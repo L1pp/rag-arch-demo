@@ -89,4 +89,4 @@ requirements.txt        已验证的直接依赖版本
 
 ## 许可证
 
-本项目代码采用 [MIT 许可证](LICENSE)。第三方依赖保留各自许可证，课程来源说明见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。
+[MIT 许可证](LICENSE) 仅覆盖本项目自有代码。第三方组件保留各自许可；本项目不为第三方的使用方式或合规性提供保证，也不保证所有依赖、组合应用或生成产物均已获得适合商业用途的授权。使用者应根据实际使用、分发和部署方式自行核对相关授权，见[版权与第三方说明](THIRD_PARTY_NOTICES.md)。

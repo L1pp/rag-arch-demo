@@ -53,7 +53,7 @@ The [architecture and reading guide](docs/architecture_en.md) maps each stage to
 4. `plan_review_agent.py` / `plan_review_evidence.py`: How are full-plan, batched, and final evidence connected, and how are quotations from the plan verified?
 5. `plan_review_report.py` / `model_input_view.py`: How are sources delivered, and how is repeated metadata reduced while preserving the text and traceability?
 
-`demo/` contains the examples and runtime adapters; `rag_arch/` retains the application code. File origins are listed in the [source manifest](docs/core_manifest.json). Course-derived comments are retained. Project code is provided under the [MIT License](LICENSE). Third-party dependencies retain their own licenses; see [third-party notices](THIRD_PARTY_NOTICES.md). This demo does not add multi-user support, a permissions system, or a large framework.
+`demo/` contains the examples and runtime adapters; `rag_arch/` retains the application code. File origins are listed in the [source manifest](docs/core_manifest.json). Course-derived comments are retained. Project-authored code is provided under the [MIT License](LICENSE). Third-party dependencies retain their own licenses; see [third-party notices](THIRD_PARTY_NOTICES.md). This demo does not add multi-user support, a permissions system, or a large framework.
 
 ## Screenshots
 
@@ -86,3 +86,7 @@ requirements.txt        Verified direct dependency versions
 ```
 
 [Initial release validation](docs/validation_en.md) records installation, offline tests, and UI checks. [Publication scope and review](docs/publication_en.md) describes the cleanup boundaries. `.env`, outputs, logs, vector caches, attachments, and archives are ignored by default; newly added materials still need review.
+
+## License
+
+MIT covers project-authored code only. Third-party components retain their own licenses. This project provides no assurance about third-party use or compliance, and does not guarantee that dependencies, combined applications, or generated outputs are cleared for commercial use. Users must check the applicable terms for their intended use, distribution, and deployment. See [copyright and third-party notices](THIRD_PARTY_NOTICES.md).
