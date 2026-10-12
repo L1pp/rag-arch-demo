@@ -10,6 +10,6 @@ Excluded files: original `.env`, complete standards library, full third-party da
 
 Review tools: `python scripts/verify_public_tree.py` scans the tree prepared for publication; `python scripts/verify_public_tree.py --tracked` scans files in the Git index. The checks look for sensitive file types, personal absolute paths, known credential formats, and private-key headers, and reject symbolic links. The report outputs only file locations and issue categories to avoid displaying suspected secrets again.
 
-Automated scanning can only detect issues covered by its rules. It cannot confirm company agreements, course permissions, or copyright ownership. The publisher should confirm the right to make the selected core code public. MIT covers project-authored code only; third-party dependencies retain their own licenses, and users must check permissions for their intended use. See the [copyright and third-party notices](../THIRD_PARTY_NOTICES.md).
+Automated scanning can only detect issues covered by its rules. It cannot confirm company agreements, course permissions, or copyright ownership. Source acknowledgements and component licenses are listed in the [third-party notices](../THIRD_PARTY_NOTICES.md).
 
 The DEMO standard identifiers, thresholds, objects, and plans in the sample materials are authored fiction; they do not cite or replace actual engineering standards. Existing evaluations publish aggregate figures only; original questions, reference answers, plans, full reports, and request records are not public.
