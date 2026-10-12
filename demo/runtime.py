@@ -1,7 +1,7 @@
 """Offline-first public demo runtime around the copied project agents."""
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, is_dataclass
+from dataclasses import asdict, dataclass, is_dataclass, replace
 from hashlib import blake2b
 import json
 import math
@@ -12,6 +12,7 @@ from typing import Any
 import numpy as np
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 
+from rag_arch.config import DEFAULT_PLAN_CONTEXT_BUDGET
 from rag_arch.evidence_index import EvidenceIndex
 from rag_arch.graph_agent import StandardAgent
 from rag_arch.plan_documents import PlanDocument, load_uploaded_document
@@ -185,7 +186,18 @@ def _chat(runtime: DemoRuntime, workflow: str):
         return ScriptedChat(workflow=workflow)
     from rag_arch.tool_chat import create_tool_chat_model
 
-    return create_tool_chat_model(runtime.settings, json_output=True)
+    settings = runtime.settings
+    if workflow == "plan":
+        # The shared chat factory reads its budgets from chat_* fields. Give it
+        # a plan-specific view so this workflow uses its declared limits.
+        settings = replace(
+            settings,
+            chat_timeout_seconds=settings.plan_timeout_seconds,
+            chat_max_tokens=settings.plan_max_tokens,
+            chat_thinking_budget=settings.plan_thinking_budget,
+            chat_context_budget_tokens=settings.plan_context_budget_tokens,
+        )
+    return create_tool_chat_model(settings, json_output=True)
 
 
 def run_standard_question(runtime: DemoRuntime, question: str):
@@ -193,19 +205,40 @@ def run_standard_question(runtime: DemoRuntime, question: str):
     return agent.run(question, corpus_id="public-demo-v1")
 
 
+def plan_document_text(plan_data: dict) -> str:
+    """Return all sample plan unit text in source order for the web editor."""
+    units = plan_data.get("units")
+    if not isinstance(units, list):
+        return ""
+    return "\n".join(
+        unit["text"] for unit in units
+        if isinstance(unit, dict) and isinstance(unit.get("text"), str)
+    )
+
+
 def make_plan_document(plan_data: dict | None = None, *, plan_path: str | Path | None = None,
                        text: str | None = None) -> PlanDocument:
     source = plan_data if plan_data is not None else _read_json(plan_path or DEFAULT_PLAN)
     document_id = str(source.get("document_id") or "DEMO-PLAN-001")
     filename = str(source.get("filename") or "演示方案.txt")
-    authored_units = [dict(unit) for unit in source.get("units", [])]
     if text is not None:
-        if authored_units:
-            authored_units[0]["text"] = text
-            authored_units = authored_units[:1]
-        else:
-            authored_units = [{"unit_id": f"{document_id}/u1", "text": text,
-                               "locator": {"line_start": 1, "line_end": 1}}]
+        if not isinstance(text, str):
+            raise TypeError("方案编辑内容必须是字符串。")
+        # Edited input is a new source document. Re-parse the complete text so
+        # unit IDs and line locators come from the edited content, not old units.
+        loaded = load_uploaded_document(filename, text.encode("utf-8"), document_id=document_id)
+        return PlanDocument(
+            document_id=document_id,
+            filename=loaded.filename,
+            units=[dict(unit) for unit in loaded.units],
+            source_kind=loaded.source_kind,
+            page_count=loaded.page_count,
+            unread_pages=list(loaded.unread_pages),
+            warnings=[PUBLIC_MATERIAL_NOTICE, *(loaded.warnings or [])],
+            source_revision=loaded.source_revision,
+        )
+
+    authored_units = [dict(unit) for unit in source.get("units", [])]
     physical_lines = []
     for unit in authored_units:
         body = unit.get("text")
@@ -252,6 +285,7 @@ def make_plan_document(plan_data: dict | None = None, *, plan_path: str | Path |
         warnings=[PUBLIC_MATERIAL_NOTICE],
     )
 
+
 def run_plan_review(runtime: DemoRuntime, plan: PlanDocument | None = None):
     document = plan or make_plan_document()
     agent = PlanReviewAgent(
@@ -261,7 +295,8 @@ def run_plan_review(runtime: DemoRuntime, plan: PlanDocument | None = None):
         max_steps=4,
         max_tool_calls=6,
         initial_plan_chars=6000,
-        context_budget_tokens=64000,
+        context_budget_tokens=(runtime.settings.plan_context_budget_tokens
+                               if runtime.settings is not None else DEFAULT_PLAN_CONTEXT_BUDGET),
         allow_context_compaction=False,
         mode="review",
         report_format="structured",

@@ -172,7 +172,8 @@
       "path": "rag_arch/plan_review_agent.py",
       "origin": "local-core/plan_review_agent.py",
       "selection": "runtime-import-closure",
-      "adapted": false
+      "adapted": true,
+      "adaptation_note": "2026-10-12: use the actual matched source anchor after quote relocation; retain the model anchor separately."
     },
     {
       "path": "rag_arch/plan_review_batches.py",
@@ -360,5 +361,7 @@
       "selection": "runtime-import-closure",
       "adapted": false
     }
-  ]
+  ],
+  "initial_public_snapshot": "403cb3d",
+  "provenance_note": "The source selection was checked locally against a private workspace. That comparison cannot be reproduced from this public repository. Later public fixes are recorded per file."
 }

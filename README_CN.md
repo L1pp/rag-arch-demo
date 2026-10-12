@@ -57,7 +57,7 @@ python -m demo --mode live --output output
 
 ## 演示截图
 
-截图均来自本版自编资料与离线运行，没有真实资料或客户信息。
+截图记录首次发布时的自编资料与离线运行，没有真实资料或客户信息。当前网页已读取完整样例方案，见[回归修复记录](docs/review_fixes_20261012.md)。
 
 ![自编资料与演示入口](docs/screenshots/01-library.png)
 ![检索与证据引用](docs/screenshots/02-qa.png)

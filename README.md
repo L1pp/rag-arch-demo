@@ -57,7 +57,7 @@ The [architecture and reading guide](docs/architecture_en.md) maps each stage to
 
 ## Screenshots
 
-These screenshots use fictional demo documents and offline runs. They contain no real source documents or customer information.
+These initial-release screenshots use fictional demo documents and offline runs. They contain no real source documents or customer information. The current app loads the full sample plan; see the [regression fixes](docs/review_fixes_20261012_en.md).
 
 ![Fictional demo documents and entry point](docs/screenshots/01-library.png)
 ![Retrieval and evidence citations](docs/screenshots/02-qa.png)

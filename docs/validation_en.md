@@ -2,7 +2,7 @@
 
 [English](validation_en.md) | [简体中文](validation.md)
 
-Date: 2026-10-12. Validation covered this demo directory. No new public benchmark, real-plan evaluation, or online model call was run.
+Date: 2026-10-12. This records validation of the initial commit `403cb3d`. No new public benchmark, real-plan evaluation, or online model call was run. See the later [regression fixes](review_fixes_20261012_en.md).
 
 - Created an independent Python 3.12.10 environment and installed the requirements and project as documented in the README. `pip check` found no dependency conflicts.
 - Five bounded offline tests passed: tool-based evidence retrieval and citations, report changes after editing an input, no invented citations when evidence is missing, no remote clients constructed by default, and the CLI output bundle.

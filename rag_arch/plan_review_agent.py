@@ -522,13 +522,15 @@ def _unverified_citation(ref, quote, *, issues, reason):
     return citation
 
 
-def _citation_from_match(document, match, *, source_ref=None, relocated=False, model_ref=None):
+def _citation_from_match(document, match, *, source_ref=None, relocated=False, model_ref=None,
+                         model_source_ref=None):
     unit = document.by_id[match["unit_id"]]
     citation = {"unit_id": match["unit_id"], "quote": match["quote"], "locator": unit["locator"],
                 "source_path": unit["source_path"], "quote_start": match["start"],
                 "quote_end": match["end"], "whitespace_normalized": match["whitespace_normalized"],
                 "location_verified": True}
-    resolved_ref = source_ref or document.source_ref_for(match["unit_id"])
+    resolved_ref = (document.source_ref_for(match["unit_id"]) if relocated
+                    else source_ref or document.source_ref_for(match["unit_id"]))
     if resolved_ref:
         citation["source_ref"] = resolved_ref
     if match.get("span_units"):
@@ -537,6 +539,8 @@ def _citation_from_match(document, match, *, source_ref=None, relocated=False, m
         citation["resolution_basis"] = "unique_quote_in_provided_units"
         if isinstance(model_ref, str) and model_ref:
             citation["model_unit_id"] = model_ref
+        if isinstance(model_source_ref, str) and model_source_ref:
+            citation["model_source_ref"] = model_source_ref
     return citation
 
 
@@ -578,9 +582,13 @@ def validate_plan_quotes(refs, document, provided, provided_ranges=None, page_so
         else:
             relocated = False
         if len(matches) == 1:
+            actual_source_ref = document.source_ref_for(matches[0]["unit_id"])
+            if source_ref and source_ref != actual_source_ref:
+                relocated = True
             model_ref = uid if relocated and isinstance(uid, str) else None
             citations.append(_citation_from_match(
-                document, matches[0], source_ref=source_ref, relocated=relocated, model_ref=model_ref))
+                document, matches[0], source_ref=source_ref, relocated=relocated, model_ref=model_ref,
+                model_source_ref=source_ref if relocated else None))
             continue
         if len(matches) > 1:
             citations.append(_unverified_citation(ref, quote, issues=issues,

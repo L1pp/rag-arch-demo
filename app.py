@@ -7,7 +7,7 @@ import streamlit as st
 
 from demo.runtime import (
     DEFAULT_PLAN, DEFAULT_STANDARDS, PUBLIC_MATERIAL_NOTICE,
-    _read_json, build_runtime, make_plan_document, render_plan_report,
+    _read_json, build_runtime, make_plan_document, plan_document_text, render_plan_report,
     result_to_dict, run_plan_review, run_standard_question,
 )
 
@@ -60,7 +60,46 @@ with qa_tab:
             st.error(f"运行失败（{type(exc).__name__}）。请检查依赖或演示配置。")
     if "qa_payload" in st.session_state:
         payload = st.session_state["qa_payload"]
-        st.markdown(payload.get("text", "本轮没有返回文字。"))
+        reason = payload.get("termination_reason")
+        status = payload.get("status")
+        traces = payload.get("traces") or []
+        validation_traces = [
+            trace for trace in traces
+            if isinstance(trace, dict)
+            and trace.get("kind") == "reply_validation"
+            and trace.get("status") == "warning"
+        ]
+        citation_display_warnings = [
+            trace for trace in traces
+            if isinstance(trace, dict)
+            and trace.get("kind") == "citation_display"
+            and trace.get("status") == "warning"
+        ]
+        answer_text = payload.get("text", "本轮没有返回文字。")
+        if reason in {"citation_rejected", "catalog_scope_rejected"} or status in {
+            "citation_rejected", "catalog_scope_rejected"
+        }:
+            st.error("引用未通过核验。本轮回答不能作为已验证结论。")
+            st.caption("以下为未通过引用核验的模型原文，仅供排查。")
+            st.text(answer_text)
+        elif reason == "insufficient_evidence":
+            st.warning("现有资料不足以支持结论，本轮没有形成可验证的回答。")
+            st.caption("以下为本轮返回的说明文本，尚未构成经资料支持的结论。")
+            st.text(answer_text)
+        elif validation_traces:
+            st.warning("本轮输出格式或引用核验未完成，回答尚未通过核验。")
+            st.caption("以下为未通过核验的模型原文，仅供排查。")
+            st.text(answer_text)
+        elif citation_display_warnings:
+            st.warning("回答中的行内引用标记与程序记录的引用不一致，请勿按标记直接判断来源。")
+            st.caption("以下回答的引用展示未通过一致性检查。")
+            st.text(answer_text)
+        elif status != "answered":
+            st.warning("本轮回答未完成核验，不能作为有依据的结论。")
+            st.caption("以下为本轮返回的原文，仅供排查。")
+            st.text(answer_text)
+        else:
+            st.markdown(answer_text)
         citations = payload.get("citations", [])
         if citations:
             st.markdown("**程序记录的引用**")
@@ -78,7 +117,7 @@ with qa_tab:
 with plan_tab:
     st.subheader("方案核查")
     plan_data = _read_json(DEFAULT_PLAN)
-    initial_text = plan_data.get("units", [{}])[0].get("text", "")
+    initial_text = plan_document_text(plan_data)
     plan_text = st.text_area("演示方案原文（可修改）", value=initial_text, height=150)
     if st.button("运行方案演示", type="primary", key="run_plan"):
         try:
