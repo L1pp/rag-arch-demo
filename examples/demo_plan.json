@@ -1,0 +1,20 @@
+{
+  "disclaimer": "以下方案内容、编号、名称和数值均为演示自编内容，不是真实客户方案或工程资料。",
+  "document_id": "DEMO-PLAN-001",
+  "filename": "演示方案.txt",
+  "source_kind": "text",
+  "units": [
+    {
+      "unit_id": "DEMO-PLAN-001/u1",
+      "text": "虚构演示方案：样例区域A的支撑间距记录为 1.50 m，检查岗位为演示班组。以上内容仅用于展示资料定位和引用流程。",
+      "locator": {"page": 1, "line_start": 1, "line_end": 1},
+      "source_path": "examples/demo_plan.json"
+    },
+    {
+      "unit_id": "DEMO-PLAN-001/u2",
+      "text": "虚构演示方案：检查日期栏暂未填写。该空白仅用于展示示例输入，不代表真实项目缺项。",
+      "locator": {"page": 1, "line_start": 2, "line_end": 2},
+      "source_path": "examples/demo_plan.json"
+    }
+  ]
+}

@@ -1,0 +1,364 @@
+{
+  "selection_roots": [
+    "loaders",
+    "splitting",
+    "collection",
+    "evidence_index",
+    "standard_tools",
+    "graph_agent",
+    "plan_review_agent",
+    "plan_review_runtime",
+    "plan_review_report",
+    "providers"
+  ],
+  "files": [
+    {
+      "path": "rag_arch/__init__.py",
+      "origin": "local-core/__init__.py",
+      "selection": "runtime-import-closure",
+      "adapted": false
+    },
+    {
+      "path": "rag_arch/arithmetic_tool.py",
+      "origin": "local-core/arithmetic_tool.py",
+      "selection": "runtime-import-closure",
+      "adapted": false
+    },
+    {
+      "path": "rag_arch/benchmark_metrics.py",
+      "origin": "local-core/benchmark_metrics.py",
+      "selection": "runtime-import-closure",
+      "adapted": false
+    },
+    {
+      "path": "rag_arch/benchmark_review_policy.py",
+      "origin": "local-core/benchmark_review_policy.py",
+      "selection": "runtime-import-closure",
+      "adapted": false
+    },
+    {
+      "path": "rag_arch/catalog_index.py",
+      "origin": "local-core/catalog_index.py",
+      "selection": "runtime-import-closure",
+      "adapted": false
+    },
+    {
+      "path": "rag_arch/catalog_runtime.py",
+      "origin": "local-core/catalog_runtime.py",
+      "selection": "runtime-import-closure",
+      "adapted": false
+    },
+    {
+      "path": "rag_arch/collection.py",
+      "origin": "local-core/collection.py",
+      "selection": "runtime-import-closure",
+      "adapted": false
+    },
+    {
+      "path": "rag_arch/config.py",
+      "origin": "local-core/config.py",
+      "selection": "runtime-import-closure",
+      "adapted": false
+    },
+    {
+      "path": "rag_arch/document_pages.py",
+      "origin": "local-core/document_pages.py",
+      "selection": "runtime-import-closure",
+      "adapted": false
+    },
+    {
+      "path": "rag_arch/embedding_cache.py",
+      "origin": "local-core/embedding_cache.py",
+      "selection": "runtime-import-closure",
+      "adapted": false
+    },
+    {
+      "path": "rag_arch/evidence_index.py",
+      "origin": "local-core/evidence_index.py",
+      "selection": "runtime-import-closure",
+      "adapted": false
+    },
+    {
+      "path": "rag_arch/evidence_status.py",
+      "origin": "local-core/evidence_status.py",
+      "selection": "runtime-import-closure",
+      "adapted": false
+    },
+    {
+      "path": "rag_arch/experiment_provenance.py",
+      "origin": "local-core/experiment_provenance.py",
+      "selection": "runtime-import-closure",
+      "adapted": false
+    },
+    {
+      "path": "rag_arch/generation_experiments.py",
+      "origin": "local-core/generation_experiments.py",
+      "selection": "runtime-import-closure",
+      "adapted": false
+    },
+    {
+      "path": "rag_arch/graph_agent.py",
+      "origin": "local-core/graph_agent.py",
+      "selection": "runtime-import-closure",
+      "adapted": false
+    },
+    {
+      "path": "rag_arch/json_output.py",
+      "origin": "local-core/json_output.py",
+      "selection": "runtime-import-closure",
+      "adapted": false
+    },
+    {
+      "path": "rag_arch/loaders.py",
+      "origin": "local-core/loaders.py",
+      "selection": "runtime-import-closure",
+      "adapted": false
+    },
+    {
+      "path": "rag_arch/local_reranking.py",
+      "origin": "local-core/local_reranking.py",
+      "selection": "runtime-import-closure",
+      "adapted": false
+    },
+    {
+      "path": "rag_arch/model_input_view.py",
+      "origin": "local-core/model_input_view.py",
+      "selection": "runtime-import-closure",
+      "adapted": false
+    },
+    {
+      "path": "rag_arch/models.py",
+      "origin": "local-core/models.py",
+      "selection": "runtime-import-closure",
+      "adapted": false
+    },
+    {
+      "path": "rag_arch/multimodal.py",
+      "origin": "local-core/multimodal.py",
+      "selection": "runtime-import-closure",
+      "adapted": false
+    },
+    {
+      "path": "rag_arch/page_sources.py",
+      "origin": "local-core/page_sources.py",
+      "selection": "runtime-import-closure",
+      "adapted": false
+    },
+    {
+      "path": "rag_arch/plan_context_summary.py",
+      "origin": "local-core/plan_context_summary.py",
+      "selection": "runtime-import-closure",
+      "adapted": false
+    },
+    {
+      "path": "rag_arch/plan_documents.py",
+      "origin": "local-core/plan_documents.py",
+      "selection": "runtime-import-closure",
+      "adapted": false
+    },
+    {
+      "path": "rag_arch/plan_location_display.py",
+      "origin": "local-core/plan_location_display.py",
+      "selection": "runtime-import-closure",
+      "adapted": false
+    },
+    {
+      "path": "rag_arch/plan_output.py",
+      "origin": "local-core/plan_output.py",
+      "selection": "runtime-import-closure",
+      "adapted": false
+    },
+    {
+      "path": "rag_arch/plan_review_agent.py",
+      "origin": "local-core/plan_review_agent.py",
+      "selection": "runtime-import-closure",
+      "adapted": false
+    },
+    {
+      "path": "rag_arch/plan_review_batches.py",
+      "origin": "local-core/plan_review_batches.py",
+      "selection": "runtime-import-closure",
+      "adapted": false
+    },
+    {
+      "path": "rag_arch/plan_review_context.py",
+      "origin": "local-core/plan_review_context.py",
+      "selection": "runtime-import-closure",
+      "adapted": false
+    },
+    {
+      "path": "rag_arch/plan_review_evidence.py",
+      "origin": "local-core/plan_review_evidence.py",
+      "selection": "runtime-import-closure",
+      "adapted": false
+    },
+    {
+      "path": "rag_arch/plan_review_memory.py",
+      "origin": "local-core/plan_review_memory.py",
+      "selection": "runtime-import-closure",
+      "adapted": false
+    },
+    {
+      "path": "rag_arch/plan_review_notes.py",
+      "origin": "local-core/plan_review_notes.py",
+      "selection": "runtime-import-closure",
+      "adapted": false
+    },
+    {
+      "path": "rag_arch/plan_review_report.py",
+      "origin": "local-core/plan_review_report.py",
+      "selection": "runtime-import-closure",
+      "adapted": false
+    },
+    {
+      "path": "rag_arch/plan_review_runtime.py",
+      "origin": "local-core/plan_review_runtime.py",
+      "selection": "runtime-import-closure",
+      "adapted": false
+    },
+    {
+      "path": "rag_arch/plan_standard_preflight.py",
+      "origin": "local-core/plan_standard_preflight.py",
+      "selection": "runtime-import-closure",
+      "adapted": false
+    },
+    {
+      "path": "rag_arch/plan_text_view.py",
+      "origin": "local-core/plan_text_view.py",
+      "selection": "runtime-import-closure",
+      "adapted": false
+    },
+    {
+      "path": "rag_arch/prompt_payload.py",
+      "origin": "local-core/prompt_payload.py",
+      "selection": "runtime-import-closure",
+      "adapted": false
+    },
+    {
+      "path": "rag_arch/providers.py",
+      "origin": "local-core/providers.py",
+      "selection": "runtime-import-closure",
+      "adapted": false
+    },
+    {
+      "path": "rag_arch/reply_text.py",
+      "origin": "local-core/reply_text.py",
+      "selection": "runtime-import-closure",
+      "adapted": false
+    },
+    {
+      "path": "rag_arch/reranking.py",
+      "origin": "local-core/reranking.py",
+      "selection": "runtime-import-closure",
+      "adapted": false
+    },
+    {
+      "path": "rag_arch/responses_chat.py",
+      "origin": "local-core/responses_chat.py",
+      "selection": "runtime-import-closure",
+      "adapted": false
+    },
+    {
+      "path": "rag_arch/retrieval.py",
+      "origin": "local-core/retrieval.py",
+      "selection": "runtime-import-closure",
+      "adapted": false
+    },
+    {
+      "path": "rag_arch/retrieval_experiments.py",
+      "origin": "local-core/retrieval_experiments.py",
+      "selection": "runtime-import-closure",
+      "adapted": false
+    },
+    {
+      "path": "rag_arch/runtime_audit.py",
+      "origin": "local-core/runtime_audit.py",
+      "selection": "runtime-import-closure",
+      "adapted": false
+    },
+    {
+      "path": "rag_arch/splitting.py",
+      "origin": "local-core/splitting.py",
+      "selection": "runtime-import-closure",
+      "adapted": false
+    },
+    {
+      "path": "rag_arch/standard_identifiers.py",
+      "origin": "local-core/standard_identifiers.py",
+      "selection": "runtime-import-closure",
+      "adapted": false
+    },
+    {
+      "path": "rag_arch/standard_lifecycle.py",
+      "origin": "local-core/standard_lifecycle.py",
+      "selection": "runtime-import-closure",
+      "adapted": false
+    },
+    {
+      "path": "rag_arch/standard_model_view.py",
+      "origin": "local-core/standard_model_view.py",
+      "selection": "runtime-import-closure",
+      "adapted": false
+    },
+    {
+      "path": "rag_arch/standard_status.py",
+      "origin": "local-core/standard_status.py",
+      "selection": "runtime-import-closure",
+      "adapted": false
+    },
+    {
+      "path": "rag_arch/standard_tools.py",
+      "origin": "local-core/standard_tools.py",
+      "selection": "runtime-import-closure",
+      "adapted": false
+    },
+    {
+      "path": "rag_arch/standards.py",
+      "origin": "local-core/standards.py",
+      "selection": "runtime-import-closure",
+      "adapted": false
+    },
+    {
+      "path": "rag_arch/status_benchmark.py",
+      "origin": "local-core/status_benchmark.py",
+      "selection": "runtime-import-closure",
+      "adapted": false
+    },
+    {
+      "path": "rag_arch/terminal_completion.py",
+      "origin": "local-core/terminal_completion.py",
+      "selection": "runtime-import-closure",
+      "adapted": false
+    },
+    {
+      "path": "rag_arch/terminal_output.py",
+      "origin": "local-core/terminal_output.py",
+      "selection": "runtime-import-closure",
+      "adapted": false
+    },
+    {
+      "path": "rag_arch/tool_chat.py",
+      "origin": "local-core/tool_chat.py",
+      "selection": "runtime-import-closure",
+      "adapted": false
+    },
+    {
+      "path": "rag_arch/visual_page_index.py",
+      "origin": "local-core/visual_page_index.py",
+      "selection": "runtime-import-closure",
+      "adapted": false
+    },
+    {
+      "path": "rag_arch/web_evidence.py",
+      "origin": "local-core/web_evidence.py",
+      "selection": "runtime-import-closure",
+      "adapted": false
+    },
+    {
+      "path": "rag_arch/web_search.py",
+      "origin": "local-core/web_search.py",
+      "selection": "runtime-import-closure",
+      "adapted": false
+    }
+  ]
+}
