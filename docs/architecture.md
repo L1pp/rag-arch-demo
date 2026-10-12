@@ -1,5 +1,7 @@
 # 架构与代码阅读路线
 
+[English](architecture_en.md) | [简体中文](architecture.md)
+
 ```mermaid
 flowchart LR
     A[自编资料 JSON 与方案文字] --> B[loaders / PlanDocument]

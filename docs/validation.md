@@ -1,5 +1,7 @@
 # 首次发布验证
 
+[English](validation_en.md) | [简体中文](validation.md)
+
 日期：2026-10-12。验证对象为本演示目录，未运行新的公共基准、真实方案评测或在线模型调用。
 
 - 新建独立 Python 3.12.10 虚拟环境，按 README 安装 `requirements.txt` 与本项目；`pip check` 无依赖冲突。

@@ -76,7 +76,7 @@ python -m demo --mode live --output output
 ```text
 app.py                  Streamlit 演示页面
 rag_arch/               保留的业务实现
-demo/                  离线/在线运行适配
+demo/                   离线/在线运行适配
 examples/               自编资料、方案与样例报告
 docs/                   架构、效果、公开范围、截图
 scripts/                公开文件检查

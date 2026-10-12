@@ -45,7 +45,7 @@ Online mode requires network access and permission to use the selected services,
 
 I led the implementation of the building-document assistant and am authorized to publish the code selected for this demo. This repository focuses on the document loading and source-location workflow, hybrid retrieval and reranking, evidence tools, tool loop, long-plan context handling, citation verification, and report delivery. The retriever and client designs that draw on course material retain their original comments and source acknowledgements.
 
-The [architecture and reading guide](docs/architecture.md) maps each stage to the source code. A useful review path is:
+The [architecture and reading guide](docs/architecture_en.md) maps each stage to the source code. A useful review path is:
 
 1. `loaders.py` / `splitting.py`: How is text extracted, how are locations preserved, and how are gaps from scanned pages surfaced?
 2. `retrieval.py` / `evidence_index.py`: How are Chinese text and numbers tokenized, how do BM25, cosine similarity, and RRF scores differ, and how do candidates reach reranking?
@@ -67,7 +67,7 @@ These screenshots use fictional demo documents and offline runs. They contain no
 
 In a historical 60-question retrieval regression, adding reranking to the same RRF candidate pool raised Recall@8 from 0.8444 to 0.8722 and increased complete evidence matches from 44/60 to 47/60. At Top-4, complete evidence matches fell from 40/60 to 39/60. On a fixed 240-question AECBench QA set, accuracy on decodable answer choices rose from 146/240 to 184/240.
 
-The five-plan whole-plan evaluation used 59 fixed development reference items. These results measure reference coverage, not full-report accuracy; they do not establish that RAG consistently improves technical findings across whole plans. The [evaluation notes](docs/evaluation.md) describe the scope, native-review comparison, unfavorable results, and changes that cannot be attributed to RAG. This public demo does not include the original evaluation inputs or claim that its small examples reproduce those results.
+The five-plan whole-plan evaluation used 59 fixed development reference items. These results measure reference coverage, not full-report accuracy; they do not establish that RAG consistently improves technical findings across whole plans. The [evaluation notes](docs/evaluation_en.md) describe the scope, native-review comparison, unfavorable results, and changes that cannot be attributed to RAG. This public demo does not include the original evaluation inputs or claim that its small examples reproduce those results.
 
 Citation checks can verify sources and quoted text. They cannot automatically establish engineering applicability, correctness of conclusions, or completeness of issue discovery. Text extraction gaps, charts, and complex calculations still require manual review.
 
@@ -85,4 +85,4 @@ tests/                  Limited offline workflow checks
 requirements.txt        Verified direct dependency versions
 ```
 
-[Initial release validation](docs/validation.md) records installation, offline tests, and UI checks. [Publication scope and review](docs/publication.md) describes the cleanup boundaries. `.env`, outputs, logs, vector caches, attachments, and archives are ignored by default; newly added materials still need review.
+[Initial release validation](docs/validation_en.md) records installation, offline tests, and UI checks. [Publication scope and review](docs/publication_en.md) describes the cleanup boundaries. `.env`, outputs, logs, vector caches, attachments, and archives are ignored by default; newly added materials still need review.
