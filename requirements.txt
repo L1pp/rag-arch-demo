@@ -1,11 +1,11 @@
-# Tested direct dependencies on Python 3.12.10; transitive packages resolved by pip.
-streamlit==1.63.0
-langchain-openai==1.6.0
-langchain-core==1.6.2
-langgraph==1.2.11
+# Independent web environment. Chat and standards reuse existing providers/agents.
+fastapi==0.141.1
+uvicorn==0.53.0
 httpx==0.28.1
-numpy==2.5.2
+langchain-openai==1.6.2
+langgraph==1.2.11
+numpy==2.5.3
 python-dotenv==1.2.3
-pydantic==2.13.5
+pillow==12.3.0
+# Web original-page operations use one child process; plain chat does not open PDFs.
 PyMuPDF==1.28.2
-Pillow==12.3.0

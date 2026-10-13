@@ -23,3 +23,10 @@ data/runtime/
 .DS_Store
 .idea/
 .vscode/
+data/
+models/
+frontend/node_modules/
+frontend/dist/
+build/
+*.tsbuildinfo
+requirements*.local.txt

@@ -1,36 +1,39 @@
 # Architecture and Code Reading Guide
 
-[English](architecture_en.md) | [简体中文](architecture.md)
+[English](architecture_en.md) | [简体中文](architecture.md) | [Web setup](web_setup_en.md)
 
-```mermaid
+The repository now presents the React + FastAPI workbench as its primary entry. The full standards corpus, original source documents, runtime database, and model credentials are not included. The interface source can be inspected, while real document Q&A and source-page viewing require compatible resources supplied by the user.
+
+~~~~mermaid
 flowchart LR
-    A[Authored sample JSON and plan text] --> B[loaders / PlanDocument]
-    A --> C[StandardCorpus / EvidenceIndex]
-    B --> H
-    C --> D[BM25 + cosine]
-    D --> E[RRF candidate fusion]
-    E --> F[rerank]
-    F --> G[StandardTools]
-    G --> H[StandardAgent / PlanReviewAgent]
-    H --> I[Citation and source-plan text validation]
-    I --> J[Markdown / JSON report]
-```
+    U[Browser / React] --> A[FastAPI pages and authentication]
+    A --> B[Workspace, task, SSE, cancel, download APIs]
+    B --> C[TaskService / assistant runner]
+    C --> D[Standards Q&A, document chat, plan-review runners]
+    D --> E[BM25 + vector retrieval]
+    E --> F[RRF fusion / reranking]
+    F --> G[Evidence tools and Agent]
+    G --> H[Source and plan-quotation validation]
+    H --> I[Markdown / JSON reports]
+    J[User-provided corpus, metadata, originals] --> D
+~~~~
 
-| Stage | Main source files | Implementation details to explore |
+| Stage | Main source files | What to inspect |
 |---|---|---|
-| Document loading | `rag_arch/loaders.py`, `splitting.py`, `plan_documents.py` | TXT/MD/PDF/DOCX text, line numbers/page numbers, gaps for scanned pages, upload limits |
-| Retrieval | `retrieval.py`, `evidence_index.py` | Chinese single-character/bigram terms, complete numeric tokens, BM25, vector normalization, RRF, candidate pool and Top-k |
-| Reranking | `reranking.py`, `providers.py` | Reranking candidates in one batch, response validation, explicit error propagation, separate service configuration |
-| Evidence tools | `standard_tools.py`, `standard_status.py` | Search/read by clause number, related-table completion, distinction between clause readability and version status |
-| Q&A | `graph_agent.py` | LangGraph model/tool loop, call budget, checking retrieved evidence against final citations |
-| Plan review | `plan_review_agent.py`, `plan_review_context.py`, `plan_review_evidence.py` | Full-text-first review, batching when capacity is insufficient, locating plan quotations, evidence assembly and source coverage |
-| Output | `plan_output.py`, `plan_review_report.py` | Narrative and structured reports, separating citation issues from engineering judgments, Markdown/JSON export |
-| Model input | `model_input_view.py`, `standard_model_view.py` | Sharing repeated metadata, looking up full status on demand, preserving evidence text and location |
+| React UI | frontend/src/App.tsx, api.ts, store.ts, WorkspaceContext.tsx | Workspace state, assistant tasks, event subscription, report display, and request boundaries |
+| FastAPI entry | rag_arch/web/app.py, contracts.py | Pages and static assets, login, workspace/task APIs, SSE, cancellation, and downloads |
+| Tasks and events | rag_arch/web/task_service.py | Single-process task lifecycle, progress events, cancellation, and current workspace snapshot |
+| Upload and source pages | rag_arch/web/document_routes.py, documents.py, standards_routes.py | Uploaded file handling, source-page viewing, document catalog, and status routes |
+| History | rag_arch/web/history.py | Local history pages and record-reading routes |
+| Backend workflows | rag_arch/web/chat_runner.py, standards_runner.py, plan_runner.py | How requests enter chat, standards Q&A, and plan review |
+| Document processing | rag_arch/loaders.py, splitting.py, plan_documents.py | TXT/MD/PDF/DOCX reading, line/page locations, scanned-page gaps, and splitting |
+| Retrieval and reranking | rag_arch/retrieval.py, evidence_index.py, reranking.py, providers.py | Chinese and numeric tokenization, BM25, vector normalization, RRF candidates, and reranking services |
+| Evidence and Q&A | rag_arch/standard_tools.py, graph_agent.py, page_qa.py | Search/read evidence tools, LangGraph tool loop, and final citation constraints |
+| Plan review | rag_arch/plan_review_agent.py, plan_review_context.py, plan_review_evidence.py | Full-text-first review, batching, plan quotation location, evidence assembly, and coverage |
+| Validation and output | rag_arch/plan_output.py, plan_review_report.py, model_input_view.py | Separating citation checks from engineering judgments, source traceability, and Markdown/JSON reports |
 
-In this version, authored JSON is assembled into a `StandardCorpus`; plan text is read through `load_uploaded_document` / `loaders` and retains line numbers. The original PDF/DOCX reading and general-purpose splitting code remains available to inspect, but scanned-document processing was not run on this sample.
+At startup, FastAPI reads settings and creates the task service. It serves the built React files and API from the same origin. The API includes task state, SSE progress, cancellation, and file downloads. This code is a local workbench, not a hosted or multi-tenant service. See the [Web setup guide](web_setup_en.md) for build and launch steps.
 
-`demo/` is the demo entry point, and `rag_arch/` contains the retained business implementation. A small number of files whose names include benchmark/experiment were retained because formal modules depend on their utility functions; benchmark questions, run logs, and real evaluation inputs are not included.
+Standards Q&A requires at least user-provided data/corpus/clauses.jsonl and data/corpus/tables.jsonl in the project’s expected format. Add catalog summaries, catalog entries, version relations, and status records as needed. To navigate from evidence to an original page, provide the corresponding originals and source mappings expected by the code; records without originals cannot open a source page. Users also supply model, embedding, and reranking configuration. These resources are not included; the [Web setup guide](web_setup_en.md) describes the minimum setup.
 
-In offline mode, the model, embedding, and reranking components are deterministic stand-ins. They let you follow how the same business flow gathers evidence and produces a deliverable. They only handle topics explicitly designed into the authored sample; this does not demonstrate model review of arbitrary construction plans. In online mode, the stand-ins are replaced by service clients constructed by the original `providers.py`; calls may incur charges.
-
-The original system’s web front end and back end, user upload history, operations tooling, and complete standards library are outside this release. Scanned-document OCR and complex engineering calculations are outside the demo scope.
+demo/ and examples/ retain the authored offline CLI sample. The Streamlit page is now a separate no-key sample. Offline stand-ins cover only topics designed into the examples; they do not demonstrate review of arbitrary engineering plans. Existing screenshots show the initial Streamlit page, not the current React workbench.

@@ -14,6 +14,6 @@ The core code was selected from the author's building-document RAG project. The 
 Original project code uses [MIT](LICENSE). Third-party components retain their own licenses; consult the terms for the versions you use.
 
 - **PyMuPDF**: required PDF dependency, offered under AGPLv3 or a commercial license. [Official licensing](https://pymupdf.io/licensing).
-- **Other dependencies**: NumPy, HTTPX, python-dotenv, LangChain, LangGraph, Streamlit, Pydantic, and Pillow. The selected versions are listed in [requirements.txt](requirements.txt); their upstream license texts remain applicable.
+- **Other dependencies**: React, FastAPI, Uvicorn, NumPy, HTTPX, python-dotenv, LangChain, LangGraph, Streamlit, Pydantic, and Pillow. The selected versions are listed in [requirements.txt](requirements.txt); their upstream license texts remain applicable.
 
 自有代码采用 MIT，第三方组件遵循各自许可。PyMuPDF 为必需的 PDF 依赖，提供 AGPLv3 或商业许可；使用者可按上述官方链接及各依赖版本的许可文本核对授权。

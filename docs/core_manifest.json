@@ -9,7 +9,8 @@
     "plan_review_agent",
     "plan_review_runtime",
     "plan_review_report",
-    "providers"
+    "providers",
+    "web.app"
   ],
   "files": [
     {
@@ -360,8 +361,312 @@
       "origin": "local-core/web_search.py",
       "selection": "runtime-import-closure",
       "adapted": false
+    },
+    {
+      "path": "rag_arch/output_schemas.py",
+      "origin": "local-current/rag_arch/output_schemas.py",
+      "selection": "react-fastapi-import-closure",
+      "adapted": false
+    },
+    {
+      "path": "rag_arch/page_qa.py",
+      "origin": "local-current/rag_arch/page_qa.py",
+      "selection": "react-fastapi-import-closure",
+      "adapted": false
+    },
+    {
+      "path": "rag_arch/pdf_backend.py",
+      "origin": "local-current/rag_arch/pdf_backend.py",
+      "selection": "react-fastapi-import-closure",
+      "adapted": false
+    },
+    {
+      "path": "rag_arch/qa.py",
+      "origin": "local-current/rag_arch/qa.py",
+      "selection": "react-fastapi-import-closure",
+      "adapted": false
+    },
+    {
+      "path": "rag_arch/web/__init__.py",
+      "origin": "local-current/rag_arch/web/__init__.py",
+      "selection": "react-fastapi-import-closure",
+      "adapted": false
+    },
+    {
+      "path": "rag_arch/web/app.py",
+      "origin": "local-current/rag_arch/web/app.py",
+      "selection": "react-fastapi-import-closure",
+      "adapted": true,
+      "adaptation_note": "2026-10-13: preserve validation warnings in Markdown exports."
+    },
+    {
+      "path": "rag_arch/web/auth.py",
+      "origin": "local-current/rag_arch/web/auth.py",
+      "selection": "react-fastapi-import-closure",
+      "adapted": false
+    },
+    {
+      "path": "rag_arch/web/auth_cli.py",
+      "origin": "local-current/rag_arch/web/auth_cli.py",
+      "selection": "react-fastapi-import-closure",
+      "adapted": false
+    },
+    {
+      "path": "rag_arch/web/catalog_tools.py",
+      "origin": "local-current/rag_arch/web/catalog_tools.py",
+      "selection": "react-fastapi-import-closure",
+      "adapted": false
+    },
+    {
+      "path": "rag_arch/web/chat_runner.py",
+      "origin": "local-current/rag_arch/web/chat_runner.py",
+      "selection": "react-fastapi-import-closure",
+      "adapted": false
+    },
+    {
+      "path": "rag_arch/web/contracts.py",
+      "origin": "local-current/rag_arch/web/contracts.py",
+      "selection": "react-fastapi-import-closure",
+      "adapted": true,
+      "adaptation_note": "2026-10-13: Preserve an optional termination_reason in task results."
+    },
+    {
+      "path": "rag_arch/web/demo.py",
+      "origin": "local-current/rag_arch/web/demo.py",
+      "selection": "react-fastapi-import-closure",
+      "adapted": false
+    },
+    {
+      "path": "rag_arch/web/document_routes.py",
+      "origin": "local-current/rag_arch/web/document_routes.py",
+      "selection": "react-fastapi-import-closure",
+      "adapted": false
+    },
+    {
+      "path": "rag_arch/web/documents.py",
+      "origin": "local-current/rag_arch/web/documents.py",
+      "selection": "react-fastapi-import-closure",
+      "adapted": false
+    },
+    {
+      "path": "rag_arch/web/history.py",
+      "origin": "local-current/rag_arch/web/history.py",
+      "selection": "react-fastapi-import-closure",
+      "adapted": true,
+      "adaptation_note": "2026-10-13: Use a generic operator-supplied history pointer path."
+    },
+    {
+      "path": "rag_arch/web/plan_runner.py",
+      "origin": "local-current/rag_arch/web/plan_runner.py",
+      "selection": "react-fastapi-import-closure",
+      "adapted": true,
+      "adaptation_note": "2026-10-13: Pass the plan context budget to the model settings."
+    },
+    {
+      "path": "rag_arch/web/standards_resources.py",
+      "origin": "local-current/rag_arch/web/standards_resources.py",
+      "selection": "react-fastapi-import-closure",
+      "adapted": false
+    },
+    {
+      "path": "rag_arch/web/standards_routes.py",
+      "origin": "local-current/rag_arch/web/standards_routes.py",
+      "selection": "react-fastapi-import-closure",
+      "adapted": false
+    },
+    {
+      "path": "rag_arch/web/standards_runner.py",
+      "origin": "local-current/rag_arch/web/standards_runner.py",
+      "selection": "react-fastapi-import-closure",
+      "adapted": true,
+      "adaptation_note": "2026-10-13: Expose QA termination_reason and validation warnings to the React client."
+    },
+    {
+      "path": "rag_arch/web/task_service.py",
+      "origin": "local-current/rag_arch/web/task_service.py",
+      "selection": "react-fastapi-import-closure",
+      "adapted": false
+    },
+    {
+      "path": "frontend/.gitignore",
+      "origin": "local-current/frontend/.gitignore",
+      "selection": "react-frontend-source",
+      "adapted": false
+    },
+    {
+      "path": "frontend/index.html",
+      "origin": "local-current/frontend/index.html",
+      "selection": "react-frontend-source",
+      "adapted": false
+    },
+    {
+      "path": "frontend/package.json",
+      "origin": "local-current/frontend/package.json",
+      "selection": "react-frontend-source",
+      "adapted": false
+    },
+    {
+      "path": "frontend/package-lock.json",
+      "origin": "local-current/frontend/package-lock.json",
+      "selection": "react-frontend-source",
+      "adapted": false
+    },
+    {
+      "path": "frontend/tsconfig.json",
+      "origin": "local-current/frontend/tsconfig.json",
+      "selection": "react-frontend-source",
+      "adapted": false
+    },
+    {
+      "path": "frontend/vite.config.ts",
+      "origin": "local-current/frontend/vite.config.ts",
+      "selection": "react-frontend-source",
+      "adapted": false
+    },
+    {
+      "path": "frontend/src/api.test.ts",
+      "origin": "local-current/frontend/src/api.test.ts",
+      "selection": "react-frontend-source",
+      "adapted": true,
+      "adaptation_note": "2026-10-13: Retain UI regression coverage using fictional public fixtures."
+    },
+    {
+      "path": "frontend/src/api.ts",
+      "origin": "local-current/frontend/src/api.ts",
+      "selection": "react-frontend-source",
+      "adapted": false
+    },
+    {
+      "path": "frontend/src/App.mode.test.tsx",
+      "origin": "local-current/frontend/src/App.mode.test.tsx",
+      "selection": "react-frontend-source",
+      "adapted": true,
+      "adaptation_note": "2026-10-13: Retain UI regression coverage using fictional public fixtures."
+    },
+    {
+      "path": "frontend/src/App.natural-report.test.tsx",
+      "origin": "local-current/frontend/src/App.natural-report.test.tsx",
+      "selection": "react-frontend-source",
+      "adapted": false
+    },
+    {
+      "path": "frontend/src/App.tsx",
+      "origin": "local-current/frontend/src/App.tsx",
+      "selection": "react-frontend-source",
+      "adapted": true,
+      "adaptation_note": "2026-10-13: Show citation and format verification failures before preserved model text."
+    },
+    {
+      "path": "frontend/src/layout.css",
+      "origin": "local-current/frontend/src/layout.css",
+      "selection": "react-frontend-source",
+      "adapted": false
+    },
+    {
+      "path": "frontend/src/main.route.test.tsx",
+      "origin": "local-current/frontend/src/main.route.test.tsx",
+      "selection": "react-frontend-source",
+      "adapted": false
+    },
+    {
+      "path": "frontend/src/main.tsx",
+      "origin": "local-current/frontend/src/main.tsx",
+      "selection": "react-frontend-source",
+      "adapted": false
+    },
+    {
+      "path": "frontend/src/PageViewer.test.tsx",
+      "origin": "local-current/frontend/src/PageViewer.test.tsx",
+      "selection": "react-frontend-source",
+      "adapted": true,
+      "adaptation_note": "2026-10-13: Retain UI regression coverage using fictional public fixtures."
+    },
+    {
+      "path": "frontend/src/PageViewer.tsx",
+      "origin": "local-current/frontend/src/PageViewer.tsx",
+      "selection": "react-frontend-source",
+      "adapted": false
+    },
+    {
+      "path": "frontend/src/ResourceControls.test.tsx",
+      "origin": "local-current/frontend/src/ResourceControls.test.tsx",
+      "selection": "react-frontend-source",
+      "adapted": true,
+      "adaptation_note": "2026-10-13: Retain UI regression coverage using fictional public fixtures."
+    },
+    {
+      "path": "frontend/src/ResourceControls.tsx",
+      "origin": "local-current/frontend/src/ResourceControls.tsx",
+      "selection": "react-frontend-source",
+      "adapted": true,
+      "adaptation_note": "2026-10-13: Use fictional example identifiers in public placeholders."
+    },
+    {
+      "path": "frontend/src/route.ts",
+      "origin": "local-current/frontend/src/route.ts",
+      "selection": "react-frontend-source",
+      "adapted": false
+    },
+    {
+      "path": "frontend/src/StandardsCatalog.test.tsx",
+      "origin": "local-current/frontend/src/StandardsCatalog.test.tsx",
+      "selection": "react-frontend-source",
+      "adapted": true,
+      "adaptation_note": "2026-10-13: Retain UI regression coverage using fictional public fixtures."
+    },
+    {
+      "path": "frontend/src/store.test.ts",
+      "origin": "local-current/frontend/src/store.test.ts",
+      "selection": "react-frontend-source",
+      "adapted": true,
+      "adaptation_note": "2026-10-13: Retain UI regression coverage using fictional public fixtures."
+    },
+    {
+      "path": "frontend/src/store.ts",
+      "origin": "local-current/frontend/src/store.ts",
+      "selection": "react-frontend-source",
+      "adapted": false
+    },
+    {
+      "path": "frontend/src/styles.css",
+      "origin": "local-current/frontend/src/styles.css",
+      "selection": "react-frontend-source",
+      "adapted": false
+    },
+    {
+      "path": "frontend/src/types.ts",
+      "origin": "local-current/frontend/src/types.ts",
+      "selection": "react-frontend-source",
+      "adapted": true,
+      "adaptation_note": "2026-10-13: Accept the optional QA termination reason."
+    },
+    {
+      "path": "frontend/src/WorkspaceContext.tsx",
+      "origin": "local-current/frontend/src/WorkspaceContext.tsx",
+      "selection": "react-frontend-source",
+      "adapted": false
+    },
+    {
+      "path": "frontend/src/generated/api.ts",
+      "origin": "local-current/frontend/src/generated/api.ts",
+      "selection": "react-frontend-source",
+      "adapted": true,
+      "adaptation_note": "2026-10-13: Regenerated from the public FastAPI contract."
+    },
+    {
+      "path": "frontend/src/test/setup.ts",
+      "origin": "local-current/frontend/src/test/setup.ts",
+      "selection": "react-frontend-source",
+      "adapted": false
+    },
+    {
+      "path": "scripts/render_docx_pages.ps1",
+      "origin": "local-current/scripts/render_docx_pages.ps1",
+      "selection": "document-page-helper",
+      "adapted": false
     }
   ],
   "initial_public_snapshot": "403cb3d",
-  "provenance_note": "The source selection was checked locally against a private workspace. That comparison cannot be reproduced from this public repository. Later public fixes are recorded per file."
+  "provenance_note": "The source selection was checked locally against a private workspace. That comparison cannot be reproduced from this public repository. Later public fixes are recorded per file.",
+  "web_source_added_on": "2026-10-13"
 }

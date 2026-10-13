@@ -2,14 +2,14 @@
 
 [English](publication_en.md) | [简体中文](publication.md)
 
-This demo started in a new directory with an independently initialized Git repository, without importing the original commit history. Its creation did not use clone, fork, bundle, cherry-pick from old commits, or an old object database; the new repository is independent of any private backup repository.
+This repository was assembled in a new directory with an independent Git history; it does not import the original repository history or connect to the private backup. The selected public source now includes the React frontend, FastAPI workbench, retrieval and Agent core, CLI sample, and a separate no-key Streamlit sample.
 
-Published files: core source code, demo entry point, configuration placeholder template, dependency declaration, authored sample materials and plan, generated authored sample report, demo screenshots, evaluation summary figures, and accompanying notes.
+This is a source showcase for code review and interviews, not a complete deployment bundle. Users supply the standards corpus, source documents and service credentials, and create local accounts; runtime databases are generated locally. Without those external resources, the corresponding real-document workflows in the main web workbench cannot run. The three existing screenshots are from the initial Streamlit release, not the current React interface. The CLI and Streamlit samples use authored fictional inputs.
 
-Excluded files: original `.env`, complete standards library, full third-party datasets, real plans and customer attachments, personal résumé, original screenshots, logs, vector cache, model weights, database, runtime directories, backup archives, old Git history, and remote configuration.
+Not included: original project configuration, complete standards materials, full third-party datasets, real plans and customer attachments, private evaluation inputs, runtime logs, vector caches, model weights, authentication database, attachments and history, backup archives, or old Git objects.
 
-Review tools: `python scripts/verify_public_tree.py` scans the tree prepared for publication; `python scripts/verify_public_tree.py --tracked` scans files in the Git index. The checks look for sensitive file types, personal absolute paths, known credential formats, and private-key headers, and reject symbolic links. The report outputs only file locations and issue categories to avoid displaying suspected secrets again.
+The public-tree checker is python scripts/verify_public_tree.py; it also supports --tracked to inspect the Git index. Its rules cover only configured sensitive file types, personal paths, and credential patterns. They do not replace manual review of new files and screenshots, or establish company permissions, course permissions, or copyright ownership. Course sources and third-party license boundaries are listed in the [third-party notices](../THIRD_PARTY_NOTICES.md).
 
-Automated scanning can only detect issues covered by its rules. It cannot confirm company agreements, course permissions, or copyright ownership. Source acknowledgements and component licenses are listed in the [third-party notices](../THIRD_PARTY_NOTICES.md).
+The DEMO standard identifiers, thresholds, objects, and plans are authored fiction. They do not cite or replace actual engineering standards. Only aggregate historical evaluation figures are public; original questions, reference answers, plans, full reports, and request records are not included. The repository examples do not reproduce those results.
 
-The DEMO standard identifiers, thresholds, objects, and plans in the sample materials are authored fiction; they do not cite or replace actual engineering standards. Existing evaluations publish aggregate figures only; original questions, reference answers, plans, full reports, and request records are not public.
+The project’s own-code license is in [LICENSE](../LICENSE) and covers only project-owned material. Third-party components remain under their own licenses.

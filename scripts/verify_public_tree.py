@@ -7,7 +7,7 @@ import re
 import subprocess
 
 ROOT = Path(__file__).resolve().parents[1]
-SKIP_DIRS = {'.git', '__pycache__', '.venv', '.pytest_cache', 'output', '.playwright-cli'}
+SKIP_DIRS = {'.git', '__pycache__', '.venv', '.pytest_cache', 'output', '.playwright-cli', 'node_modules', 'dist', 'build', 'data', 'models'}
 FORBIDDEN_SUFFIXES = {'.pem', '.key', '.pfx', '.p12', '.sqlite', '.sqlite3', '.db', '.log', '.zip', '.whl', '.pdf', '.docx', '.csv', '.jsonl'}
 RULES = {
     'private-key': re.compile(r'-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----'),

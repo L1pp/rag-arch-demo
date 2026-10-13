@@ -12,7 +12,7 @@ from streamlit.testing.v1 import AppTest
 from demo.runtime import DEFAULT_PLAN, ScriptedChat, _read_json, build_runtime, plan_document_text
 
 
-APP_PATH = Path(__file__).resolve().parents[1] / "app.py"
+APP_PATH = Path(__file__).resolve().parents[1] / "streamlit_demo.py"
 
 
 class PublicDemoUITests(unittest.TestCase):
