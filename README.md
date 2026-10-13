@@ -31,7 +31,7 @@ python -m pip install -r requirements-demo.txt
 python -m streamlit run streamlit_demo.py --server.address 127.0.0.1 --server.port 8501
 ~~~~
 
-This is a small standalone sample, not the primary React/FastAPI workbench. Its screenshots below are from the initial Streamlit release and are included as historical sample material.
+This is a small standalone sample, not the primary React/FastAPI workbench. Historical screenshots of this standalone Streamlit sample are linked below.
 
 ## Core implementation and contribution
 
@@ -39,13 +39,15 @@ I led the implementation of the building-document assistant and am authorized to
 
 The [architecture guide](docs/architecture_en.md) maps the web and retrieval paths to source files. The [web setup guide](docs/web_setup_en.md) explains the user-provided configuration and data expected by the web app.
 
-## Historical sample screenshots
+## React + FastAPI screenshots
 
-These screenshots show the fictional, offline Streamlit sample from the initial release. They do not depict the current React interface.
+Captured in an isolated temporary screenshot environment, these images show the current React interface with offline sample results wired into the pages. The data is authored and fictional. The regular workbench still requires users to provide API settings, a corpus, and source documents; these screenshots do not verify an online model service or production deployment.
 
-![Historical Streamlit sample: authored materials](docs/screenshots/01-library.png)
-![Historical Streamlit sample: retrieval and citations](docs/screenshots/02-qa.png)
-![Historical Streamlit sample: plan review report](docs/screenshots/03-review.png)
+![Current React workbench with authored fictional data](docs/screenshots/react-01-workbench.png)
+![Current evidence view with offline demo results](docs/screenshots/react-02-evidence.png)
+![Current plan review view with offline demo results](docs/screenshots/react-03-plan-review.png)
+
+The initial Streamlit screenshots remain available: [materials](docs/screenshots/01-library.png), [retrieval and citations](docs/screenshots/02-qa.png), and [plan review](docs/screenshots/03-review.png).
 
 ## Existing results and limitations
 
@@ -62,7 +64,7 @@ Citation checks can verify sources and quoted text. They cannot automatically es
 - rag_arch/: retrieval, evidence, agents, plan review, and report implementation.
 - demo/, examples/: offline CLI sample and authored fictional inputs.
 - streamlit_demo.py: independent small Streamlit sample.
-- docs/: setup, architecture, evaluation, publication scope, and historical screenshots.
+- docs/: setup, architecture, evaluation, publication scope, current React screenshots, and historical Streamlit screenshots.
 
 The [initial validation record](docs/validation_en.md) refers to the original Streamlit sample; it is not a validation report for the current React/FastAPI workbench. The [publication notes](docs/publication_en.md) describe the scope of the public source selection.
 

@@ -29,7 +29,7 @@ python -m pip install -r requirements-demo.txt
 python -m streamlit run streamlit_demo.py --server.address 127.0.0.1 --server.port 8501
 ~~~~
 
-它是轻量独立样例，不是 React/FastAPI 主工作台。下方截图来自首次发布时的 Streamlit 页面，仅作为历史样例材料。
+它是轻量独立样例，不是 React/FastAPI 主工作台。首次发布时的 Streamlit 历史截图见下方链接。
 
 ## 核心实现与贡献范围
 
@@ -37,13 +37,15 @@ python -m streamlit run streamlit_demo.py --server.address 127.0.0.1 --server.po
 
 [架构说明](docs/architecture.md)将 Web 与检索链路映射到源码；[Web 启动说明](docs/web_setup.md)说明主应用所需的配置和由使用者准备的资料。
 
-## 历史样例截图
+## React + FastAPI 界面截图
 
-截图展示首次发布时的虚构资料与 Streamlit 离线样例，不是当前 React 界面。
+截图在隔离的临时环境中拍摄：将离线样例结果接入当前 React 页面。画面资料为自编虚构内容。正常使用主工作台仍需自行配置 API、资料库和来源文件；截图不代表在线模型服务或生产部署已验证。
 
-![历史 Streamlit 样例：自编资料](docs/screenshots/01-library.png)
-![历史 Streamlit 样例：检索和引用](docs/screenshots/02-qa.png)
-![历史 Streamlit 样例：方案核查报告](docs/screenshots/03-review.png)
+![新版工作台：自编虚构资料](docs/screenshots/react-01-workbench.png)
+![新版证据页：离线演示结果](docs/screenshots/react-02-evidence.png)
+![新版方案核查页：离线演示结果](docs/screenshots/react-03-plan-review.png)
+
+首次发布时的 Streamlit 截图仍保留：[资料](docs/screenshots/01-library.png)、[检索与引用](docs/screenshots/02-qa.png)和[方案核查](docs/screenshots/03-review.png)。
 
 ## 现有效果与限制
 
@@ -60,7 +62,7 @@ python -m streamlit run streamlit_demo.py --server.address 127.0.0.1 --server.po
 - rag_arch/：检索、证据、Agent、方案核查和报告实现。
 - demo/、examples/：离线 CLI 样例与自编虚构输入。
 - streamlit_demo.py：独立的小型 Streamlit 样例。
-- docs/：启动、架构、效果、发布范围说明和历史截图。
+- docs/：启动、架构、效果、发布范围说明、新版 React 截图和历史 Streamlit 截图。
 
 [首次发布验证记录](docs/validation.md)验证的是原 Streamlit 样例，不是当前 React/FastAPI 工作台。[发布说明](docs/publication.md)介绍本次公开源码的范围。
 
