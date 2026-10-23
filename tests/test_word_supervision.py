@@ -23,8 +23,8 @@ WINDOWS_EPOCH_TICKS = 621355968000000000
 START_TICKS = str(WINDOWS_EPOCH_TICKS + 1_700_000_000 * 10_000_000 + 1_234_560)
 START_TOKEN = format((Decimal(START_TICKS) - Decimal(WINDOWS_EPOCH_TICKS))
                      / Decimal(10_000_000), ".6f")
-WORD_EXE = r"C:\Program Files\Microsoft Office\root\Office16\WINWORD.EXE"
-POWERSHELL_EXE = r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe"
+WORD_EXE = str(Path(tempfile.gettempdir()) / "synthetic-office" / "WINWORD.EXE")
+POWERSHELL_EXE = str(Path(tempfile.gettempdir()) / "synthetic-powershell" / "powershell.exe")
 
 
 class FakeResourceHandle:
