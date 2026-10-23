@@ -1,17 +1,17 @@
-# 发布范围与复查说明
+# Publication Scope and Review Notes
 
-[English](publication_en.md) | [简体中文](publication.md)
+[English](publication.md) | [简体中文](zh-CN/publication.md)
 
-本仓库从新目录和独立 Git 历史创建，不关联私有备份仓库。公开项目现展示 React 前端、FastAPI API、PostgreSQL 账号与任务状态、独立 AI worker、检索和 Agent 代码，以及自编离线 CLI 样例。Streamlit 已退役并从项目入口移除。
+This repository was created in a new directory with independent Git history. It is not linked to the private backup repository. The public project now presents the React frontend, FastAPI API, PostgreSQL-backed account and task state, independent AI workers, retrieval and agent code, and an authored offline CLI sample. Streamlit is retired and removed as a project entry point.
 
-本仓库用于工程实现展示和面试交流，不是克隆即可运行的完整部署包。完整内部语料、规范原件、真实方案、账号数据库、服务凭据、运行日志、附件历史和基于私有资料生成的派生包均未发布。使用者自行准备 PostgreSQL、模型配置、语料、原件以及工作流所需的检索派生包。
+The repository is a code showcase for engineering review and interviews, not a turnkey deployment bundle. The complete internal corpus, original standards documents, real plans, account database, service credentials, runtime logs, attachment history, and generated packages based on private data are not published. Users provide their own PostgreSQL instance, model configuration, corpus, original files, and derived retrieval packages required by their chosen workflows.
 
-README 截图于 2026-10-13 使用虚构离线样例拍摄，展示较早版本的 React 界面，不包含当前账号隔离、PostgreSQL 持久任务、worker 执行或真实模型行为。截图不作为当前界面验证或生产部署的证据。
+The README evidence screenshot was captured on 2026-10-13 using a fictional offline sample. It shows an earlier React interface, not current account isolation, persistent PostgreSQL tasks, worker execution, or live model behavior. The archived images are visual examples only.
 
-样例中的 DEMO 编号、条文、数值和方案均为虚构。公开的历史评测结果仅为汇总；原始题目、参考答案、方案、完整报告和请求日志仍不公开。结论约束与引用补证实验不作为生产功能介绍。
+The authored DEMO identifiers, clauses, values, and plans are fictional. Public historical evaluation results are aggregate summaries only; source questions, reference answers, plans, complete reports, and request logs remain private. Conclusion-control and citation-recovery experiments are not presented as production features.
 
-本次代码迁移的发布检查记录在[当前验证页](web_validation_20261023.md)。较早验证页只记录旧样例和第一阶段 React 迁移。发布前须依据真实测试与审阅证据补完当前页面。
+The [2026-10-23 validation record](validation/2026-10-23.md) separates the original local PR-candidate checks from the post-merge GitHub CI result. The merged CI passed 208 backend tests, 72 frontend tests, and the 224-file publication scan. Earlier pages retain results for their historical code paths.
 
-仓库中的 scripts/verify_public_tree.py 可进行规则扫描，但它不能证明新增文件都适合公开，也不能独立确认公司或课程授权。发布前仍需检查新增代码、样例、截图、日志、缓存和 Git 变更。课程来源及组件边界见[第三方说明](../THIRD_PARTY_NOTICES.md)。
+The repository includes a public-tree checker at scripts/verify_public_tree.py. Its configured patterns are a useful scan, not proof that all newly added files are safe to publish or that company/course rights have been independently confirmed. Review new code, examples, screenshots, logs, caches, and Git changes before release. Course references and component boundaries are listed in [third-party notices](third_party_notices.md).
 
-本项目自有代码采用 [MIT 许可](../LICENSE)，许可范围是项目自有代码；第三方组件仍适用各自许可。
+Original project code is licensed under [MIT](../LICENSE). The license covers project-owned code; third-party components keep their own licenses.

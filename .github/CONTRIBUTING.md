@@ -9,10 +9,11 @@ Use Python 3.12, Node.js 22, and PostgreSQL for the full backend suite. Create t
 ```sh
 python -m venv .venv-web
 source .venv-web/bin/activate
-python -m pip install -r requirements-web.txt -e .
+python -m pip install -r requirements/web.txt
+python -m pip install --no-deps -e .
 ```
 
-On Windows PowerShell, activate with `.\.venv-web\Scripts\Activate.ps1` instead of `source`. See the [web setup guide](../docs/web_setup_en.md) for database and local startup steps.
+On Windows PowerShell, activate with `.\.venv-web\Scripts\Activate.ps1` instead of `source`. See the [web setup guide](../docs/setup.md) for database and local startup steps.
 
 Install and check the frontend from `frontend/`:
 

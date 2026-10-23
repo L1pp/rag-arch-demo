@@ -53,7 +53,7 @@ jobs:
           echo "$GITHUB_WORKSPACE/.venv-web/bin" >> "$GITHUB_PATH"
 
       - name: Install Python dependencies
-        run: python -m pip install -r requirements-web.txt -e .
+        run: python -m pip install -r requirements/web.txt -e .
 
       - name: Check Python dependencies
         run: python -m pip check

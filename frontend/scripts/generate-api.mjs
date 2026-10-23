@@ -41,7 +41,7 @@ if (!unexpectedArgs.length) {
   try {
     // Avoid probing or downloading a system Python. The project venv is mandatory.
     if (!existsSync(pythonPath)) {
-      throw new Error(`未找到项目虚拟环境 Python：${pythonPath}。请先在项目 .venv-web 中安装 requirements-web.txt。`)
+      throw new Error(`未找到项目虚拟环境 Python：${pythonPath}。请先在项目 .venv-web 中安装 requirements/web.txt。`)
     }
     if (!existsSync(openapiCli)) {
       throw new Error(`未找到本地 openapi-typescript：${openapiCli}。请先在 frontend 目录安装 npm 依赖。`)

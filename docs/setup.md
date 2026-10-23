@@ -1,6 +1,6 @@
 # Run the React + FastAPI Workbench Locally
 
-[English](web_setup_en.md) | [简体中文](web_setup.md) | [Architecture](architecture_en.md)
+[English](setup.md) | [简体中文](zh-CN/setup.md) | [Architecture](architecture.md)
 
 The public workbench runs a React frontend, FastAPI API, PostgreSQL database, and separate AI worker processes. It is a source showcase, not a packaged hosted service. You provide PostgreSQL, model credentials, a corpus, and source documents for any workflow that needs to open original pages.
 
@@ -21,7 +21,7 @@ From the repository root:
 ~~~~powershell
 python -m venv .venv-web
 .\.venv-web\Scripts\Activate.ps1
-python -m pip install -r requirements-web.txt
+python -m pip install -r requirements/web.txt
 python -m pip install --no-deps -e .
 Push-Location frontend
 npm ci
@@ -80,13 +80,13 @@ $env:RAG_ARCH_DATABASE_URL = 'postgresql://<application-user>:<password>@<host>:
 $env:RAG_ARCH_DATABASE_SCHEMA = 'rag_arch'
 $env:RAG_ARCH_AUTH_COOKIE_SECURE = 'false'
 $env:RAG_ARCH_FRONTEND_ORIGINS = 'http://127.0.0.1:5173'
-.\start_web.ps1
+.\scripts\start_web.ps1
 ~~~~
 
 In the second terminal, set the same database variables and run the worker:
 
 ~~~~powershell
-.\start_worker.ps1
+.\scripts\start_worker.ps1
 ~~~~
 
 In the third terminal, start the frontend dev server:

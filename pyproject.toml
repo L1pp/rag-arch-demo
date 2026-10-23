@@ -6,7 +6,7 @@ build-backend = "setuptools.build_meta"
 name = "rag-arch-public-demo"
 version = "0.3.0"
 license = "MIT"
-license-files = ["LICENSE", "THIRD_PARTY_NOTICES.md"]
+license-files = ["LICENSE", "docs/third_party_notices.md"]
 description = "React/FastAPI document assistant source showcase with a separate offline demo"
 requires-python = ">=3.12"
 dependencies = [
