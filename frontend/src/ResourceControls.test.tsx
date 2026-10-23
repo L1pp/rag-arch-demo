@@ -13,7 +13,7 @@ beforeEach(() => {
   state.loaded = true
   state.loading = false
   state.assistants.plan.execution_mode = 'model'
-  state.plans = [{ plan_id: 'DEMO-PLAN-01', label: 'DEMO-PLAN-01 自编方案', filename: 'DEMO-PLAN-01.pdf' }]
+  state.plans = [{ plan_id: 'P01', label: 'P01 主体方案', filename: 'P01.pdf' }]
   context = {
     state,
     dispatch: vi.fn(),
@@ -48,7 +48,7 @@ describe('resource controls', () => {
   })
 
   it('selects a registered plan and submits the full review action', () => {
-    context.state.assistants.plan.draft.registered_plan_id = 'DEMO-PLAN-01'
+    context.state.assistants.plan.draft.registered_plan_id = 'P01'
     render(<ResourceControls id="plan" busy={false}/>)
     fireEvent.click(screen.getByRole('button', { name: '生成整份方案核查报告' }))
     expect(context.send).toHaveBeenCalledWith('plan', false, { prompt: '生成整份方案核查报告', plan_action: 'review' })
@@ -57,7 +57,7 @@ describe('resource controls', () => {
   it('clears upload selection when choosing a registered plan', () => {
     context.state.assistants.plan.draft.attachment_ids = ['asset-1']
     render(<ResourceControls id="plan" busy={false}/>)
-    fireEvent.change(screen.getByRole('combobox', { name: '已登记方案' }), { target: { value: 'DEMO-PLAN-01' } })
-    expect(context.dispatch).toHaveBeenCalledWith({ type: 'draft', id: 'plan', patch: { registered_plan_id: 'DEMO-PLAN-01', attachment_ids: [] } })
+    fireEvent.change(screen.getByRole('combobox', { name: '已登记方案' }), { target: { value: 'P01' } })
+    expect(context.dispatch).toHaveBeenCalledWith({ type: 'draft', id: 'plan', patch: { registered_plan_id: 'P01', attachment_ids: [] } })
   })
 })

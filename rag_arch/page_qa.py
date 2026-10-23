@@ -9,6 +9,7 @@ from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage
 from langchain_core.utils.function_calling import convert_to_openai_tool
 
 from .multimodal import image_source_record, page_result_messages
+from .async_support import run_local
 from .web_evidence import (NATIVE_TOOLS_INSTRUCTION, WEB_SEARCH_INSTRUCTION,
                            native_web_observation, web_observation)
 from .plan_review_context import ContextBudgetError, estimate_messages, estimate_tokens
@@ -257,6 +258,137 @@ def invoke_with_pages(chat_model, messages, page_service=None, *, budget_tokens,
                                         _has_text=bool(result.get("text")))
             except Exception as exc:
                 receipts.append(_error(call, f"{type(exc).__name__}: {exc}"))
+        current.extend(receipts)
+        current.extend(pictures)
+        if used >= max_tool_calls:
+            final_only = True
+            forced_finish = True
+            warnings.append("本轮已达到资料工具调用上限，已使用当前依据生成回答。")
+            current.append(HumanMessage(content="本轮资料工具调用已结束。请根据当前已取得的文字、页图或网页参考回答；未读取的内容明确说明。"))
+
+
+async def ainvoke_with_pages(chat_model, messages, page_service=None, *, budget_tokens,
+                             max_tool_calls=8, web_provider=None) -> PageQAResult:
+    """Async counterpart to :func:`invoke_with_pages`.
+
+    Model and network operations use native async interfaces. Page rendering,
+    file access, and image/message preparation run through the bounded local
+    executor so synchronous page services cannot block the event loop.
+    """
+    if type(max_tool_calls) is not int or max_tool_calls < 0:
+        raise ValueError("页图工具调用上限须为非负整数。")
+    if type(budget_tokens) is not int or budget_tokens <= 0:
+        raise ValueError("页图问答输入预算须为正整数。")
+    web_provider = enabled_web_provider(web_provider, chat_model)
+    native_enabled = bool(native_tool_names(chat_model))
+    source_rows = (await run_local(registered_sources, page_service)
+                   if page_service is not None else [])
+    refs = {row["source_ref"] for row in source_rows}
+    collection_id = (await run_local(getattr, page_service, "collection_id", None)
+                     if page_service is not None else None)
+    if page_service is not None and (not isinstance(collection_id, str) or not collection_id):
+        collection_id = "page_sources:" + json.dumps(
+            sorted(refs), ensure_ascii=False)
+    context = await run_local(page_context_messages, page_service, web_provider, native_enabled)
+    current = [row for row in context if isinstance(row, SystemMessage)] + list(messages)
+    current.extend(row for row in context if not isinstance(row, SystemMessage))
+    schemas = await run_local(_tool_schemas, page_service, web_provider)
+    schema_tokens = (await run_local(estimate_tokens, json.dumps(schemas, ensure_ascii=False))
+                     if schemas else 0)
+    bound = chat_model.bind_tools(schemas) if max_tool_calls and schemas else chat_model
+    sources = {}
+    web_sources = []
+    native_observations, native_usage_calls, native_counts = [], [], {}
+    native_reference_metadata = False
+    warnings = []
+    used = 0
+    final_only = max_tool_calls == 0 or not schemas
+    forced_finish = max_tool_calls == 0
+    while True:
+        token_count = await run_local(estimate_messages, current,
+                                      0 if final_only else schema_tokens)
+        if token_count > budget_tokens:
+            raise ContextBudgetError("本轮资料与文字超过可用输入预算，未发送超限请求；请减少本轮范围。")
+        model = without_native_tools(chat_model) if forced_finish else chat_model if final_only else bound
+        response = await model.ainvoke(current)
+        native_payload, web_sources = await run_local(native_web_observation, response, web_sources)
+        native_reference_metadata = native_reference_metadata or bool(native_payload.get("sources"))
+        native_observations.extend(native_payload.get("native_tool_observations", []))
+        usage = native_payload.get("native_tool_usage", {})
+        if usage:
+            native_usage_calls.append(deepcopy(usage))
+            for name, count in usage.get("counts", {}).items():
+                if type(count) is int:
+                    native_counts[name] = native_counts.get(name, 0) + count
+        # Sources become delivered only after a model request using them succeeds.
+        for source in sources.values():
+            source["sent_to_model"] = source["image_available"]
+            source["text_sent_to_model"] = source.pop(
+                "_has_text", source.get("text_sent_to_model", False))
+        for source in web_sources:
+            source["sent_to_model"] = True
+        calls = getattr(response, "tool_calls", None) or []
+        if not calls:
+            return PageQAResult(
+                response, list(sources.values()), warnings, web_sources,
+                native_observations,
+                {"counts": native_counts, "by_model_call": native_usage_calls}
+                if native_usage_calls else {},
+                native_reference_metadata, tool_calls=used)
+        if final_only:
+            raise RuntimeError("模型在页图工具结束后仍请求工具，未生成最终回答。")
+        ids = [call.get("id") for call in calls]
+        if any(not isinstance(call_id, str) or not call_id for call_id in ids) or len(set(ids)) != len(ids):
+            raise ValueError("模型返回的工具调用编号为空或重复，无法配对工具回执。")
+        current.append(response)
+        receipts, pictures = [], []
+        for call in calls:
+            if used >= max_tool_calls:
+                receipts.append(_error(call, "本轮已达到资料工具调用上限，请用已有依据完成回答。"))
+                continue
+            used += 1
+            try:
+                name = call.get("name")
+                if name == "search_web":
+                    if web_provider is None:
+                        raise ValueError("本轮未启用网页搜索工具。")
+                    args = call.get("args")
+                    if (not isinstance(args, dict) or set(args) != {"query"}
+                            or not isinstance(args["query"], str)
+                            or not 1 <= len(args["query"].strip()) <= 2000):
+                        raise ValueError("search_web仅接受1至2000字符的query。")
+                    result = await web_provider.asearch(args["query"].strip())
+                    payload, web_sources = await run_local(web_observation, result, web_sources)
+                    receipt_text = await run_local(json.dumps, payload, ensure_ascii=False)
+                    receipts.append(ToolMessage(content=receipt_text,
+                                                tool_call_id=call["id"], name=name))
+                    continue
+                args = await run_local(_validate_args, name, call.get("args"), refs)
+                if name == "list_document_pages":
+                    result = await run_local(page_service.list_pages, **args)
+                    receipt_text = await run_local(json.dumps, result, ensure_ascii=False)
+                    receipts.append(ToolMessage(content=receipt_text,
+                                                tool_call_id=call["id"], name=name))
+                    continue
+                result = dict(await run_local(page_service.read_page, **args))
+                if result.get("ok"):
+                    if (result.get("source_ref") != args["source_ref"] or result.get("page") != args["page"]):
+                        raise ValueError("页图服务返回的来源或物理页与请求不一致。")
+                    if not result.get("image_bytes") and not result.get("text"):
+                        raise ValueError("页图服务未返回图像或可读文字。")
+                    key = (args["source_ref"], args["page"])
+                    display_id = sources[key]["display_id"] if key in sources else f"P{len(sources) + 1}"
+                    result.update(display_id=display_id, citation=f"[{display_id}]")
+                packet = await run_local(page_result_messages, result, call["id"], name)
+                receipts.extend(row for row in packet if isinstance(row, ToolMessage))
+                pictures.extend(row for row in packet if not isinstance(row, ToolMessage))
+                if result.get("ok"):
+                    record = await run_local(image_source_record, result)
+                    sources[key] = dict(record, collection_id=collection_id,
+                                        _has_text=bool(result.get("text")))
+            except Exception as exc:
+                receipts.append(_error(call, f"{type(exc).__name__}: {exc}"))
+        # Tool receipts must precede any image messages for the same assistant turn.
         current.extend(receipts)
         current.extend(pictures)
         if used >= max_tool_calls:

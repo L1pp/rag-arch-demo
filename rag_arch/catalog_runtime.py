@@ -54,6 +54,10 @@ def discover_catalog(index, query, filters=None, limit=10):
     if selected:
         allowed = {entry["catalog_id"] for name in selected for entry in index.get(name)["matches"]}
         matches = [entry for entry in matches if entry["catalog_id"] in allowed]
+    return _project_catalog_matches(matches, limit)
+
+
+def _project_catalog_matches(matches, limit):
     seen, result = {}, []
     for entry in matches:
         identity = entry["catalog_id"]
@@ -63,6 +67,48 @@ def discover_catalog(index, query, filters=None, limit=10):
         elif result[seen[identity]].get("candidate_only") and not entry.get("candidate_only"):
             result[seen[identity]] = project_catalog(entry)
     return result[:limit]
+
+
+def _selected_catalog_ids(index, selected):
+    return {entry["catalog_id"] for name in selected for entry in index.get(name)["matches"]}
+
+
+async def adiscover_catalog(index, query, filters=None, limit=10):
+    """Async catalog discovery that never runs a synchronous embedding call on the loop."""
+    from .async_support import run_local
+
+    filters = filters or {}
+    selected = filters.get("std_nos", [filters["std_no"]] if filters.get("std_no") else [])
+    selected = [selected] if isinstance(selected, str) else selected
+    requested = explicit_standard_requests(query)
+    if requested or selected:
+        matches = []
+        names = [row["raw"] for row in parse_standard_references(query)] if requested else selected
+        candidates = getattr(index, "acandidates", None)
+        for name in names:
+            if callable(candidates):
+                rows = await candidates(name, limit=limit)
+            else:
+                # Legacy in-memory catalogs can still be queried off-loop. If
+                # embeddings are configured, candidates() may perform network
+                # I/O and must have an explicit async adapter instead.
+                if getattr(index, "embeddings", None) is not None:
+                    raise RuntimeError("启用了目录向量服务，但目录索引没有异步候选接口。")
+                rows = await run_local(index.candidates, name, limit=limit)
+            exact = [row for row in rows if row.get("candidate_only") is False]
+            matches.extend(exact or rows)
+    else:
+        candidates = getattr(index, "acandidates", None)
+        if callable(candidates):
+            matches = await candidates(query, limit=limit)
+        else:
+            if getattr(index, "embeddings", None) is not None:
+                raise RuntimeError("启用了目录向量服务，但目录索引没有异步候选接口。")
+            matches = await run_local(index.candidates, query, limit=limit)
+    if selected:
+        allowed = await run_local(_selected_catalog_ids, index, selected)
+        matches = [entry for entry in matches if entry["catalog_id"] in allowed]
+    return await run_local(_project_catalog_matches, matches, limit)
 
 
 def catalog_metadata_query(query):

@@ -3,13 +3,16 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from collections import OrderedDict
+from decimal import Decimal, InvalidOperation
 import math
+import json
 import os
 from pathlib import Path
 import re
 import shutil
 import subprocess
 import threading
+import time
 from typing import Any, Callable
 from uuid import uuid4
 from xml.etree import ElementTree
@@ -266,6 +269,9 @@ class DocumentPageService:
                     temp.replace(pdf_path)
                     source.rendered_pdf = pdf_path
                 except (OSError, RuntimeError) as exc:
+                    from .resource_supervision import ResourceCleanupUncertain
+                    if isinstance(exc, ResourceCleanupUncertain):
+                        raise
                     raise ValueError("文件排版失败，未生成可用分页 PDF。") from exc
                 finally:
                     temp.unlink(missing_ok=True)
@@ -418,12 +424,81 @@ class DocumentPageService:
                     self._page_cache.popitem(last=False)
             return result
 
+    @staticmethod
+    def _resource_api():
+        from .resource_supervision import ResourceCleanupUncertain, begin_resource, probe_process
+        return ResourceCleanupUncertain, begin_resource, probe_process
+
+    @staticmethod
+    def _decode_process_output(value: Any) -> str:
+        if isinstance(value, bytes):
+            return value.decode("utf-8", errors="replace")
+        return value if isinstance(value, str) else ""
+
+    @staticmethod
+    def _merge_process_output(complete: Any, partial: Any) -> str:
+        complete_text = DocumentPageService._decode_process_output(complete)
+        partial_text = DocumentPageService._decode_process_output(partial)
+        if not partial_text or partial_text in complete_text:
+            return complete_text
+        separator = "" if not complete_text or complete_text.endswith("\n") else "\n"
+        return complete_text + separator + partial_text
+
+    @staticmethod
+    def _read_word_owner(owner: Path) -> dict:
+        try:
+            value = json.loads(owner.read_text(encoding="utf-8-sig"))
+        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+            raise ValueError("Word 所有者文件缺失或无法解析。") from exc
+        if (not isinstance(value, dict) or value.get("owned") is not True
+                or isinstance(value.get("pid"), bool) or not isinstance(value.get("pid"), int)
+                or value["pid"] < 1
+                or not isinstance(value.get("start_ticks"), str)
+                or not value["start_ticks"].isascii() or not value["start_ticks"].isdigit()
+                or not isinstance(value.get("executable"), str)
+                or not os.path.isabs(value["executable"])
+                or Path(value["executable"]).name.casefold() != "winword.exe"):
+            raise ValueError("Word 所有者文件中的 PID、StartTicks 或可执行文件身份无效。")
+        try:
+            unix_seconds = float(
+                (Decimal(value["start_ticks"]) - Decimal(621355968000000000))
+                / Decimal(10000000))
+        except (InvalidOperation, OverflowError, ValueError) as exc:
+            raise ValueError("Word 所有者文件中的 StartTicks 无效。") from exc
+        if not math.isfinite(unix_seconds) or unix_seconds < 0:
+            raise ValueError("Word 所有者文件中的 StartTicks 无效。")
+        # Match task_worker.process_start_token and psutil's six-decimal epoch
+        # representation, including its float rounding at half-microsecond ticks.
+        value["process_start_token"] = f"{unix_seconds:.6f}"
+        return value
+
+    @staticmethod
+    def _stop_powershell(process: subprocess.Popen, timeout: float = 5) -> tuple[str, str]:
+        """Stop and reap only the exact child represented by this Popen handle."""
+        if process.poll() is None:
+            try:
+                process.terminate()
+            except OSError:
+                if process.poll() is None:
+                    process.kill()
+        try:
+            stdout, stderr = process.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            stdout, stderr = process.communicate(timeout=timeout)
+        if process.poll() is None:
+            raise TimeoutError("The owned PowerShell process is still running after termination.")
+        return (DocumentPageService._decode_process_output(stdout),
+                DocumentPageService._decode_process_output(stderr))
+
     def _render_with_word(self, source: Path, output: Path) -> None:
         executable = shutil.which("powershell.exe") or shutil.which("pwsh")
         script = self.project_root / "scripts/render_docx_pages.ps1"
         if not executable or not script.is_file():
             raise ValueError("未找到本地 Word 转换脚本或 PowerShell。")
         owner = output.with_suffix(".owner.json")
+        if owner.exists():
+            raise ValueError("本次 Word 所有者文件已存在，拒绝覆盖。")
         # Scope execution policy to this trusted converter process; Group Policy
         # still takes precedence and no user or machine policy is changed.
         common = [executable, "-NoLogo", "-NoProfile", "-NonInteractive",
@@ -431,32 +506,283 @@ class DocumentPageService:
         temp_dir = output.parent / ("word-temp-" + uuid4().hex)
         temp_dir.mkdir()
         child_env = {**os.environ, "TEMP": str(temp_dir), "TMP": str(temp_dir)}
-        kwargs = {"capture_output": True, "text": True, "encoding": "utf-8", "errors": "replace",
-                  "env": child_env}
+        kwargs = {"stdout": subprocess.PIPE, "stderr": subprocess.PIPE,
+                  "text": True, "encoding": "utf-8", "errors": "replace", "env": child_env}
         if hasattr(subprocess, "CREATE_NO_WINDOW"):
             kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
-        try:
-            result = subprocess.run(common + ["-InputPath", str(source), "-OutputPath", str(output),
-                                              "-OwnerFile", str(owner)],
-                                    timeout=self.conversion_timeout, **kwargs)
-            output.with_suffix(".log").write_text(
-                result.stdout + "\n" + result.stderr, encoding="utf-8")
-            if result.returncode:
-                raise ValueError("DOCX 的 Word 后台排版失败；详细原因已保存在本次缓存日志。")
-        except subprocess.TimeoutExpired as exc:
-            # TimeoutExpired may hold bytes even when subprocess.run uses text=True.
-            captured = [part.decode("utf-8", errors="replace") if isinstance(part, bytes)
-                        else (part or "") for part in (exc.stdout, exc.stderr)]
-            output.with_suffix(".log").write_text(
-                "\n".join(captured + [f"Word conversion timed out after {exc.timeout}s."]),
-                encoding="utf-8")
-            raise ValueError("Word 排版超时，已停止本次转换；未操作其他已打开的 Word。") from exc
-        finally:
-            # Clean up only the recorded PID and creation time, including normal failures.
+
+        ResourceCleanupUncertain, begin_resource, probe_process = self._resource_api()
+        word_resource = begin_resource(kind="word", scope="task", owner_path=str(owner))
+        main_resource = None
+        powershell_resources = []
+        main_process = None
+        main_attached = False
+        main_completed = False
+        main_stdout = ""
+        main_stderr = ""
+        primary_error: BaseException | None = None
+        cleanup_errors: list[BaseException] = []
+        cleanup_failures: list[BaseException] = []
+        word_record = None
+        word_attached = False
+        cleanup_stdout = ""
+        cleanup_stderr = ""
+        cleanup_exit_code: int | None = None
+        word_confirmed_exited = False
+
+        def record_unknown(handle, code: str) -> None:
             try:
-                cleanup = subprocess.run(common + ["-OwnerFile", str(owner), "-CleanupOnly"],
-                                         timeout=15, **kwargs)
-                if cleanup.returncode == 0:
-                    owner.unlink(missing_ok=True)
-            except (OSError, subprocess.TimeoutExpired):
-                pass
+                handle.unknown(code)
+            except BaseException as exc:
+                cleanup_errors.append(exc)
+
+        def record_cleanup_failure(exc: BaseException) -> None:
+            if isinstance(exc, ResourceCleanupUncertain):
+                cleanup_errors.append(exc)
+            else:
+                cleanup_failures.append(exc)
+
+        def record_exited(handle, code: str) -> bool:
+            try:
+                handle.exited()
+                return True
+            except BaseException as exc:
+                cleanup_errors.append(exc)
+                record_unknown(handle, code)
+                return False
+
+        def attach_word_record() -> bool:
+            nonlocal word_record, word_attached, word_confirmed_exited
+            if word_record is not None:
+                return word_attached
+            if not owner.is_file():
+                return False
+            try:
+                word_record = self._read_word_owner(owner)
+                status = probe_process(
+                    word_record["pid"], word_record["process_start_token"],
+                    executable=word_record["executable"])
+                if status == "exited":
+                    word_resource.attach_exited_process(
+                        word_record["pid"], word_record["process_start_token"],
+                        executable=word_record["executable"])
+                    word_confirmed_exited = True
+                elif status == "running":
+                    word_resource.attach_process(
+                        word_record["pid"],
+                        process_start_token=word_record["process_start_token"],
+                        executable=word_record["executable"])
+                    word_resource.used()
+                else:
+                    word_resource.unknown("word_owner_process_identity_unknown")
+                word_attached = True
+            except BaseException as exc:
+                cleanup_errors.append(exc)
+                record_unknown(word_resource, "word_owner_identity_unverified")
+            return word_attached
+
+        def run_cleanup_process() -> None:
+            nonlocal cleanup_stdout, cleanup_stderr, cleanup_exit_code
+            cleanup_resource = begin_resource(
+                kind="powershell", scope="task", owner_path=str(owner))
+            powershell_resources.append(cleanup_resource)
+            process = None
+            attached = False
+            try:
+                process = subprocess.Popen(common + ["-OwnerFile", str(owner), "-CleanupOnly"],
+                                           **kwargs)
+            except BaseException:
+                cleanup_resource.exited()
+                raise
+            try:
+                cleanup_resource.attach_process(process.pid, executable=str(executable))
+                cleanup_resource.used()
+                attached = True
+                cleanup_stdout, cleanup_stderr = process.communicate(timeout=15)
+                cleanup_exit_code = process.returncode
+            except BaseException as exc:
+                cleanup_failures.append(exc)
+                try:
+                    extra_out, extra_err = self._stop_powershell(process)
+                    cleanup_stdout = cleanup_stdout or extra_out
+                    cleanup_stderr = cleanup_stderr or extra_err
+                except BaseException as stop_exc:
+                    cleanup_failures.append(stop_exc)
+                    record_unknown(cleanup_resource, "word_cleanup_powershell_exit_unverified")
+                cleanup_exit_code = process.returncode
+            finally:
+                if attached and process.poll() is not None:
+                    record_exited(cleanup_resource, "word_cleanup_powershell_exit_unverified")
+                elif not attached and process.poll() is not None:
+                    record_unknown(cleanup_resource, "word_cleanup_powershell_attach_failed")
+                elif process.poll() is None:
+                    record_unknown(cleanup_resource, "word_cleanup_powershell_exit_unverified")
+
+        try:
+            main_resource = begin_resource(
+                kind="powershell", scope="task", owner_path=str(owner))
+            powershell_resources.append(main_resource)
+            try:
+                main_process = subprocess.Popen(
+                    common + ["-InputPath", str(source), "-OutputPath", str(output),
+                              "-OwnerFile", str(owner)], **kwargs)
+            except BaseException:
+                main_resource.exited()
+                raise
+            try:
+                main_resource.attach_process(main_process.pid, executable=str(executable))
+                main_resource.used()
+                main_attached = True
+            except BaseException as exc:
+                primary_error = exc
+                record_unknown(main_resource, "word_renderer_powershell_attach_failed")
+            if primary_error is None:
+                deadline = time.monotonic() + self.conversion_timeout
+                timeout_error = None
+                while True:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        timeout_error = subprocess.TimeoutExpired(
+                            main_process.args, self.conversion_timeout,
+                            output=main_stdout, stderr=main_stderr)
+                        break
+                    try:
+                        from .request_control import check_request_control
+                        check_request_control()
+                        main_stdout, main_stderr = main_process.communicate(
+                            timeout=min(0.2, remaining))
+                        main_completed = True
+                        if main_process.returncode:
+                            primary_error = ValueError(
+                                "DOCX 的 Word 后台排版失败；详细原因已保存在本次缓存日志。")
+                        if main_attached:
+                            record_exited(main_resource,
+                                          "word_renderer_powershell_exit_unverified")
+                        break
+                    except subprocess.TimeoutExpired as exc:
+                        timeout_error = exc
+                        main_stdout = self._decode_process_output(exc.stdout)
+                        main_stderr = self._decode_process_output(exc.stderr)
+                        attach_word_record()
+                        if time.monotonic() >= deadline:
+                            break
+                    except BaseException as exc:
+                        primary_error = exc
+                        attach_word_record()
+                        break
+                if timeout_error is not None and primary_error is None:
+                    primary_error = ValueError(
+                        f"Word 排版超时（{self.conversion_timeout:g}s）；"
+                        "详细过程已保存在本次缓存日志。")
+                    primary_error.__cause__ = timeout_error
+        except BaseException as exc:
+            if primary_error is None:
+                primary_error = exc
+
+        # The script publishes the PID+StartTicks record immediately after
+        # creating Word, before opening the DOCX. Give that atomic write a short,
+        # bounded chance to complete after cancellation/timeout.
+        if not owner.exists() and main_process is not None and main_process.poll() is None:
+            deadline = time.monotonic() + 2.0
+            while not owner.exists() and time.monotonic() < deadline:
+                time.sleep(0.05)
+        attach_word_record()
+
+        # On timeout/cancellation, clean the exact Word PID first. A missing or
+        # malformed owner record is never treated as proof of exit.
+        if word_record is not None and not word_confirmed_exited:
+            try:
+                run_cleanup_process()
+            except BaseException as exc:
+                record_cleanup_failure(exc)
+
+        # If PowerShell was still running, stop only its Popen child handle after
+        # the Word cleanup attempt, wait boundedly, and verify the same child.
+        if main_process is not None and main_process.poll() is None:
+            try:
+                out, err = self._stop_powershell(main_process)
+                main_stdout = self._merge_process_output(out, main_stdout)
+                main_stderr = self._merge_process_output(err, main_stderr)
+                main_completed = True
+            except BaseException as exc:
+                cleanup_failures.append(exc)
+                record_unknown(main_resource, "word_renderer_powershell_exit_unverified")
+
+        if main_resource is not None and main_attached and main_process is not None \
+                and main_process.poll() is not None \
+                and not getattr(main_resource, "_verified_exited", False):
+                record_exited(main_resource, "word_renderer_powershell_exit_unverified")
+
+        # If Word published its record while the converter was being stopped,
+        # read and clean that now. If the process reached the creation stage but
+        # no verifiable record exists, keep the resource unresolved.
+        if word_record is None and owner.exists():
+            attach_word_record()
+            if word_record is not None:
+                try:
+                    run_cleanup_process()
+                except BaseException as exc:
+                    record_cleanup_failure(exc)
+
+        if word_attached:
+            if not word_confirmed_exited:
+                word_confirmed_exited = record_exited(
+                    word_resource, "owned_word_exit_unverified")
+        elif main_process is None:
+            word_confirmed_exited = record_exited(
+                word_resource, "word_not_started_state_unverified")
+        elif main_completed and "DOCX_PAGE_RENDER_STAGE:create_word" not in main_stdout:
+            # The converter exited before its explicit pre-COM creation marker.
+            word_confirmed_exited = record_exited(word_resource, "word_not_started_unverified")
+        else:
+            record_unknown(word_resource, "word_owner_file_missing_or_invalid")
+
+        all_processes_confirmed = (
+            word_confirmed_exited
+            and all(getattr(handle, "_verified_exited", False)
+                    for handle in powershell_resources))
+        if owner.exists() and not all_processes_confirmed:
+            # Keep the evidence file available for operator recovery whenever
+            # any process identity or wait result remains uncertain.
+            pass
+        elif owner.exists():
+            owner.unlink(missing_ok=True)
+        if all_processes_confirmed:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+
+        log_parts = [self._decode_process_output(main_stdout),
+                     self._decode_process_output(main_stderr)]
+        if cleanup_stdout or cleanup_stderr:
+            log_parts.extend(["Word cleanup:", self._decode_process_output(cleanup_stdout),
+                              self._decode_process_output(cleanup_stderr)])
+        if isinstance(primary_error, ValueError) and primary_error.__cause__ is not None \
+                and isinstance(primary_error.__cause__, subprocess.TimeoutExpired):
+            log_parts.append(str(primary_error))
+        log_error = None
+        try:
+            output.with_suffix(".log").write_text("\n".join(log_parts), encoding="utf-8")
+        except OSError as exc:
+            log_error = exc
+
+        if cleanup_errors:
+            uncertain = next((error for error in cleanup_errors
+                              if isinstance(error, ResourceCleanupUncertain)), None)
+            if uncertain is not None:
+                raise uncertain from primary_error
+            raise ResourceCleanupUncertain("word_cleanup_unconfirmed") from cleanup_errors[0]
+
+        if (word_record is not None and cleanup_exit_code is not None
+                and (cleanup_exit_code != 0
+                     or "DOCX_PAGE_WORD_CLEANUP_VERIFIED" not in cleanup_stdout)):
+            if primary_error is None:
+                primary_error = ValueError(
+                    "Word 清理脚本未返回可验证的退出确认；详细过程已保存在本次缓存日志。")
+        if cleanup_failures and primary_error is None:
+            primary_error = ValueError(
+                "Word 清理子进程未能正常完成；详细过程已保存在本次缓存日志。")
+            primary_error.__cause__ = cleanup_failures[0]
+        if log_error is not None and primary_error is None:
+            primary_error = ValueError("Word 转换日志无法写入本次缓存。")
+            primary_error.__cause__ = log_error
+        if primary_error is not None:
+            raise primary_error

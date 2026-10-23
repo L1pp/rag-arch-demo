@@ -9,11 +9,7 @@ from starlette.concurrency import run_in_threadpool
 
 from ..config import DEFAULT_PLAN_MAX_STEPS, DEFAULT_PLAN_MAX_TOOL_CALLS
 from ..loaders import MAX_UPLOAD_BYTES, validate_upload_sizes
-
-
-def check_workspace(request, workspace_id):
-    if workspace_id != request.app.state.tasks.workspace_id:
-        raise HTTPException(409, "工作区已失效，请重新获取当前工作区。")
+from .tenancy import check_workspace, current_documents
 
 
 def validate_task_documents(body, store):
@@ -62,14 +58,21 @@ def create_document_router():
             raise HTTPException(503, "当前页面暂不支持：分页或渲染未完成，请稍后重试。") from None
 
     @router.get("/api/uploads")
-    def uploads(request: Request, workspace_id: str):
+    def uploads(request: Request, workspace_id: str, response: Response):
+        store = current_documents(request)
         check_workspace(request, workspace_id)
-        return {"uploads": [asset_view(row, workspace_id) for row in request.app.state.documents.list()]}
+        response.headers["Cache-Control"] = "private, no-store"
+        response.headers["Vary"] = "Cookie"
+        return {"uploads": [asset_view(row, workspace_id) for row in store.list()]}
 
     @router.post("/api/uploads", status_code=201, openapi_extra={"requestBody": {
         "required": True, "content": {"application/octet-stream": {"schema": {"type": "string", "format": "binary"}}}}})
-    async def upload(request: Request, workspace_id: str, filename: str = Query(min_length=1, max_length=255)):
+    async def upload(request: Request, workspace_id: str, response: Response,
+                     filename: str = Query(min_length=1, max_length=255)):
+        store = current_documents(request)
         check_workspace(request, workspace_id)
+        response.headers["Cache-Control"] = "private, no-store"
+        response.headers["Vary"] = "Cookie"
         content_length = request.headers.get("content-length", "")
         if content_length.isdigit() and int(content_length) > MAX_UPLOAD_BYTES:
             raise HTTPException(413, "单个文件不能超过 10 MB。")
@@ -78,26 +81,28 @@ def create_document_router():
             if len(content) + len(chunk) > MAX_UPLOAD_BYTES:
                 raise HTTPException(413, "单个文件不能超过 10 MB。")
             content.extend(chunk)
-        result = await run_in_threadpool(lambda: read(lambda: request.app.state.documents.add(filename, bytes(content))))
+        result = await run_in_threadpool(lambda: read(lambda: store.add(filename, bytes(content))))
         return asset_view(result, workspace_id)
 
     @router.get("/api/uploads/{asset_id}/download")
     def original(asset_id: str, request: Request, workspace_id: str):
+        store = current_documents(request)
         check_workspace(request, workspace_id)
-        asset = read(lambda: request.app.state.documents.get(asset_id))
-        return FileResponse(asset.path, filename=asset.filename)
+        asset = read(lambda: store.get(asset_id))
+        return FileResponse(asset.path, filename=asset.filename,
+                            headers={"Cache-Control": "private, no-store", "Vary": "Cookie"})
 
     @router.get("/api/plans")
     def plans(request: Request):
-        rows = read(lambda: request.app.state.documents.registered_plans())
+        store = current_documents(request)
+        rows = read(lambda: store.registered_plans())
         return {"plans": [{**row, "page_url": "/viewer/pages?" + urlencode({"plan_id": row["plan_id"]})
                            if Path(row["filename"]).suffix.lower() in {".pdf", ".docx"} else None} for row in rows],
                 "defaults": {"max_steps": DEFAULT_PLAN_MAX_STEPS, "max_tool_calls": DEFAULT_PLAN_MAX_TOOL_CALLS}}
 
-    def page_service(request, asset, plan_id, workspace_id):
+    def page_service(request, store, asset, plan_id, workspace_id):
         if bool(asset) == bool(plan_id):
             raise ValueError("请选择一个上传文件或一份已登记方案。")
-        store = request.app.state.documents
         if asset:
             check_workspace(request, workspace_id)
             source = store.get(asset)
@@ -109,10 +114,15 @@ def create_document_router():
         return store.pages_for_plan(plan.document, plan.asset, corpus=None), plan.document.filename, plan_id
 
     @router.get("/api/documents/pages")
-    def pages(request: Request, asset: str | None = None, plan_id: str | None = None,
-              workspace_id: str | None = None, source_ref: str | None = None, page: int = Query(default=1, ge=1)):
+    def pages(request: Request, response: Response, asset: str | None = None, plan_id: str | None = None,
+              workspace_id: str | None = None, source_ref: str | None = None,
+              page: int = Query(default=1, ge=1)):
+        store = current_documents(request)
+        response.headers["Cache-Control"] = "private, no-store"
+        response.headers["Vary"] = "Cookie"
+
         def perform():
-            service, title, code = page_service(request, asset, plan_id, workspace_id)
+            service, title, code = page_service(request, store, asset, plan_id, workspace_id)
             sources = service.sources()
             if not sources:
                 raise ValueError("此来源暂不支持分页图像；PDF和DOCX原件可按页查看。")
@@ -133,10 +143,13 @@ def create_document_router():
     @router.get("/api/documents/page-image")
     def image(request: Request, source_ref: str, page: int = Query(ge=1), asset: str | None = None,
               plan_id: str | None = None, workspace_id: str | None = None):
+        store = current_documents(request)
+
         def perform():
-            service, _, _ = page_service(request, asset, plan_id, workspace_id)
+            service, _, _ = page_service(request, store, asset, plan_id, workspace_id)
             return service.read_page(source_ref, page)["image_bytes"]
         data = read(perform, page=True)
-        return Response(data, media_type="image/png", headers={"Cache-Control": "private, max-age=300"})
+        return Response(data, media_type="image/png",
+                        headers={"Cache-Control": "private, no-store", "Vary": "Cookie"})
 
     return router

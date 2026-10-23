@@ -2,12 +2,14 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
+from collections.abc import Mapping, Sequence
 import json
 from copy import deepcopy
 from pathlib import Path
 from uuid import uuid4
 import math
 
+from .async_support import run_local
 from .models import Chunk, SearchHit
 from .retrieval import LocalIndex
 from .standards import StandardCorpus, load_corpus, _standard_key
@@ -146,16 +148,58 @@ def _record_chunk(record: dict, kind: str, collection_id: str) -> Chunk:
                  "\n\n".join(part for part in parts if part), locator, "standard", collection_id)
 
 
+class _ChunkMapping(Mapping):
+    """ID lookup without retaining decoded Chunk objects."""
+
+    def __init__(self, chunks, row_ids):
+        self.chunks = chunks
+        self.rows = {value: i for i, value in enumerate(row_ids)}
+
+    def __getitem__(self, key):
+        return self.chunks[self.rows[key]]
+
+    def __iter__(self):
+        return iter(self.rows)
+
+    def __len__(self):
+        return len(self.rows)
+
+    def __contains__(self, key):
+        return key in self.rows
+
+
+class _ChunkRows(Sequence):
+    """An amendment's row selection, decoded only when actually examined."""
+
+    def __init__(self, chunks, rows):
+        self.chunks, self.rows = chunks, tuple(rows)
+
+    def __len__(self):
+        return len(self.rows)
+
+    def __getitem__(self, key):
+        if isinstance(key, slice):
+            return type(self)(self.chunks, self.rows[key])
+        return self.chunks[self.rows[key]]
+
+
 class EvidenceIndex:
     """Raw ranking treats each clause/table as a separate ID, then expands tables.
 
     No exact-ID shortcut is applied to benchmark retrieval. Tools may explicitly
     use get_clause/get_table. Missing table text affects evidence completeness,
     not whether unrelated readable clauses can be loaded and queried.
+
+    ``prepared_vectors`` follows the generated clause/table chunk order and is
+    attached read-only after BM25 statistics are prepared. The embedding provider
+    then supplies query vectors without a document-embedding request.
+    ``bm25_directory`` attaches the public immutable lexical package instead of
+    constructing per-document Python Counters. Corpus and evidence stay local.
     """
 
     def __init__(self, corpus: StandardCorpus, embeddings=None, reranker=None,
-                 candidate_pool: int = 30, rrf_constant: int = 60):
+                 candidate_pool: int = 30, rrf_constant: int = 60, *,
+                 prepared_vectors=None, bm25_directory=None):
         if candidate_pool < 1 or rrf_constant < 1:
             raise ValueError("候选池和 RRF 常数须为正数。")
         self.corpus = corpus
@@ -165,25 +209,83 @@ class EvidenceIndex:
         self.reranker = reranker
         self.embeddings = embeddings
         self.trace_candidates = False
-        self.chunks = [_record_chunk(record, kind, self.collection_id)
-                       for kind, records in (("clause", corpus.clauses), ("table", corpus.tables))
-                       for record in records if record.get("document_part", "body") != "commentary"]
-        self.by_id = {chunk.chunk_id: chunk for chunk in self.chunks}
+        chunk_factory = getattr(corpus, "chunk_sequence", None)
+        if callable(chunk_factory):
+            self.chunks = chunk_factory(self.collection_id)
+            self._chunk_ids = self.chunks.row_ids
+            self._chunk_metadata = getattr(self.chunks, "filter_metadata", self.chunks.metadata)
+            self.by_id = _ChunkMapping(self.chunks, self._chunk_ids)
+        else:
+            self.chunks = [_record_chunk(record, kind, self.collection_id)
+                           for kind, records in (("clause", corpus.clauses), ("table", corpus.tables))
+                           for record in records if record.get("document_part", "body") != "commentary"]
+            self._chunk_ids = [chunk.chunk_id for chunk in self.chunks]
+            self._chunk_metadata = None
+            self.by_id = {chunk.chunk_id: chunk for chunk in self.chunks}
         if len(self.by_id) != len(self.chunks):
             raise ValueError("规范条文与表格证据 ID 不唯一。")
         self._by_import_part = {}
         self._revision_relations = {}
-        for chunk in self.chunks:
-            locator = chunk.locator
+        for row in range(len(self.chunks)):
+            locator = (self._chunk_metadata[row] if self._chunk_metadata is not None
+                       else self.chunks[row].locator)
             part = locator.get("import_part_id")
             if part:
-                self._by_import_part.setdefault((locator.get("std_id"), part), []).append(chunk)
+                self._by_import_part.setdefault((locator.get("std_id"), part), []).append(row)
+        self._by_import_part = {key: _ChunkRows(self.chunks, rows)
+                                for key, rows in self._by_import_part.items()}
         for relation in getattr(corpus, "relations", []):
             if (relation.get("source_part_id") and relation.get("target_std_id")
                     and relation.get("relation") in {"amends", "amendment", "errata", "supersedes", "deletes"}):
                 self._revision_relations.setdefault(relation["target_std_id"], []).append(relation)
 
-        self.local = LocalIndex(self.chunks, embeddings)
+        # LocalIndex builds its BM25 statistics from this exact chunk order,
+        # then attaches a validated read-only matrix without re-embedding.
+        self.local = LocalIndex(self.chunks, embeddings,
+                                prepared_vectors=prepared_vectors,
+                                bm25_directory=bm25_directory)
+
+    def _allowed_indices(self, filters):
+        """Filter small metadata columns; never decode all mapped locators."""
+        standards = filters.get("std_nos", [filters["std_no"]] if filters.get("std_no") else [])
+        if isinstance(standards, str):
+            standards = [standards]
+        keys = {self.corpus.resolve_standard_id(value) for value in standards} - {None}
+        allowed = []
+        for i in range(len(self.chunks)):
+            locator = (self._chunk_metadata[i] if self._chunk_metadata is not None
+                       else self.chunks[i].locator)
+            if (not locator.get("excluded_from_current_retrieval", False)
+                    and (not standards or self.corpus.resolve_standard_id(locator["std_no"]) in keys)
+                    and (not filters.get("kind") or locator["evidence_kind"] == filters["kind"])
+                    and (not filters.get("document_part") or locator["document_part"] == filters["document_part"])):
+                allowed.append(i)
+        return allowed, standards
+
+    @classmethod
+    async def acreate(cls, corpus: StandardCorpus, embeddings=None, reranker=None,
+                      candidate_pool: int = 30, rrf_constant: int = 60, *,
+                      prepared_vectors=None, bm25_directory=None) -> "EvidenceIndex":
+        """Create corpus metadata locally and embed documents only without a prepared matrix."""
+        created = []
+
+        def construct():
+            index = cls(corpus, None, reranker, candidate_pool=candidate_pool,
+                        rrf_constant=rrf_constant, bm25_directory=bm25_directory)
+            created.append(index)
+            return index
+
+        try:
+            index = await run_local(construct)
+            # Keep the already prepared lexical mapping when attaching async
+            # vectors; rebuilding LocalIndex would duplicate or leak it.
+            await index.local._aprepare_vectors(embeddings, prepared_vectors)
+            index.embeddings = embeddings
+            return index
+        except BaseException:
+            if created:
+                await run_local(created[0].local.close_bm25)
+            raise
 
     def _candidate_trace_active(self) -> bool:
         if not self.trace_candidates:
@@ -200,6 +302,14 @@ class EvidenceIndex:
         try:
             from .runtime_audit import record_event
             record_event("retrieval_candidate_audit", **fields)
+        except Exception:
+            return None
+
+    async def _arecord_candidate_trace(self, **fields) -> None:
+        """Write async-run audit events through the bounded local executor."""
+        try:
+            from .runtime_audit import arecord_event
+            await arecord_event("retrieval_candidate_audit", **fields)
         except Exception:
             return None
 
@@ -401,15 +511,7 @@ class EvidenceIndex:
             self._record_preflight_failure(query, mode, top_k, filters,
                                            "filter_validation", "ValueError")
             raise ValueError("不支持的规范过滤字段：" + ", ".join(sorted(unknown)))
-        standards = filters.get("std_nos", [filters["std_no"]] if filters.get("std_no") else [])
-        if isinstance(standards, str):
-            standards = [standards]
-        keys = {self.corpus.resolve_standard_id(value) for value in standards}
-        allowed = [i for i, chunk in enumerate(self.chunks)
-                   if not chunk.locator.get("excluded_from_current_retrieval", False)
-                   and (not standards or (self.corpus.resolve_standard_id(chunk.locator["std_no"]) in keys - {None}))
-                   and (not filters.get("kind") or chunk.locator["evidence_kind"] == filters["kind"])
-                   and (not filters.get("document_part") or chunk.locator["document_part"] == filters["document_part"])]
+        allowed, standards = self._allowed_indices(filters)
         pool = max(top_k, self.candidate_pool)
         trace = self._candidate_trace_active()
         trace_base = {
@@ -432,7 +534,7 @@ class EvidenceIndex:
 
         def order(scores, positive=False):
             return sorted((i for i in allowed if not positive or scores[i] > 0),
-                          key=lambda i: (-scores[i], self.chunks[i].chunk_id))[:pool]
+                          key=lambda i: (-scores[i], self._chunk_ids[i]))[:pool]
 
         bm25 = dense = scores = None
         bm25_ranked: list[int] | None = None
@@ -557,6 +659,198 @@ class EvidenceIndex:
         emit_trace(status="complete", stage="complete")
         return EvidenceResult(query, mode, hits, context, missing, rerank)
 
+    async def aretrieve(self, query: str, mode: str = "bm25", top_k: int = 8,
+                        filters: dict | None = None, use_reranker: bool = False) -> EvidenceResult:
+        """Async equivalent of retrieve; provider calls are awaited natively."""
+        if mode not in {"bm25", "dense", "rrf", "hybrid"}:
+            await run_local(self._record_preflight_failure, query, mode, top_k, filters,
+                            "argument_validation", "ValueError")
+            raise ValueError("检索模式须为 bm25、dense、rrf 或 hybrid。")
+        if isinstance(top_k, bool) or not isinstance(top_k, int) or top_k < 1:
+            await run_local(self._record_preflight_failure, query, mode, top_k, filters,
+                            "argument_validation", "ValueError")
+            raise ValueError("top_k 须为正整数。")
+        if not isinstance(query, str) or not query.strip():
+            return EvidenceResult(str(query or ""), mode, [], [])
+        query = query.strip()
+        rerank = use_reranker or mode == "hybrid"
+        if mode != "bm25" and self.embeddings is None:
+            await run_local(self._record_preflight_failure, query, mode, top_k, filters,
+                            "retrieval_configuration", "ValueError")
+            raise ValueError("此检索模式需要文档向量索引；请先配置并加载向量。")
+        if rerank and self.reranker is None:
+            await run_local(self._record_preflight_failure, query, mode, top_k, filters,
+                            "retrieval_configuration", "ValueError")
+            raise ValueError("已选择重排，但重排客户端尚未配置。")
+        filters = filters or {}
+        unknown = set(filters) - {"std_no", "std_nos", "kind", "document_part"}
+        if unknown:
+            await run_local(self._record_preflight_failure, query, mode, top_k, filters,
+                            "filter_validation", "ValueError")
+            raise ValueError("不支持的规范过滤字段：" + ", ".join(sorted(unknown)))
+
+        allowed, standards = await run_local(self._allowed_indices, filters)
+        pool = max(top_k, self.candidate_pool)
+        trace = self._candidate_trace_active()
+        trace_base = {
+            "query": query, "filters": deepcopy(filters), "mode": mode,
+            "corpus_id": self.collection_id, "corpus_chunk_count": len(self.chunks),
+            "eligible_chunk_count": len(allowed), "top_k": top_k,
+            "candidate_pool": self.candidate_pool, "effective_pool": pool,
+            "trace_candidate_limit": 30,
+        }
+        if not allowed:
+            if trace:
+                await self._arecord_candidate_trace(
+                    **trace_base, status="complete", stage="empty_filter_result",
+                    bm25_candidates=None if mode == "dense" else [],
+                    dense_candidates=None if mode == "bm25" else [],
+                    pre_rerank_candidates=[], pre_rerank_candidate_count=0,
+                    candidate_lists_truncated=False, reranker_status="not_needed",
+                    final_top_k=[], expanded_ids=[])
+            return EvidenceResult(query, mode, [], [], reranked=rerank)
+
+        def order(scores, positive=False):
+            return sorted((i for i in allowed if not positive or scores[i] > 0),
+                          key=lambda i: (-scores[i], self._chunk_ids[i]))[:pool]
+
+        bm25 = dense = scores = None
+        bm25_ranked: list[int] | None = None
+        dense_ranked: list[int] | None = None
+        ranked: list[int] = []
+        hits: list[SearchHit] = []
+        context: list[SearchHit] = []
+        missing: list[dict] = []
+        stage = "score_generation"
+        reranker_status = "not_reached" if rerank else "not_used"
+        reranker_positions: dict[int, tuple[int, float]] = {}
+        final_positions: dict[int, int] = {}
+
+        def ranked_rows(indices, score_values):
+            if indices is None or score_values is None:
+                return None
+            return [self._trace_candidate(i, rank=rank, score=float(score_values[i]))
+                    for rank, i in enumerate(indices[:min(pool, 30)], 1)]
+
+        def trace_fields(*, status, stage, failure_type=None):
+            lanes = {
+                "bm25_candidates": ranked_rows(bm25_ranked, bm25),
+                "dense_candidates": ranked_rows(dense_ranked, dense),
+            }
+            fused = []
+            bm25_ranks = {i: rank for rank, i in enumerate(bm25_ranked or [], 1)}
+            dense_ranks = {i: rank for rank, i in enumerate(dense_ranked or [], 1)}
+            is_fused = mode in {"rrf", "hybrid"}
+            for candidate_rank, i in enumerate(ranked[:min(pool, 30)], 1):
+                row = self._trace_candidate(
+                    i, candidate_rank=candidate_rank,
+                    candidate_score=float(scores[i]) if scores is not None else None,
+                    fused_rank=candidate_rank if is_fused else None,
+                    fused_score=float(scores[i]) if is_fused and scores is not None else None,
+                    bm25_rank=bm25_ranks.get(i),
+                    bm25_score=float(bm25[i]) if bm25 is not None else None,
+                    dense_rank=dense_ranks.get(i),
+                    dense_score=float(dense[i]) if dense is not None else None,
+                    reranker_rank=None, reranker_score=None, final_rank=None)
+                if i in reranker_positions:
+                    row["reranker_rank"], row["reranker_score"] = reranker_positions[i]
+                if i in final_positions:
+                    row["final_rank"] = final_positions[i]
+                fused.append(row)
+            fields = {**trace_base, **lanes, "pre_rerank_candidates": fused,
+                      "pre_rerank_candidate_count": len(ranked),
+                      "candidate_lists_truncated": ((bm25_ranked is not None and len(bm25_ranked) > 30) or
+                          (dense_ranked is not None and len(dense_ranked) > 30) or len(ranked) > 30),
+                      "status": status, "stage": stage,
+                      "reranker_status": reranker_status}
+            if failure_type is not None:
+                fields["failure_type"] = failure_type
+            if status == "complete" or hits:
+                fields["final_top_k"] = [
+                    {"rank": rank, "evidence_id": hit.chunk.chunk_id,
+                     "score": float(hit.score),
+                     "score_kind": "reranker" if rerank and ranked else mode}
+                    for rank, hit in enumerate(hits, 1)]
+            if status == "complete":
+                fields["expanded_ids"] = [hit.chunk.chunk_id for hit in context]
+            return fields
+
+        async def emit_trace(**kwargs):
+            if not trace:
+                return None
+            try:
+                fields = await run_local(trace_fields, **kwargs)
+                await self._arecord_candidate_trace(**fields)
+            except Exception:
+                return None
+
+        try:
+            if mode != "dense":
+                bm25 = await run_local(self.local._bm25_scores, query)
+            if mode != "bm25":
+                embed_query = getattr(self.embeddings, "aembed_query", None)
+                if not callable(embed_query):
+                    raise RuntimeError("异步检索要求向量客户端实现 aembed_query。")
+                try:
+                    raw = await embed_query(query)
+                except Exception as exc:
+                    raise RuntimeError("查询向量调用失败；未切换为其他检索方式，请检查向量服务配置。") from exc
+                dense = await run_local(self.local._cosine_scores_from_vector, raw)
+            if bm25 is not None:
+                bm25_ranked = await run_local(order, bm25, True)
+            if dense is not None:
+                dense_ranked = await run_local(order, dense)
+
+            if mode == "bm25":
+                ranked, scores = bm25_ranked, bm25
+            elif mode == "dense":
+                ranked, scores = dense_ranked, dense
+            else:
+                def fuse():
+                    fused_scores = [0.0] * len(self.chunks)
+                    for sequence in (bm25_ranked or [], dense_ranked or []):
+                        for rank, i in enumerate(sequence, 1):
+                            fused_scores[i] += 1.0 / (self.rrf_constant + rank)
+                    return fused_scores, order(fused_scores, True)
+                scores, ranked = await run_local(fuse)
+
+            stage = "reranking"
+            if rerank and ranked:
+                reranker_status = "running"
+                arerank = getattr(self.reranker, "arerank", None)
+                if not callable(arerank):
+                    raise RuntimeError("异步检索要求重排客户端实现 arerank。")
+                outputs = await arerank(query, [self.chunks[i].text for i in ranked],
+                                         top_n=len(ranked))
+                positions = [item.index for item in outputs]
+                if (len(positions) != len(ranked) or set(positions) != set(range(len(ranked)))
+                        or any(not math.isfinite(float(item.score)) for item in outputs)):
+                    raise ValueError("重排返回的候选数、位置或得分不完整。")
+                reranker_positions = {ranked[item.index]: (rank, float(item.score))
+                                      for rank, item in enumerate(outputs, 1)}
+                hits = [SearchHit(self.chunks[ranked[item.index]], float(item.score))
+                        for item in outputs[:top_k]]
+                final_positions = {ranked[item.index]: rank
+                                   for rank, item in enumerate(outputs[:top_k], 1)}
+                reranker_status = "complete"
+            else:
+                if rerank:
+                    reranker_status = "empty_candidates"
+                hits = await run_local(lambda: [SearchHit(self.chunks[i], float(scores[i]))
+                                                for i in ranked[:top_k]])
+                final_positions = {i: rank for rank, i in enumerate(ranked[:top_k], 1)}
+
+            stage = "evidence_expansion"
+            context, missing = await run_local(self.expand, hits)
+        except Exception as exc:
+            if stage == "reranking":
+                reranker_status = "failed"
+            await emit_trace(status="failed", stage=stage, failure_type=type(exc).__name__)
+            raise
+
+        await emit_trace(status="complete", stage="complete")
+        return EvidenceResult(query, mode, hits, context, missing, rerank)
+
 
 class StandardsQAIndex:
     """Compatibility view for shared multi-turn QA; retains the raw evidence trace."""
@@ -576,6 +870,10 @@ class StandardsQAIndex:
     def discover(self, query: str, limit: int = 10) -> list[dict]:
         from .catalog_runtime import discover_catalog
         return discover_catalog(self.catalog_index, query, self.filters, limit)
+
+    async def adiscover(self, query: str, limit: int = 10) -> list[dict]:
+        from .catalog_runtime import adiscover_catalog
+        return await adiscover_catalog(self.catalog_index, query, self.filters, limit)
 
     def search(self, query: str, top_k: int = 8) -> list[SearchHit]:
         from .catalog_runtime import explicit_standard_requests
@@ -603,6 +901,44 @@ class StandardsQAIndex:
                 key = locator["std_no"], locator.get("clause_no")
                 if key not in statuses:
                     statuses[key] = self.status_registry.check(*key)
+                status = statuses[key]
+                for field in ("standard_status", "current_mandatory_status", "verification_date",
+                              "status_checked_at"):
+                    locator[field] = status[field]
+                locator["status_source_ids"] = deepcopy(status["source_ids"])
+                current_hits.append(SearchHit(replace(hit.chunk, locator=locator), hit.score))
+            self.last_result = replace(self.last_result, context_hits=current_hits)
+        return self.last_result.context_hits
+
+    async def asearch(self, query: str, top_k: int = 8) -> list[SearchHit]:
+        from .catalog_runtime import explicit_standard_requests
+        filters = deepcopy(self.filters)
+        requested = await run_local(explicit_standard_requests, query)
+        if requested and not (filters.get("std_no") or filters.get("std_nos")):
+            filters["std_nos"] = requested
+        selected = filters.get("std_nos", [filters["std_no"]] if filters.get("std_no") else [])
+        selected = [selected] if isinstance(selected, str) else selected
+        bound_codes = selected or requested
+
+        def has_no_text():
+            return bool(bound_codes and self.catalog_index.records) and all(
+                not self.catalog_index.get(name)["matches"] or
+                all(not row["text_available"] for row in self.catalog_index.get(name)["matches"])
+                for name in bound_codes)
+
+        if await run_local(has_no_text):
+            self.last_result = EvidenceResult(query, self.mode, [], [])
+            return []
+        self.last_result = await self.evidence.aretrieve(
+            query, self.mode, top_k, filters, self.use_reranker)
+        if self.status_registry is not None:
+            current_hits = []
+            statuses = {}
+            for hit in self.last_result.context_hits:
+                locator = deepcopy(hit.chunk.locator)
+                key = locator["std_no"], locator.get("clause_no")
+                if key not in statuses:
+                    statuses[key] = await run_local(self.status_registry.check, *key)
                 status = statuses[key]
                 for field in ("standard_status", "current_mandatory_status", "verification_date",
                               "status_checked_at"):

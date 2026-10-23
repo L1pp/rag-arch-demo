@@ -1,12 +1,21 @@
 import { fireEvent, render, screen, waitFor } from '@testing-library/react'
-import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import PageViewer from './PageViewer'
-import { getStandardsPages } from './api'
+import { getProtectedBlob, getStandardsPages } from './api'
 
-vi.mock('./api', () => ({ getStandardsPages: vi.fn() }))
+vi.mock('./api', async (importOriginal) => ({
+  ...await importOriginal<typeof import('./api')>(),
+  getStandardsPages: vi.fn(),
+  getProtectedBlob: vi.fn(),
+}))
+
+class TestURL extends URL {
+  static createObjectURL = vi.fn(() => 'blob:page-viewer-test')
+  static revokeObjectURL = vi.fn()
+}
 
 const pagesFor = (sourceRef = 'source-a') => ({
-  std_no: 'DEMO-STD-02', title: '自编防水示例规范', source_ref: sourceRef,
+  std_no: 'GB 55008-2021', title: '工程防水通用规范', source_ref: sourceRef,
   filename: `${sourceRef}.pdf`, page_count: 8,
   sources: [
     { source_ref: 'source-a', filename: '正式版.pdf', pages: [2, 5, 8] },
@@ -19,18 +28,23 @@ const pagesFor = (sourceRef = 'source-a') => ({
 })
 
 const pagesMock = vi.mocked(getStandardsPages)
+const imageMock = vi.mocked(getProtectedBlob)
+
+afterEach(() => { vi.unstubAllGlobals(); vi.unstubAllEnvs() })
 
 describe('independent standards page viewer', () => {
   beforeEach(() => {
-    window.history.replaceState(null, '', '/viewer/pages?std=demo-std-02&evidence=evidence-1&source_ref=source-a&page=2')
+    window.history.replaceState(null, '', '/viewer/pages?std=gb-55008&evidence=evidence-1&source_ref=source-a&page=2')
     pagesMock.mockResolvedValue(pagesFor())
+    imageMock.mockReset().mockResolvedValue(new Blob(['page image']))
+    vi.stubGlobal('URL', TestURL)
   })
 
   it('renders without WorkspaceProvider, shows mapped evidence pages, and changes source/page', async () => {
     render(<PageViewer />)
-    expect(await screen.findByRole('heading', { name: '自编防水示例规范' })).toBeInTheDocument()
+    expect(await screen.findByRole('heading', { name: '工程防水通用规范' })).toBeInTheDocument()
     expect(screen.getByText((_, element) => !!element && element.classList.contains('viewer-page-summary') && element.textContent?.includes('本条涉及 3 页') === true)).toBeInTheDocument()
-    expect(screen.getAllByRole('img')).toHaveLength(2)
+    expect(await screen.findAllByRole('img')).toHaveLength(2)
     expect(screen.getByRole('combobox', { name: '选择页码' })).toBeInTheDocument()
 
     fireEvent.click(screen.getByRole('button', { name: '下一页' }))
@@ -41,21 +55,21 @@ describe('independent standards page viewer', () => {
   })
 
   it('lets the backend choose the mapped page when an evidence link has no page parameter', async () => {
-    window.history.replaceState(null, '', '/viewer/pages?std=demo-std-02&evidence=evidence-1')
+    window.history.replaceState(null, '', '/viewer/pages?std=gb-55008&evidence=evidence-1')
     pagesMock.mockReset()
     pagesMock.mockImplementation(async query => {
-      expect(query).toMatchObject({ std: 'demo-std-02', evidence: 'evidence-1' })
+      expect(query).toMatchObject({ std: 'gb-55008', evidence: 'evidence-1' })
       expect(query).not.toHaveProperty('page')
       return pagesFor()
     })
     render(<PageViewer />)
-    expect(await screen.findByAltText('自编防水示例规范 第 2 页')).toBeInTheDocument()
+    expect(await screen.findByAltText('工程防水通用规范 第 2 页')).toBeInTheDocument()
     expect(pagesMock).toHaveBeenCalledTimes(1)
   })
 
   it('reports a single image failure locally and displays metadata errors with retry', async () => {
     render(<PageViewer />)
-    const image = await screen.findByAltText('自编防水示例规范 第 2 页')
+    const image = await screen.findByAltText('工程防水通用规范 第 2 页')
     fireEvent.error(image)
     expect(await screen.findByText('当前页面暂不支持')).toBeInTheDocument()
 
@@ -68,13 +82,13 @@ describe('independent standards page viewer', () => {
   it('keeps the previous source selector after a source metadata error without showing stale images', async () => {
     pagesMock.mockResolvedValueOnce(pagesFor())
     render(<PageViewer />)
-    expect(await screen.findByAltText('自编防水示例规范 第 2 页')).toBeInTheDocument()
+    expect(await screen.findByAltText('工程防水通用规范 第 2 页')).toBeInTheDocument()
 
     pagesMock.mockRejectedValueOnce(new Error('副本元数据不可用'))
     fireEvent.change(screen.getByRole('combobox', { name: '来源' }), { target: { value: 'source-b' } })
     expect(await screen.findByText('副本元数据不可用')).toBeInTheDocument()
     expect(screen.getByRole('combobox', { name: '来源' })).toBeEnabled()
-    expect(screen.queryByAltText('自编防水示例规范 第 2 页')).not.toBeInTheDocument()
+    expect(screen.queryByAltText('工程防水通用规范 第 2 页')).not.toBeInTheDocument()
 
     pagesMock.mockResolvedValueOnce(pagesFor('source-a'))
     fireEvent.change(screen.getByRole('combobox', { name: '来源' }), { target: { value: 'source-a' } })
@@ -85,5 +99,17 @@ describe('independent standards page viewer', () => {
     pagesMock.mockResolvedValueOnce({ ...pagesFor(), pages: [] })
     render(<PageViewer />)
     expect(await screen.findByText('当前来源暂无可显示的页图。')).toBeInTheDocument()
+  })
+
+  it('passes private page image URLs to the credentialed API resource fetcher', async () => {
+    vi.stubEnv('VITE_API_BASE_URL', 'https://api.example.test/prefix')
+    pagesMock.mockResolvedValueOnce({
+      ...pagesFor(),
+      pages: [{ page: 2, document_page: 12, image_url: '/api/documents/page-image?asset=private-a&page=2' }],
+    })
+    render(<PageViewer />)
+    const image = await screen.findByAltText('工程防水通用规范 第 2 页') as HTMLImageElement
+    expect(image.src).toBe('blob:page-viewer-test')
+    expect(imageMock).toHaveBeenCalledWith('/api/documents/page-image?asset=private-a&page=2', expect.any(AbortSignal))
   })
 })

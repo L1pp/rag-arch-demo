@@ -5,7 +5,16 @@ httpx==0.28.1
 langchain-openai==1.6.2
 langgraph==1.2.11
 numpy==2.5.3
+# Offline streaming conversion of the legacy public vector cache.
+ijson==3.6.0
 python-dotenv==1.2.3
 pillow==12.3.0
 # Web original-page operations use one child process; plain chat does not open PDFs.
 PyMuPDF==1.28.2
+# DOCX validation/text extraction; page conversion additionally needs a renderer.
+python-docx==1.2.0
+# Persistent multi-user state. Keep the legacy SQLite auth reader for migration.
+psycopg[binary,pool]==3.3.6
+psycopg-pool==3.3.3
+# Worker recovery checks the exact OS process creation identity, never PID alone.
+psutil==7.2.2

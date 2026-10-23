@@ -28,6 +28,10 @@ class BusyError(RuntimeError):
     """The selected assistant already has an active task."""
 
 
+class TaskCapacityError(RuntimeError):
+    """The bounded, process-local history is full until durable tasks are enabled."""
+
+
 class EventBus:
     """Publish state changes under the same lock used by TaskService."""
     def __init__(self, lock=None, capacity=2000):
@@ -93,7 +97,8 @@ def _now():
 
 class ThreadPoolExecutorTaskService:
     def __init__(self, *, runner=None, archive_root=DEFAULT_ARCHIVE_ROOT, event_capacity=2000,
-                 execution_modes: dict | None = None, model_name: str | None = None):
+                 execution_modes: dict | None = None, model_name: str | None = None,
+                 executor=None, user_id=None, workspace_id=None, max_tasks=None):
         overrides = {} if execution_modes is None else execution_modes
         if (not isinstance(overrides, dict) or set(overrides) - set(ASSISTANTS)
                 or any(mode not in ("model", "simulation") for mode in overrides.values())):
@@ -102,11 +107,18 @@ class ThreadPoolExecutorTaskService:
         if "model" in self._execution_modes.values() and runner is None:
             raise ValueError("真实模型模式须提供执行器，不能使用模拟执行器代替。")
         self.model_name = model_name
-        self.workspace_id = uuid4().hex
+        if user_id is not None and (type(user_id) is not int or user_id < 1):
+            raise ValueError("user_id须为正整数。")
+        if max_tasks is not None and (type(max_tasks) is not int or max_tasks < 1):
+            raise ValueError("max_tasks须为正整数。")
+        self.user_id = user_id
+        self.workspace_id = workspace_id or uuid4().hex
+        self._max_tasks = max_tasks
         self.server_instance_id = uuid4().hex
         self._lock = RLock()
         self.events = EventBus(self._lock, event_capacity)
-        self._executor = ThreadPoolExecutor(max_workers=3, thread_name_prefix="web-task")
+        self._owns_executor = executor is None
+        self._executor = executor or ThreadPoolExecutor(max_workers=3, thread_name_prefix="web-task")
         self._runner = runner or run_demo
         self._archive_root = Path(archive_root) if archive_root is not None else None
         self._closed = False
@@ -146,6 +158,7 @@ class ThreadPoolExecutorTaskService:
                                                            for tid in assistant["tasks"]]})
             # State and cursor are captured atomically, so reconnect has no gap.
             return {"workspace_id": self.workspace_id, "server_instance_id": self.server_instance_id,
+                    "owner_user_id": self.user_id,
                     "cursor": self.events.cursor,
                     "mode": "chat_preview" if self._execution_modes["chat"] == "model" else "infrastructure_demo",
                     "model_name": self.model_name, "assistants": assistants}
@@ -166,6 +179,8 @@ class ThreadPoolExecutorTaskService:
                 return self._snapshot_task(self._tasks[self._requests[key]])
             if assistant["active_task_id"] is not None:
                 raise BusyError("这个助手已有任务在运行，请等待或先取消。")
+            if self._max_tasks is not None and len(self._tasks) >= self._max_tasks:
+                raise TaskCapacityError("当前工作区任务记录已达容量上限，请联系管理员。")
             simulation = self._execution_modes[assistant_id] == "simulation"
             if not isinstance(prompt, str) or not prompt.strip():
                 raise ValueError("请输入任务内容。")
@@ -187,6 +202,8 @@ class ThreadPoolExecutorTaskService:
                        "registered_plan_id": registered_plan_id, "plan_action": plan_action,
                        "use_embeddings": bool(use_embeddings), "max_steps": max_steps,
                        "max_tool_calls": max_tool_calls}
+            if self.user_id is not None:
+                request.update(user_id=self.user_id, workspace_id=self.workspace_id)
             if not simulation:
                 # Capture before reserving this task, under the state lock.
                 # Only completed model answers in this assistant's current view
@@ -332,7 +349,8 @@ class ThreadPoolExecutorTaskService:
                 return
             self._closed = True
             archives = [task for task in self._tasks.values() if self._cancel(task)]
-        self._executor.shutdown(wait=False, cancel_futures=True)
+        if self._owns_executor:
+            self._executor.shutdown(wait=False, cancel_futures=True)
         for task in archives:
             self._archive(task)
 

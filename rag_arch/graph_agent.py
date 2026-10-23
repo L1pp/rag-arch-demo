@@ -10,6 +10,8 @@ from __future__ import annotations
 
 from copy import deepcopy
 from dataclasses import dataclass, field
+import asyncio
+import inspect
 import json
 import re
 import time
@@ -27,6 +29,7 @@ from .web_evidence import (WEB_SEARCH_INSTRUCTION, NATIVE_TOOLS_INSTRUCTION, web
                            native_web_observation, resolve_web_citations)
 from .terminal_completion import (TERMINAL_COMPLETION_POLICY, completion_window, append_completion_instruction)
 from .plan_review_context import ContextBudgetError, estimate_messages, prepare_messages
+from .async_support import run_local
 
 try:
     from .runtime_audit import record_event
@@ -66,6 +69,28 @@ def _record_runtime_event(kind: str, **fields: object) -> None:
         record_event(kind, **fields)
     except Exception:
         return None
+
+
+def _has_native_async_tool(tool) -> bool:
+    """True only when the tool exposes an actual coroutine implementation."""
+    if callable(getattr(tool, "coroutine", None)):
+        return True
+    if inspect.iscoroutinefunction(getattr(tool, "func", None)):
+        return True
+    return (not hasattr(tool, "_run")
+            and inspect.iscoroutinefunction(getattr(tool, "ainvoke", None)))
+
+
+_GENERATOR_START = object()
+
+
+def _advance_generator(generator, value=_GENERATOR_START):
+    """Advance a shared sync/async operation without leaking StopIteration."""
+    try:
+        item = next(generator) if value is _GENERATOR_START else generator.send(value)
+        return False, item
+    except StopIteration as stopped:
+        return True, stopped.value
 
 TOOL_NAMES = {"get_clause", "search", "check_standard_status"}
 AGENT_TOOL_ERROR_POLICY = "local_validation_feedback_v1"
@@ -528,8 +553,69 @@ class StandardAgent:
                                     {"model": "model", "finish": "finish"})
         graph.add_edge("finish", END)
         self.graph = graph.compile()
+        async_graph = StateGraph(AgentState)
+        async_graph.add_node("model", self._amodel)
+        async_graph.add_node("tools", self._atools)
+        async_graph.add_node("finish", self._afinish)
+        async_graph.add_edge(START, "model")
+        async_graph.add_conditional_edges("model", self._after_model, {"tools": "tools", "finish": "finish"})
+        async_graph.add_conditional_edges("tools", lambda s: "finish" if s["termination_reason"] else "model",
+                                         {"model": "model", "finish": "finish"})
+        async_graph.add_edge("finish", END)
+        self.async_graph = async_graph.compile()
 
     def _model(self, state: AgentState) -> dict:
+        steps = self._model_steps(state)
+        try:
+            request_messages, invoke_options = next(steps)
+        except StopIteration as stopped:
+            return stopped.value
+        try:
+            response = self.model.invoke(request_messages, **invoke_options)
+        except Exception as exc:
+            response = exc
+        try:
+            return steps.send(response)
+        except StopIteration as stopped:
+            return stopped.value
+
+    async def _amodel(self, state: AgentState) -> dict:
+        steps = self._model_steps(state)
+        try:
+            done, request = await run_local(_advance_generator, steps)
+            if done:
+                return request
+            request_messages, invoke_options = request
+        except asyncio.CancelledError:
+            steps.close()
+            raise
+        except BaseException:
+            steps.close()
+            raise
+        try:
+            response = await self.model.ainvoke(request_messages, **invoke_options)
+        except asyncio.CancelledError:
+            steps.close()
+            raise
+        except Exception as exc:
+            response = exc
+        except BaseException:
+            steps.close()
+            raise
+        try:
+            done, update = await run_local(_advance_generator, steps, response)
+            if not done:
+                raise RuntimeError("StandardAgent异步模型步骤意外产生第二个请求。")
+            return update
+        except asyncio.CancelledError:
+            steps.close()
+            raise
+        except BaseException:
+            steps.close()
+            raise
+
+    def _model_steps(self, state: AgentState):
+        """Shared request construction and response processing for sync/async calls."""
         if state["model_calls"] >= self.max_steps:
             return {"termination_reason": "step_limit"}
         step, start = state["model_calls"] + 1, time.perf_counter()
@@ -561,7 +647,9 @@ class StandardAgent:
         update = {"steps_used": step, "model_calls": state["model_calls"] + 1}
         _record_runtime_event("model_call_started", step=step, phase="standard_agent")
         try:
-            response = self.model.invoke(request_messages, **({"tool_choice": "none"} if final_only else {}))
+            response = yield (request_messages, {"tool_choice": "none"} if final_only else {})
+            if isinstance(response, Exception):
+                raise response
             if not isinstance(response, AIMessage):
                 raise TypeError("Expected AIMessage")
         except Exception:
@@ -653,10 +741,11 @@ class StandardAgent:
             return "finish"
         return "tools"
 
-    def _page_tool_reply(self, name, args, call_id):
+    def _page_tool_reply(self, name, args, call_id, result):
         """Keep page pixels out of JSON logs; navigation is never body evidence."""
         try:
-            result = self.tools[name].invoke(deepcopy(args))
+            if isinstance(result, Exception):
+                raise result
             if not isinstance(result, dict):
                 raise ValueError("分页工具未返回有效结果。")
             if name == "list_document_pages":
@@ -677,6 +766,64 @@ class StandardAgent:
                      "message": str(exc) or "页面读取失败，未提供图像。"}}, [], [], "page_unavailable")
 
     def _tools(self, state: AgentState) -> dict:
+        steps = self._tool_steps(state)
+        try:
+            name, args, _call_id = next(steps)
+        except StopIteration as stopped:
+            return stopped.value
+        while True:
+            try:
+                result = self.tools[name].invoke(deepcopy(args))
+            except Exception as exc:
+                result = exc
+            try:
+                name, args, _call_id = steps.send(result)
+            except StopIteration as stopped:
+                return stopped.value
+
+    async def _atools(self, state: AgentState) -> dict:
+        steps = self._tool_steps(state)
+        try:
+            done, request = await run_local(_advance_generator, steps)
+            if done:
+                return request
+            name, args, _call_id = request
+        except asyncio.CancelledError:
+            steps.close()
+            raise
+        except BaseException:
+            steps.close()
+            raise
+        while True:
+            try:
+                tool = self.tools[name]
+                if name == "search_web" and not _has_native_async_tool(tool):
+                    raise RuntimeError("联网工具未提供真正的异步实现。")
+                if _has_native_async_tool(tool):
+                    result = await tool.ainvoke(deepcopy(args))
+                else:
+                    result = await run_local(tool.invoke, deepcopy(args))
+            except asyncio.CancelledError:
+                steps.close()
+                raise
+            except Exception as exc:
+                result = exc
+            except BaseException:
+                steps.close()
+                raise
+            try:
+                done, request = await run_local(_advance_generator, steps, result)
+                if done:
+                    return request
+                name, args, _call_id = request
+            except asyncio.CancelledError:
+                steps.close()
+                raise
+            except BaseException:
+                steps.close()
+                raise
+
+    def _tool_steps(self, state: AgentState):
         step, count = state["steps_used"], state["tool_calls"]
         messages, traces = list(state["messages"]), list(state["traces"])
         page_images = []
@@ -709,12 +856,15 @@ class StandardAgent:
             records, complete_ids = [], []
             observation = "ok"
             try:
+                raw_result = yield (name, deepcopy(args), call_id)
                 if name in PAGE_TOOL_NAMES:
-                    result, images, records, observation = self._page_tool_reply(name, args, call_id)
+                    result, images, records, observation = self._page_tool_reply(name, args, call_id, raw_result)
                     page_images.extend(images)
                     model_result = result
                 else:
-                    result = self.tools[name].invoke(deepcopy(args))
+                    if isinstance(raw_result, Exception):
+                        raise raw_result
+                    result = raw_result
                     if not isinstance(result, dict):
                         raise ValueError("Tool result must be an object")
                     if name == "search_web":
@@ -923,7 +1073,10 @@ class StandardAgent:
                 "citations": citations, "cited_ids": ids, "required_ids": required_ids, "answer_scope": answer_scope,
                 "traces": state["traces"] + display_diagnostics}
 
-    def run(self, question: str, *, corpus_id: str, history=None) -> AgentResult:
+    async def _afinish(self, state: AgentState) -> dict:
+        return await run_local(self._finish, state)
+
+    def _prepare_run(self, question: str, *, corpus_id: str, history=None):
         if not isinstance(question, str) or not question.strip():
             raise ValueError("问题须为非空文本。")
         if not isinstance(corpus_id, str) or not corpus_id.strip():
@@ -982,8 +1135,9 @@ class StandardAgent:
                    "evidence_budget_texts": {}, "evidence_body_tokens": 0, "evidence_budget_exhausted": False,
                    "conflicting_ids": [], "page_sources": [], "web_sources": [], "native_usage_samples": [],
                    "termination_reason": "", "draft": "", "text": "", "status": "running", "answer_scope": "evidence", "cited_ids": [], "required_ids": []}
-        start = time.perf_counter()
-        state = self.graph.invoke(initial, config={"recursion_limit": self.max_steps * 2 + 4})
+        return initial, recent
+
+    def _build_result(self, state, *, question: str, corpus_id: str, recent, start) -> AgentResult:
         native_counts = {}
         for sample in state["native_usage_samples"]:
             for name, value in (sample.get("counts") or {}).items():
@@ -1020,6 +1174,20 @@ class StandardAgent:
                            if any(t.get("kind") == "citation_display" for t in state["traces"]) else [])
                            + (["已保留模型原文；输出格式或引用核对未完成，请结合来源阅读。"]
                               if any(t.get("kind") == "reply_validation" for t in state["traces"]) else []))
+
+
+    def run(self, question: str, *, corpus_id: str, history=None) -> AgentResult:
+        initial, recent = self._prepare_run(question, corpus_id=corpus_id, history=history)
+        start = time.perf_counter()
+        state = self.graph.invoke(initial, config={"recursion_limit": self.max_steps * 2 + 4})
+        return self._build_result(state, question=question, corpus_id=corpus_id, recent=recent, start=start)
+
+    async def arun(self, question: str, *, corpus_id: str, history=None) -> AgentResult:
+        initial, recent = await run_local(self._prepare_run, question, corpus_id=corpus_id, history=history)
+        start = time.perf_counter()
+        state = await self.async_graph.ainvoke(initial, config={"recursion_limit": self.max_steps * 2 + 4})
+        return await run_local(self._build_result, state, question=question, corpus_id=corpus_id,
+                               recent=recent, start=start)
 
 
 def run_standard_agent(question: str, standard_tools, chat_model, *, corpus_id: str,

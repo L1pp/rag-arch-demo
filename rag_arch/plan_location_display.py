@@ -59,6 +59,11 @@ def _physical_bounds(locator):
     if page is not None:
         if not _positive_integer(page):
             return None
+        # True == 1 and 4.0 == 4, so duplicate fields need the same strict check.
+        if start is not None and not _positive_integer(start):
+            return None
+        if end is not None and not _positive_integer(end):
+            return None
         if start is not None or end is not None:
             if start != page or end not in (None, page):
                 return None

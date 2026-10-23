@@ -1,0 +1,2 @@
+# Web/API/worker dependencies; the offline CLI uses the same environment.
+-r requirements.txt

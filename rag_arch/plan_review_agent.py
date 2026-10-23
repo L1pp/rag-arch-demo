@@ -9,6 +9,8 @@ from __future__ import annotations
 from copy import deepcopy
 from dataclasses import asdict, dataclass, field
 from datetime import date
+import asyncio
+import inspect
 import json
 import re
 import time
@@ -24,7 +26,10 @@ from langchain_core.tools import StructuredTool
 from langgraph.graph import START, END, StateGraph
 from pydantic import BaseModel, Field, ValidationError, create_model
 
-from .graph_agent import _message_text, _tool_evidence, _usage, _usage_total, _evidence_comparison_text
+from .graph_agent import (_message_text, _tool_evidence, _usage, _usage_total,
+                          _evidence_comparison_text, _has_native_async_tool,
+                          _advance_generator)
+from .async_support import run_local
 from .config import (DEFAULT_PLAN_CONTEXT_BUDGET, DEFAULT_PLAN_MAX_STEPS,
                      DEFAULT_PLAN_MAX_TOOL_CALLS, DEFAULT_PLAN_TIMEOUT_SECONDS)
 from .plan_context_summary import (SUMMARY_PREFIX, SUMMARY_POLICY, NATURAL_SUMMARY_POLICY, partition_context,
@@ -578,7 +583,7 @@ def validate_plan_quotes(refs, document, provided, provided_ranges=None, page_so
             matches = _unique_provided_quote_match(document, quote, provided, provided_ranges, scoped_ids)
         if not matches:
             matches = _unique_provided_quote_match(document, quote, provided, provided_ranges)
-            relocated = bool(scoped_ids)
+            relocated = bool(source_ref or (isinstance(uid, str) and uid))
         else:
             relocated = False
         if len(matches) == 1:
@@ -958,6 +963,20 @@ class PlanReviewAgent:
         graph.add_edge("advance_review", "prepare_model")
         graph.add_edge("finish", END)
         self.graph = graph.compile()
+        async_graph = StateGraph(ReviewState)
+        async_graph.add_node("model", self._amodel)
+        async_graph.add_node("prepare_model", self._aprepare_model)
+        async_graph.add_node("tools", self._atools)
+        async_graph.add_node("advance_review", self._aadvance_review)
+        async_graph.add_node("finish", self._afinish)
+        async_graph.add_edge(START, "prepare_model")
+        async_graph.add_edge("prepare_model", "model")
+        async_graph.add_conditional_edges("model", self._next,
+            {"model": "prepare_model", "tools": "tools", "advance_review": "advance_review", "finish": "finish"})
+        async_graph.add_edge("tools", "prepare_model")
+        async_graph.add_edge("advance_review", "prepare_model")
+        async_graph.add_edge("finish", END)
+        self.async_graph = async_graph.compile()
 
     def _assembly_source(self, state, *, candidate=None, phase="candidate_drafting", max_chars=32000,
                          priority_plan_unit_ids=None, priority_standard_ids=None, restore_missing=True,
@@ -1069,6 +1088,9 @@ class PlanReviewAgent:
 
     def _prepare_model(self, state):
         return {"context_summary_returned": False}
+
+    async def _aprepare_model(self, state):
+        return await run_local(self._prepare_model, state)
 
     def _initial_context(self):
         """Optional task-local context; ordinary reviews start without it."""
@@ -1251,6 +1273,20 @@ class PlanReviewAgent:
         return HumanMessage(content=_PROGRESS_PREFIX + json.dumps(progress, ensure_ascii=False))
 
     def _maybe_summarize_context(self, state, messages, history_selection, step):
+        """Compatibility wrapper for synchronous callers of the former helper."""
+        steps = self._summary_steps(state, messages, history_selection, step)
+        done, call = _advance_generator(steps)
+        if done:
+            return call
+        _kind, request, timeout, options = call
+        try:
+            response = self.summary_model.invoke(request, timeout=timeout, **options)
+        except Exception as exc:
+            response = exc
+        done, update = _advance_generator(steps, response)
+        return update
+
+    def _summary_steps(self, state, messages, history_selection, step):
         if not self.context_summary_ratio:
             return None
         before = estimate_messages(messages, self.schema_tokens, project_metadata=self.project_input_metadata)
@@ -1281,7 +1317,9 @@ class PlanReviewAgent:
         trace.update(request_sent=True, estimated_summary_input_tokens=size)
         _record_runtime_event("model_call_started", step=step, phase="context_summary")
         try:
-            response = self.summary_model.invoke(request, timeout=request_timeout)
+            response = yield ("summary", request, request_timeout, {})
+            if isinstance(response, Exception):
+                raise response
             if not isinstance(response, AIMessage):
                 raise TypeError("摘要响应不是AIMessage。")
             usage = _usage(response)
@@ -1422,6 +1460,66 @@ class PlanReviewAgent:
         return {"evidence": records, "complete_ids": sorted(complete)}
 
     def _model(self, state):
+        steps = self._model_steps(state)
+        try:
+            done, call = _advance_generator(steps)
+            if done:
+                return call
+        except BaseException:
+            steps.close()
+            raise
+        while True:
+            kind, messages, timeout, options = call
+            try:
+                model = self.summary_model if kind == "summary" else self.model
+                response = model.invoke(messages, timeout=timeout, **options)
+            except Exception as exc:
+                response = exc
+            try:
+                done, call = _advance_generator(steps, response)
+                if done:
+                    return call
+            except BaseException:
+                steps.close()
+                raise
+
+    async def _amodel(self, state):
+        steps = self._model_steps(state)
+        try:
+            done, call = await run_local(_advance_generator, steps)
+            if done:
+                return call
+        except asyncio.CancelledError:
+            steps.close()
+            raise
+        except BaseException:
+            steps.close()
+            raise
+        while True:
+            kind, messages, timeout, options = call
+            try:
+                model = self.summary_model if kind == "summary" else self.model
+                response = await model.ainvoke(messages, timeout=timeout, **options)
+            except asyncio.CancelledError:
+                steps.close()
+                raise
+            except Exception as exc:
+                response = exc
+            except BaseException:
+                steps.close()
+                raise
+            try:
+                done, call = await run_local(_advance_generator, steps, response)
+                if done:
+                    return call
+            except asyncio.CancelledError:
+                steps.close()
+                raise
+            except BaseException:
+                steps.close()
+                raise
+
+    def _model_steps(self, state):
         timing = self._wall_time()
         step = state["attempts"] + 1
         final_only = (step >= self.max_steps or state["tool_calls"] >= self.max_tool_calls
@@ -1451,8 +1549,9 @@ class PlanReviewAgent:
                 # the old bounded source reassembly is an explicit experiment.
                 messages.append(SystemMessage(content=self.final_delivery_instruction))
         messages, history_selection = self._select_history_messages(messages)
-        summary_update = (self._maybe_summarize_context(state, messages, history_selection, step)
-                          if not final_only else None)
+        summary_update = None
+        if not final_only:
+            summary_update = yield from self._summary_steps(state, messages, history_selection, step)
         if summary_update is not None:
             return summary_update
         trace = {"kind": "model", "step": step, "final_only": final_only, "format_only": False,
@@ -1500,7 +1599,9 @@ class PlanReviewAgent:
                               effective_request_timeout_seconds=request_timeout)
         try:
             invoke_options = {"tool_choice": self._final_tool_choice(state)} if final_only else {}
-            response = self.model.invoke(messages, timeout=request_timeout, **invoke_options)
+            response = yield ("model", messages, request_timeout, invoke_options)
+            if isinstance(response, Exception):
+                raise response
             if not isinstance(response, AIMessage):
                 raise TypeError("模型响应不是AIMessage。")
             if history_selection is not None:
@@ -1736,6 +1837,9 @@ class PlanReviewAgent:
                 "unparsed":state.get("unparsed",[])+parsed["unparsed"],
                 "traces":state["traces"]+[trace]}
 
+    async def _aadvance_review(self, state):
+        return await run_local(self._advance_review, state)
+
     def _candidate_source_messages(self, candidates, state, *, facts_only=False):
         """Reuse already acquired evidence at phase boundaries, without a new lookup."""
         source_ids = {eid for item in candidates for eid in item.get("evidence_ids", [])}
@@ -1789,6 +1893,61 @@ class PlanReviewAgent:
         return messages
 
     def _tools(self, state):
+        steps = self._tool_steps(state)
+        try:
+            name, args = next(steps)
+        except StopIteration as stopped:
+            return stopped.value
+        while True:
+            try:
+                result = self.tools[name].invoke(deepcopy(args))
+            except Exception as exc:
+                result = exc
+            try:
+                name, args = steps.send(result)
+            except StopIteration as stopped:
+                return stopped.value
+
+    async def _atools(self, state):
+        steps = self._tool_steps(state)
+        try:
+            done, request = await run_local(_advance_generator, steps)
+            if done:
+                return request
+            name, args = request
+        except asyncio.CancelledError:
+            steps.close()
+            raise
+        while True:
+            try:
+                tool = self.tools[name]
+                if name == "search_web" and not _has_native_async_tool(tool):
+                    raise RuntimeError("联网工具未提供真正的异步实现。")
+                if _has_native_async_tool(tool):
+                    result = await tool.ainvoke(deepcopy(args))
+                else:
+                    result = await run_local(tool.invoke, deepcopy(args))
+            except asyncio.CancelledError:
+                steps.close()
+                raise
+            except Exception as exc:
+                result = exc
+            except BaseException:
+                steps.close()
+                raise
+            try:
+                done, request = await run_local(_advance_generator, steps, result)
+                if done:
+                    return request
+                name, args = request
+            except asyncio.CancelledError:
+                steps.close()
+                raise
+            except BaseException:
+                steps.close()
+                raise
+
+    def _tool_steps(self, state):
         messages, traces = list(state["messages"]), list(state["traces"])
         records, complete = deepcopy(state["evidence"]), set(state["complete_ids"])
         provided, seen = set(state["provided_units"]), set(state["seen_call_ids"])
@@ -1822,7 +1981,9 @@ class PlanReviewAgent:
             else:
                 try:
                     effective_args = deepcopy(args)
-                    result = self.tools[name].invoke(effective_args)
+                    result = yield (name, effective_args)
+                    if isinstance(result, Exception):
+                        raise result
                     if not isinstance(result, dict):
                         raise TypeError("工具结果必须是对象。")
                     if name in PAGE_TOOL_NAMES:
@@ -1967,6 +2128,9 @@ class PlanReviewAgent:
                     output[key] = list(dict.fromkeys(output[key] + candidate.get(key, [])))
         return {"output": output, "stop_reason": reason, "format_issues":issues, "unparsed":unparsed}
 
+    async def _afinish(self, state):
+        return await run_local(self._finish, state)
+
     def _plan_visual_directory(self):
         """Prepare page hints, not pixels or evidence; scan only the current plan."""
         if self.mode != "review" or self.page_service is None:
@@ -1987,7 +2151,7 @@ class PlanReviewAgent:
             return {"ok": False, "source_ref": "plan:current", "error_type": type(exc).__name__,
                     "note": "图表页目录暂不可用，本轮可继续文字核查；按需读页时再检查来源。"}
 
-    def run(self, question: str = DEFAULT_REVIEW_TASK, *, history=None) -> PlanReviewResult:
+    def _prepare_run(self, question: str = DEFAULT_REVIEW_TASK, *, history=None):
         if not isinstance(question, str) or not question.strip():
             raise ValueError("请输入核查任务或问题。")
         self._started_at = self._clock()
@@ -2151,15 +2315,16 @@ class PlanReviewAgent:
             messages.append(_plan_source_message("方案原文片段：\n", first))
             review_phase = "question"
         self.runtime["review_batches"] = {"total": len(self._review_batches), "full_text_chars": self.document.text_chars}
-        state = self.graph.invoke({"messages": messages, "attempts": 0, "tool_calls": 0,
+        initial = {"messages": messages, "attempts": 0, "tool_calls": 0,
             "seen_call_ids": [], "provided_units": [], "provided_ranges": {},
-            "evidence": initial_evidence, "complete_ids": initial_complete, "conflicting_ids": [], "traces": [], "usage": [], "raw_output": "",
-            "stop_reason": "", "output": {}, "final_call_used": False, "force_final":False,
-            "batch_index": review_batch_index,
-            "batch_outputs": [], "review_phase": review_phase,
-            "format_issues": [], "unparsed": [], "model_retry_used": False,
-            "model_retry_pending": False,
-            "completion_attempted":False}, config={"recursion_limit": self.max_steps * 3 + 12})
+            "evidence": initial_evidence, "complete_ids": initial_complete, "conflicting_ids": [],
+            "traces": [], "usage": [], "raw_output": "", "stop_reason": "", "output": {},
+            "final_call_used": False, "force_final": False, "batch_index": review_batch_index,
+            "batch_outputs": [], "review_phase": review_phase, "format_issues": [], "unparsed": [],
+            "model_retry_used": False, "model_retry_pending": False, "completion_attempted": False}
+        return initial, start, visual_directory
+
+    def _build_result(self, state, *, question, start, visual_directory) -> PlanReviewResult:
         parsed = deepcopy(state["output"])
         parsed["evidence_ids"] = resolve_web_citations(_strings(parsed.get("evidence_ids", [])), self.web_sources)
         for item in parsed.get("findings", []):
@@ -2282,3 +2447,14 @@ class PlanReviewAgent:
             time.perf_counter() - start, reason, self._history_used_count, model=self.model_name,
             prompt_version=self.prompt_version, raw_final_text=state["raw_output"],
             validation_notes=notes, runtime=runtime)
+
+    def run(self, question: str = DEFAULT_REVIEW_TASK, *, history=None) -> PlanReviewResult:
+        initial, start, visual_directory = self._prepare_run(question, history=history)
+        state = self.graph.invoke(initial, config={"recursion_limit": self.max_steps * 3 + 12})
+        return self._build_result(state, question=question, start=start, visual_directory=visual_directory)
+
+    async def arun(self, question: str = DEFAULT_REVIEW_TASK, *, history=None) -> PlanReviewResult:
+        initial, start, visual_directory = await run_local(self._prepare_run, question, history=history)
+        state = await self.async_graph.ainvoke(initial, config={"recursion_limit": self.max_steps * 3 + 12})
+        return await run_local(self._build_result, state, question=question, start=start,
+                               visual_directory=visual_directory)

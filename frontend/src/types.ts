@@ -1,5 +1,8 @@
 import type { components } from './generated/api'
 
+export type AuthLogin = components['schemas']['AuthLogin']
+export type AuthSession = components['schemas']['AuthSessionSnapshot']
+export type AuthLogout = components['schemas']['AuthLogout']
 export type TaskSnapshot = components['schemas']['TaskSnapshot']
 export type AssistantSnapshot = components['schemas']['AssistantSnapshot']
 export type WorkspaceSnapshot = components['schemas']['WorkspaceSnapshot']
@@ -8,7 +11,7 @@ export type AssistantId = TaskSnapshot['assistant_id']
 export type TaskStatus = TaskSnapshot['status']
 export const assistantIds: AssistantId[] = ['chat', 'standards', 'plan']
 export const isActive = (task?: TaskSnapshot) =>
-  !!task && ['queued', 'running', 'cancelling'].includes(task.status)
+  !!task && ['queued', 'running', 'cancelling', 'recovering'].includes(task.status)
 
 export interface StandardCatalogEntry {
   catalog_id: string
@@ -48,7 +51,6 @@ export type StandardTaskResult = NonNullable<TaskSnapshot['result']> & {
   catalog_matches?: StandardCatalogMatch[]
   answer_scope?: string
   status?: string
-  termination_reason?: string
   tool_calls?: unknown
 }
 

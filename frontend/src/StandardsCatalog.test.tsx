@@ -11,12 +11,12 @@ vi.mock('./api', async () => {
 const catalog = {
   entries: [
     {
-      catalog_id: 'demo-std-01', std_no: 'DEMO-STD-01', title: '自编防水示例规范', library_class: '自编演示资料',
-      text_available: true, original_available: true, page_url: '/original/demo-std-01', history_url: '/viewer/history/?std=demo-std-01',
+      catalog_id: 'gb-55008', std_no: 'GB 55008-2021', title: '工程防水通用规范', library_class: '国家标准',
+      text_available: true, original_available: true, page_url: '/original/gb-55008', history_url: '/viewer/history/?std=gb-55008',
     },
     {
-      catalog_id: 'demo-std-02', std_no: 'DEMO-STD-02', title: '自编防火示例规范', library_class: '自编演示资料',
-      text_available: true, original_available: false, page_url: null, history_url: '/viewer/history/?std=demo-std-02',
+      catalog_id: 'gb-50016', std_no: 'GB 50016-2014', title: '建筑设计防火规范', library_class: '国家标准',
+      text_available: true, original_available: false, page_url: null, history_url: '/viewer/history/?std=gb-50016',
     },
   ],
   total: 2,
@@ -39,7 +39,7 @@ describe('standards catalog', () => {
 
   it('filters by standard number/title and keeps source links in new tabs', async () => {
     openCatalog()
-    expect(await screen.findByText('DEMO-STD-01')).toBeInTheDocument()
+    expect(await screen.findByText('GB 55008-2021')).toBeInTheDocument()
     const original = screen.getByRole('link', { name: '查看原页↗' })
     const history = screen.getAllByRole('link', { name: '历史关系↗' })[0]
     expect(original).toHaveAttribute('target', '_blank')
@@ -48,8 +48,8 @@ describe('standards catalog', () => {
     expect(history).toHaveAttribute('rel', 'noopener noreferrer')
 
     fireEvent.change(screen.getByRole('textbox', { name: '搜索规范号或中文名' }), { target: { value: '防火' } })
-    expect(screen.getByText('DEMO-STD-02')).toBeInTheDocument()
-    expect(screen.queryByText('DEMO-STD-01')).not.toBeInTheDocument()
+    expect(screen.getByText('GB 50016-2014')).toBeInTheDocument()
+    expect(screen.queryByText('GB 55008-2021')).not.toBeInTheDocument()
     fireEvent.click(screen.getByRole('button', { name: '收起规范目录' }))
     expect(screen.queryByRole('textbox', { name: '搜索规范号或中文名' })).not.toBeInTheDocument()
   })
@@ -69,15 +69,15 @@ describe('standards catalog', () => {
 
   it('only queries semantic candidates on button/Enter and displays reasons without confidence claims', async () => {
     candidateMock.mockResolvedValue({
-      query: 'DEMO-STD-03 旧版', semantic_used: true, warnings: [],
+      query: 'GB 55023旧版', semantic_used: true, warnings: [],
       matches: [{ ...catalog.entries[0], candidate_only: true, match_method: 'identifier_alias', match_notes: ['编号年份与目录候选接近'] }],
     })
     openCatalog()
     const input = screen.getByRole('textbox', { name: '搜索规范号或中文名' })
-    fireEvent.change(input, { target: { value: 'DEMO-STD-03 旧版' } })
+    fireEvent.change(input, { target: { value: 'GB 55023旧版' } })
     expect(candidateMock).not.toHaveBeenCalled()
     fireEvent.keyDown(input, { key: 'Enter' })
-    await waitFor(() => expect(candidateMock).toHaveBeenCalledWith('DEMO-STD-03 旧版', expect.any(AbortSignal)))
+    await waitFor(() => expect(candidateMock).toHaveBeenCalledWith('GB 55023旧版', expect.any(AbortSignal)))
     expect(screen.getByText('候选')).toBeInTheDocument()
     expect(screen.getByText('编号年份与目录候选接近')).toBeInTheDocument()
     expect(screen.queryByText(/置信度/)).not.toBeInTheDocument()

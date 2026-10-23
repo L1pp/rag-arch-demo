@@ -1,0 +1,38 @@
+[Unit]
+Description=RAG Arch Demo durable AI task worker
+Wants=network-online.target
+After=network-online.target
+# For a PostgreSQL system service on this same host, add After=<actual-postgresql-unit>.
+# Omit that dependency when using a managed/remote PostgreSQL endpoint.
+
+[Service]
+Type=simple
+User=ragarchdemo
+Group=ragarchdemo
+WorkingDirectory=/opt/rag-arch-demo
+EnvironmentFile=/etc/rag-arch-demo/rag-arch.env
+Environment=PYTHONUNBUFFERED=1
+UMask=0077
+
+# This service claims PostgreSQL tasks and executes model work independently of API processes.
+ExecStart=/opt/rag-arch-demo/.venv-web/bin/python -m rag_arch.web.worker_process run --concurrency 3 --poll-interval 0.5 --heartbeat-interval 5 --lease-seconds 15
+Restart=always
+RestartSec=5s
+# Let a worker receive SIGTERM, stop claiming new work, and finish local cleanup.
+KillSignal=SIGTERM
+KillMode=mixed
+TimeoutStopSec=3700s
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+LockPersonality=true
+RestrictSUIDSGID=true
+ReadWritePaths=/opt/rag-arch-demo/data/runtime
+
+[Install]
+WantedBy=multi-user.target

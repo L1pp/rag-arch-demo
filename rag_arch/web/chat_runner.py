@@ -2,6 +2,8 @@
 from concurrent.futures import CancelledError
 from copy import copy, deepcopy
 from dataclasses import asdict
+import asyncio
+import inspect
 import json
 from types import SimpleNamespace
 from urllib.parse import urlencode
@@ -13,7 +15,9 @@ from ..models import Answer, Chunk, ConversationTurn, SearchHit
 from ..providers import (create_chat_model, create_embeddings, create_reranker,
                          create_web_search_provider)
 from ..qa import answer_question
-from ..runtime_audit import record_event, record_run
+from ..runtime_audit import (arecord_event, arecord_run, record_event, record_run,
+                             tenant_audit_metadata)
+from ..async_support import TaskResourceCleanupError, run_local
 
 
 def _cancelled(cancel_event):
@@ -176,6 +180,82 @@ class _ObservedModel:
         _cancelled(self._cancel_event)
         return response
 
+    async def ainvoke(self, *args, **kwargs):
+        """Observe the native async provider call without a sync/thread fallback."""
+        await _aprogress(self._progress, self._cancel_event, "model",
+                         f"正在调用聊天模型（第{len(self._samples) + 1}次）")
+        position = len(self._samples)
+        self._samples.append(None)
+        response = await self._model.ainvoke(*args, **kwargs)
+        usage = _usage(SimpleNamespace(
+            usage_metadata=getattr(response, "usage_metadata", None),
+            response_metadata=getattr(response, "response_metadata", None) or {}))
+        self._samples[position] = usage
+        await arecord_event("web_chat_model_returned", call_number=position + 1, token_usage=usage)
+        _cancelled(self._cancel_event)
+        return response
+
+
+class _AsyncCancellableEmbeddings:
+    """Use provider-native async embedding calls and check cancellation per batch."""
+
+    def __init__(self, provider, cancel_event, batch_size):
+        self._provider, self._cancel_event = provider, cancel_event
+        limits = [batch_size] + [value for name in ("batch_size", "chunk_size")
+                                if type(value := getattr(provider, name, None)) is int and value > 0]
+        self.batch_size = min(limits)
+
+    def __getattr__(self, name):
+        return getattr(self._provider, name)
+
+    async def aembed_documents(self, texts):
+        vectors = []
+        for start in range(0, len(texts), self.batch_size):
+            _cancelled(self._cancel_event)
+            vectors.extend(await self._provider.aembed_documents(texts[start:start + self.batch_size]))
+            _cancelled(self._cancel_event)
+        return vectors
+
+    async def aembed_query(self, text):
+        _cancelled(self._cancel_event)
+        vector = await self._provider.aembed_query(text)
+        _cancelled(self._cancel_event)
+        return vector
+
+
+async def _aprogress(progress, cancel_event, stage, detail):
+    _cancelled(cancel_event)
+    if callable(progress):
+        try:
+            await run_local(progress, stage, detail)
+        except CancelledError:
+            if cancel_event is not None and cancel_event.is_set():
+                raise CancelledError("本轮聊天已取消。") from None
+            raise
+    _cancelled(cancel_event)
+
+
+async def _aclose_task_embeddings(provider):
+    """Close a chat task's own async SDK root; shared standards caches are never passed here."""
+    if provider is None:
+        return
+    async_client = getattr(provider, "async_client", None)
+    target = getattr(async_client, "_client", None) or async_client or provider
+    async_close = getattr(target, "aclose", None)
+    if callable(async_close):
+        value = async_close()
+        if inspect.isawaitable(value):
+            await value
+        return
+    sync_close = getattr(target, "close", None)
+    if callable(sync_close):
+        if inspect.iscoroutinefunction(sync_close):
+            await sync_close()
+        else:
+            value = await run_local(sync_close)
+            if inspect.isawaitable(value):
+                await value
+
 
 def run_chat(request, progress, cancel_event, *, settings=None, model_factory=None, documents=None):
     """Run the configured chat model in this worker's independent audit context.
@@ -194,7 +274,8 @@ def run_chat(request, progress, cancel_event, *, settings=None, model_factory=No
         _cancelled(cancel_event)
         raise RuntimeError(json.dumps(safe_error(exc, component="chat"), ensure_ascii=False)) from None
     samples = []
-    with record_run("web_chat", settings, question, task_id=request.get("task_id")) as audit:
+    with record_run("web_chat", settings, question,
+                    **tenant_audit_metadata(request)) as audit:
         try:
             _cancelled(cancel_event)
             progress("preparing", "正在准备聊天上下文")
@@ -248,7 +329,11 @@ def run_chat(request, progress, cancel_event, *, settings=None, model_factory=No
                         embedding_proxy = _CancellableEmbeddings(
                             provider, cancel_event, settings.embedding_batch_size)
                     run_index = copy(collection.index)
+                    if getattr(collection.index, "local", None) is not None:
+                        run_index.local = copy(collection.index.local)
                     run_index.embeddings = embedding_proxy
+                    if getattr(run_index, "local", None) is not None:
+                        run_index.local.embeddings = embedding_proxy
                     run_index.candidate_pool = 30
                     run_index.rrf_constant = 60
 
@@ -334,3 +419,224 @@ def run_chat(request, progress, cancel_event, *, settings=None, model_factory=No
             # Never pass provider str(exc), response bodies or credential-bearing URLs outward.
             raise RuntimeError(json.dumps(error, ensure_ascii=False)) from None
     return result
+
+
+async def arun_chat(request, progress, cancel_event, *, settings=None, model_factory=None,
+                    documents=None):
+    """Run chat with native async model, embedding, retrieval, and page APIs.
+
+    The synchronous ``run_chat`` remains for CLI and legacy callers. Only short
+    local progress writes and document helpers retained as sync APIs cross the
+    bounded ``run_local`` bridge; model and provider requests stay on this loop.
+    """
+    from ..providers import async_close_model, create_async_chat_model
+    from ..qa import aanswer_question
+
+    _cancelled(cancel_event)
+    question = request.get("prompt")
+    if not isinstance(question, str) or not question.strip():
+        raise ValueError("请输入聊天问题。")
+    question = question.strip()
+    try:
+        settings = settings if settings is not None else load_settings()
+    except Exception as exc:
+        _cancelled(cancel_event)
+        raise RuntimeError(json.dumps(safe_error(exc, component="chat"), ensure_ascii=False)) from None
+
+    samples = []
+    model = None
+    owned_models = []
+    web_provider = None
+    task_embeddings = []
+    completed_result = None
+    primary_failed = False
+    primary_cancelled = False
+    async with arecord_run("web_chat", settings, question,
+                           **tenant_audit_metadata(request)) as audit:
+        try:
+            await _aprogress(progress, cancel_event, "preparing", "正在准备聊天上下文")
+            prepared, file_mode = None, None
+            qa_options = {"index": None, "page_service": None,
+                "history": await run_local(_history_turns, request.get("history")),
+                "context_budget_tokens": settings.chat_context_budget_tokens,
+                "output_budget_tokens": settings.chat_max_tokens}
+            attachment_ids = request.get("attachment_ids") or []
+            if attachment_ids:
+                if documents is None:
+                    raise ValueError("上传文件服务未提供，不能读取这些附件。")
+                legacy_use_embeddings = request.get("use_embeddings", False)
+                if type(legacy_use_embeddings) is not bool:
+                    raise ValueError("向量检索选项须为布尔值。")
+                await _aprogress(progress, cancel_event, "files", "正在读取附件全文并检查输入规模")
+                embedding_proxy = None
+
+                def _make_embeddings():
+                    nonlocal embedding_proxy
+                    _cancelled(cancel_event)
+                    provider = create_embeddings(settings)
+                    if provider is not None:
+                        task_embeddings.append(provider)
+                        embedding_proxy = _AsyncCancellableEmbeddings(
+                            provider, cancel_event, settings.embedding_batch_size)
+                    return embedding_proxy
+
+                prepared = await documents.aprepare_chat(
+                    attachment_ids, embeddings_factory=_make_embeddings)
+                _cancelled(cancel_event)
+                collection, pages = prepared.collection, prepared.pages
+                usable = bool(collection.chunks)
+                page_sources = await run_local(pages.sources) if pages is not None else []
+                if not usable and not page_sources:
+                    raise ValueError("附件没有可用文字或可按页读取的原件，暂不能问答。")
+                file_mode = collection.mode if usable else "pages_only"
+
+                run_index = None
+                rerank_warnings = []
+                if usable and collection.uses_embeddings and collection.index is not None:
+                    if embedding_proxy is None:
+                        embedding_proxy = await run_local(_make_embeddings)
+                        _cancelled(cancel_event)
+                        if embedding_proxy is None:
+                            raise ValueError("附件提取正文超出全文直读门槛，向量服务不可用；未改用关键词检索。")
+                    run_index = copy(collection.index)
+                    run_index.embeddings = embedding_proxy
+                    run_index.candidate_pool = 30
+                    run_index.rrf_constant = 60
+
+                    def _record_rerank_fallback(failure):
+                        status = failure.get("status_code")
+                        code = failure.get("code") or "RemoteError"
+                        # LocalIndex.asearch invokes this through run_local, so
+                        # this synchronous audit write is already off the event loop.
+                        record_event("web_chat_file_reranker_fallback",
+                            fallback_reason="reranker_service_error",
+                            fallback_to="rrf_top_k", candidate_pool=30,
+                            rrf_constant=60, top_k=8, error_code=code,
+                            http_status=status)
+                        status_text = f"HTTP {status}，" if status is not None else ""
+                        rerank_warnings.append(
+                            f"附件重排服务异常（{status_text}code={code}），本轮按 RRF 30 候选中的前 8 条回答。")
+
+                    run_index.rerank_error_handler = _record_rerank_fallback
+                    if (settings.reranker_provider == "bailian"
+                            and settings.reranker_model == "qwen3-rerank"
+                            and settings.reranker_ready):
+                        run_index.reranker = await run_local(create_reranker, settings)
+                    else:
+                        run_index.reranker = None
+                    await arecord_event("web_chat_file_retrieval_strategy",
+                        mode="bm25_dense_rrf", embedding_model=settings.embedding_model,
+                        candidate_pool=30, rrf_constant=60, top_k=8,
+                        reranker=("qwen3-rerank" if run_index.reranker is not None else None),
+                        legacy_use_embeddings_ignored=legacy_use_embeddings)
+                    if run_index.reranker is None:
+                        reason = ("reranker_not_configured" if not settings.reranker_ready
+                                  else "reranker_configuration_not_qwen3")
+                        await arecord_event("web_chat_file_reranker_fallback",
+                            fallback_reason=reason, fallback_to="rrf_top_k",
+                            candidate_pool=30, rrf_constant=60, top_k=8)
+                        rerank_warnings.append(
+                            "附件重排服务未按百炼 qwen3-rerank 配置，本轮按 RRF 30 候选中的前 8 条回答。")
+                elif usable:
+                    await arecord_event("web_chat_file_retrieval_strategy",
+                        mode="direct" if collection.mode == "direct" else "bm25",
+                        text_bytes=collection.text_bytes,
+                        text_tokens=collection.text_tokens,
+                        legacy_use_embeddings_ignored=legacy_use_embeddings)
+
+                qa_options.update(index=run_index if usable else None,
+                    direct_chunks=collection.chunks if usable and collection.mode == "direct" else None,
+                    page_service=pages, web_provider=None, top_k=8)
+                web_provider = create_web_search_provider(settings)
+                qa_options["web_provider"] = web_provider
+                await arecord_event("web_chat_files_prepared", attachment_ids=list(attachment_ids),
+                    file_mode=file_mode, text_bytes=collection.text_bytes,
+                    text_tokens=collection.text_tokens,
+                    uses_embeddings=bool(collection.uses_embeddings and usable),
+                    legacy_use_embeddings_ignored=legacy_use_embeddings)
+            def _create_model():
+                created = (model_factory or create_async_chat_model)(settings)
+                if created is not None:
+                    owned_models.append(created)
+                return created
+
+            model = await run_local(_create_model)
+            if model is None:
+                raise ValueError("聊天模型未配置。")
+            observed = _ObservedModel(model, progress, cancel_event, samples)
+            answer = await aanswer_question(question, chat_model=observed, **qa_options)
+            _cancelled(cancel_event)
+            if prepared is not None and rerank_warnings:
+                answer.warnings.extend(row for row in dict.fromkeys(rerank_warnings)
+                                       if row not in answer.warnings)
+            result = {
+                "text": answer.text, "simulation": False, "model": settings.chat_model,
+                "web_sources": deepcopy(answer.web_sources),
+                "warnings": list(answer.warnings),
+                "native_tool_usage": deepcopy(answer.native_tool_usage),
+                "audit_log": audit.info, "token_usage": _usage_total(samples),
+                "model_calls": len(samples), "tool_calls": answer.tool_calls,
+            }
+            if prepared is not None:
+                result.update(await run_local(_file_fields, prepared, answer, file_mode))
+            audit.set_result({**result, "task_id": request.get("task_id"), "answer": answer})
+            completed_result = result
+            return result
+        except BaseException as exc:
+            was_cancelled = (cancel_event.is_set()
+                             or isinstance(exc, (CancelledError, asyncio.CancelledError)))
+            if was_cancelled:
+                primary_cancelled = True
+                audit.set_result({"status": "cancelled", "simulation": False,
+                    "task_id": request.get("task_id"), "model": settings.chat_model,
+                    "token_usage": _usage_total(samples), "audit_log": audit.info})
+                current_task = asyncio.current_task()
+                if (isinstance(exc, asyncio.CancelledError) and current_task is not None
+                        and current_task.cancelling()):
+                    raise
+                raise CancelledError("本轮聊天已取消。") from None
+            primary_failed = True
+            error = safe_error(exc, component="chat")
+            audit.set_result({"status": "failed", "simulation": False,
+                "task_id": request.get("task_id"), "model": settings.chat_model,
+                "error": error, "token_usage": _usage_total(samples), "audit_log": audit.info})
+            raise RuntimeError(json.dumps(error, ensure_ascii=False)) from None
+        finally:
+            close_failures = []
+            seen = set()
+            for kind, resource in ([("model", item) for item in owned_models]
+                                   + [("web_search", web_provider)]
+                                   + [("embedding", provider) for provider in reversed(task_embeddings)]):
+                if resource is None or id(resource) in seen:
+                    continue
+                seen.add(id(resource))
+                try:
+                    if kind == "embedding":
+                        await _aclose_task_embeddings(resource)
+                    else:
+                        await async_close_model(resource)
+                except BaseException as exc:
+                    close_failures.append(type(exc).__name__)
+            if close_failures:
+                mark_cleanup = getattr(cancel_event, "mark_resource_cleanup_failed", None)
+                if callable(mark_cleanup):
+                    mark_cleanup()
+                await arecord_event("web_chat_resource_close_failed", exception_types=close_failures)
+                if completed_result is not None:
+                    cleanup_error = TaskResourceCleanupError("chat",
+                                                            exception_types=close_failures)
+                    error = cleanup_error.as_error()
+                    audit.set_result({"status": "failed", "simulation": False,
+                        "task_id": request.get("task_id"), "model": settings.chat_model,
+                        "error": error, "token_usage": _usage_total(samples),
+                        "audit_log": audit.info})
+                    raise cleanup_error
+                if primary_failed and not primary_cancelled:
+                    cleanup_error = TaskResourceCleanupError("chat",
+                                                            exception_types=close_failures)
+                    previous = audit.result if isinstance(audit.result, dict) else {}
+                    error = cleanup_error.as_error()
+                    if previous.get("error") is not None:
+                        error["operation_error"] = previous["error"]
+                    audit.set_result({**previous, "status": "failed", "error": error})
+                    raise cleanup_error

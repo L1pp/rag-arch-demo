@@ -1,672 +1,615 @@
 {
   "selection_roots": [
-    "loaders",
-    "splitting",
-    "collection",
-    "evidence_index",
-    "standard_tools",
+    "web.app",
+    "web.worker_process",
     "graph_agent",
     "plan_review_agent",
-    "plan_review_runtime",
-    "plan_review_report",
-    "providers",
-    "web.app"
+    "retrieval",
+    "binary_bm25",
+    "binary_corpus",
+    "binary_vectors"
+  ],
+  "selection_note": "Independent public copy; source history and private resources are excluded.",
+  "excluded_modules": [
+    "conclusion_controls",
+    "citation_recovery",
+    "standard_relation_pilot",
+    "standard_business_validation"
   ],
   "files": [
     {
       "path": "rag_arch/__init__.py",
       "origin": "local-core/__init__.py",
-      "selection": "runtime-import-closure",
+      "selection": "application-runtime-and-storage",
       "adapted": false
     },
     {
       "path": "rag_arch/arithmetic_tool.py",
       "origin": "local-core/arithmetic_tool.py",
-      "selection": "runtime-import-closure",
+      "selection": "application-runtime-and-storage",
       "adapted": false
+    },
+    {
+      "path": "rag_arch/async_support.py",
+      "origin": "local-core/async_support.py",
+      "selection": "application-runtime-and-storage",
+      "adapted": true
     },
     {
       "path": "rag_arch/benchmark_metrics.py",
       "origin": "local-core/benchmark_metrics.py",
-      "selection": "runtime-import-closure",
+      "selection": "application-runtime-and-storage",
       "adapted": false
     },
     {
       "path": "rag_arch/benchmark_review_policy.py",
       "origin": "local-core/benchmark_review_policy.py",
-      "selection": "runtime-import-closure",
+      "selection": "application-runtime-and-storage",
+      "adapted": false
+    },
+    {
+      "path": "rag_arch/binary_bm25.py",
+      "origin": "local-core/binary_bm25.py",
+      "selection": "application-runtime-and-storage",
+      "adapted": false
+    },
+    {
+      "path": "rag_arch/binary_corpus.py",
+      "origin": "local-core/binary_corpus.py",
+      "selection": "application-runtime-and-storage",
+      "adapted": false
+    },
+    {
+      "path": "rag_arch/binary_vectors.py",
+      "origin": "local-core/binary_vectors.py",
+      "selection": "application-runtime-and-storage",
       "adapted": false
     },
     {
       "path": "rag_arch/catalog_index.py",
       "origin": "local-core/catalog_index.py",
-      "selection": "runtime-import-closure",
+      "selection": "application-runtime-and-storage",
       "adapted": false
     },
     {
       "path": "rag_arch/catalog_runtime.py",
       "origin": "local-core/catalog_runtime.py",
-      "selection": "runtime-import-closure",
+      "selection": "application-runtime-and-storage",
       "adapted": false
     },
     {
       "path": "rag_arch/collection.py",
       "origin": "local-core/collection.py",
-      "selection": "runtime-import-closure",
+      "selection": "application-runtime-and-storage",
       "adapted": false
     },
     {
       "path": "rag_arch/config.py",
       "origin": "local-core/config.py",
-      "selection": "runtime-import-closure",
+      "selection": "application-runtime-and-storage",
       "adapted": false
     },
     {
       "path": "rag_arch/document_pages.py",
       "origin": "local-core/document_pages.py",
-      "selection": "runtime-import-closure",
+      "selection": "application-runtime-and-storage",
       "adapted": false
     },
     {
       "path": "rag_arch/embedding_cache.py",
       "origin": "local-core/embedding_cache.py",
-      "selection": "runtime-import-closure",
+      "selection": "application-runtime-and-storage",
       "adapted": false
     },
     {
       "path": "rag_arch/evidence_index.py",
       "origin": "local-core/evidence_index.py",
-      "selection": "runtime-import-closure",
+      "selection": "application-runtime-and-storage",
       "adapted": false
     },
     {
       "path": "rag_arch/evidence_status.py",
       "origin": "local-core/evidence_status.py",
-      "selection": "runtime-import-closure",
+      "selection": "application-runtime-and-storage",
       "adapted": false
     },
     {
       "path": "rag_arch/experiment_provenance.py",
       "origin": "local-core/experiment_provenance.py",
-      "selection": "runtime-import-closure",
+      "selection": "application-runtime-and-storage",
       "adapted": false
     },
     {
       "path": "rag_arch/generation_experiments.py",
       "origin": "local-core/generation_experiments.py",
-      "selection": "runtime-import-closure",
+      "selection": "application-runtime-and-storage",
       "adapted": false
     },
     {
       "path": "rag_arch/graph_agent.py",
       "origin": "local-core/graph_agent.py",
-      "selection": "runtime-import-closure",
+      "selection": "application-runtime-and-storage",
       "adapted": false
     },
     {
       "path": "rag_arch/json_output.py",
       "origin": "local-core/json_output.py",
-      "selection": "runtime-import-closure",
+      "selection": "application-runtime-and-storage",
       "adapted": false
     },
     {
       "path": "rag_arch/loaders.py",
       "origin": "local-core/loaders.py",
-      "selection": "runtime-import-closure",
+      "selection": "application-runtime-and-storage",
       "adapted": false
     },
     {
       "path": "rag_arch/local_reranking.py",
       "origin": "local-core/local_reranking.py",
-      "selection": "runtime-import-closure",
+      "selection": "application-runtime-and-storage",
       "adapted": false
     },
     {
       "path": "rag_arch/model_input_view.py",
       "origin": "local-core/model_input_view.py",
-      "selection": "runtime-import-closure",
+      "selection": "application-runtime-and-storage",
       "adapted": false
     },
     {
       "path": "rag_arch/models.py",
       "origin": "local-core/models.py",
-      "selection": "runtime-import-closure",
+      "selection": "application-runtime-and-storage",
       "adapted": false
     },
     {
       "path": "rag_arch/multimodal.py",
       "origin": "local-core/multimodal.py",
-      "selection": "runtime-import-closure",
+      "selection": "application-runtime-and-storage",
+      "adapted": false
+    },
+    {
+      "path": "rag_arch/output_schemas.py",
+      "origin": "local-core/output_schemas.py",
+      "selection": "application-runtime-and-storage",
+      "adapted": false
+    },
+    {
+      "path": "rag_arch/owned_process_exit.py",
+      "origin": "local-core/owned_process_exit.py",
+      "selection": "application-runtime-and-storage",
+      "adapted": false
+    },
+    {
+      "path": "rag_arch/page_qa.py",
+      "origin": "local-core/page_qa.py",
+      "selection": "application-runtime-and-storage",
       "adapted": false
     },
     {
       "path": "rag_arch/page_sources.py",
       "origin": "local-core/page_sources.py",
-      "selection": "runtime-import-closure",
+      "selection": "application-runtime-and-storage",
+      "adapted": false
+    },
+    {
+      "path": "rag_arch/pdf_backend.py",
+      "origin": "local-core/pdf_backend.py",
+      "selection": "application-runtime-and-storage",
       "adapted": false
     },
     {
       "path": "rag_arch/plan_context_summary.py",
       "origin": "local-core/plan_context_summary.py",
-      "selection": "runtime-import-closure",
+      "selection": "application-runtime-and-storage",
       "adapted": false
     },
     {
       "path": "rag_arch/plan_documents.py",
       "origin": "local-core/plan_documents.py",
-      "selection": "runtime-import-closure",
+      "selection": "application-runtime-and-storage",
       "adapted": false
     },
     {
       "path": "rag_arch/plan_location_display.py",
       "origin": "local-core/plan_location_display.py",
-      "selection": "runtime-import-closure",
+      "selection": "application-runtime-and-storage",
       "adapted": false
     },
     {
       "path": "rag_arch/plan_output.py",
       "origin": "local-core/plan_output.py",
-      "selection": "runtime-import-closure",
+      "selection": "application-runtime-and-storage",
       "adapted": false
     },
     {
       "path": "rag_arch/plan_review_agent.py",
       "origin": "local-core/plan_review_agent.py",
-      "selection": "runtime-import-closure",
-      "adapted": true,
-      "adaptation_note": "2026-10-12: use the actual matched source anchor after quote relocation; retain the model anchor separately."
+      "selection": "application-runtime-and-storage",
+      "adapted": true
     },
     {
       "path": "rag_arch/plan_review_batches.py",
       "origin": "local-core/plan_review_batches.py",
-      "selection": "runtime-import-closure",
+      "selection": "application-runtime-and-storage",
       "adapted": false
     },
     {
       "path": "rag_arch/plan_review_context.py",
       "origin": "local-core/plan_review_context.py",
-      "selection": "runtime-import-closure",
+      "selection": "application-runtime-and-storage",
       "adapted": false
     },
     {
       "path": "rag_arch/plan_review_evidence.py",
       "origin": "local-core/plan_review_evidence.py",
-      "selection": "runtime-import-closure",
+      "selection": "application-runtime-and-storage",
       "adapted": false
     },
     {
       "path": "rag_arch/plan_review_memory.py",
       "origin": "local-core/plan_review_memory.py",
-      "selection": "runtime-import-closure",
+      "selection": "application-runtime-and-storage",
       "adapted": false
     },
     {
       "path": "rag_arch/plan_review_notes.py",
       "origin": "local-core/plan_review_notes.py",
-      "selection": "runtime-import-closure",
+      "selection": "application-runtime-and-storage",
       "adapted": false
     },
     {
       "path": "rag_arch/plan_review_report.py",
       "origin": "local-core/plan_review_report.py",
-      "selection": "runtime-import-closure",
+      "selection": "application-runtime-and-storage",
       "adapted": false
     },
     {
       "path": "rag_arch/plan_review_runtime.py",
       "origin": "local-core/plan_review_runtime.py",
-      "selection": "runtime-import-closure",
+      "selection": "application-runtime-and-storage",
       "adapted": false
     },
     {
       "path": "rag_arch/plan_standard_preflight.py",
       "origin": "local-core/plan_standard_preflight.py",
-      "selection": "runtime-import-closure",
+      "selection": "application-runtime-and-storage",
       "adapted": false
     },
     {
       "path": "rag_arch/plan_text_view.py",
       "origin": "local-core/plan_text_view.py",
-      "selection": "runtime-import-closure",
+      "selection": "application-runtime-and-storage",
       "adapted": false
     },
     {
       "path": "rag_arch/prompt_payload.py",
       "origin": "local-core/prompt_payload.py",
-      "selection": "runtime-import-closure",
+      "selection": "application-runtime-and-storage",
       "adapted": false
     },
     {
       "path": "rag_arch/providers.py",
       "origin": "local-core/providers.py",
-      "selection": "runtime-import-closure",
+      "selection": "application-runtime-and-storage",
+      "adapted": false
+    },
+    {
+      "path": "rag_arch/qa.py",
+      "origin": "local-core/qa.py",
+      "selection": "application-runtime-and-storage",
       "adapted": false
     },
     {
       "path": "rag_arch/reply_text.py",
       "origin": "local-core/reply_text.py",
-      "selection": "runtime-import-closure",
+      "selection": "application-runtime-and-storage",
+      "adapted": false
+    },
+    {
+      "path": "rag_arch/request_control.py",
+      "origin": "local-core/request_control.py",
+      "selection": "application-runtime-and-storage",
       "adapted": false
     },
     {
       "path": "rag_arch/reranking.py",
       "origin": "local-core/reranking.py",
-      "selection": "runtime-import-closure",
+      "selection": "application-runtime-and-storage",
+      "adapted": false
+    },
+    {
+      "path": "rag_arch/resource_supervision.py",
+      "origin": "local-core/resource_supervision.py",
+      "selection": "application-runtime-and-storage",
       "adapted": false
     },
     {
       "path": "rag_arch/responses_chat.py",
       "origin": "local-core/responses_chat.py",
-      "selection": "runtime-import-closure",
+      "selection": "application-runtime-and-storage",
       "adapted": false
     },
     {
       "path": "rag_arch/retrieval.py",
       "origin": "local-core/retrieval.py",
-      "selection": "runtime-import-closure",
+      "selection": "application-runtime-and-storage",
       "adapted": false
     },
     {
       "path": "rag_arch/retrieval_experiments.py",
       "origin": "local-core/retrieval_experiments.py",
-      "selection": "runtime-import-closure",
+      "selection": "application-runtime-and-storage",
       "adapted": false
     },
     {
       "path": "rag_arch/runtime_audit.py",
       "origin": "local-core/runtime_audit.py",
-      "selection": "runtime-import-closure",
+      "selection": "application-runtime-and-storage",
       "adapted": false
     },
     {
       "path": "rag_arch/splitting.py",
       "origin": "local-core/splitting.py",
-      "selection": "runtime-import-closure",
+      "selection": "application-runtime-and-storage",
       "adapted": false
     },
     {
       "path": "rag_arch/standard_identifiers.py",
       "origin": "local-core/standard_identifiers.py",
-      "selection": "runtime-import-closure",
+      "selection": "application-runtime-and-storage",
       "adapted": false
     },
     {
       "path": "rag_arch/standard_lifecycle.py",
       "origin": "local-core/standard_lifecycle.py",
-      "selection": "runtime-import-closure",
+      "selection": "application-runtime-and-storage",
       "adapted": false
     },
     {
       "path": "rag_arch/standard_model_view.py",
       "origin": "local-core/standard_model_view.py",
-      "selection": "runtime-import-closure",
+      "selection": "application-runtime-and-storage",
       "adapted": false
     },
     {
       "path": "rag_arch/standard_status.py",
       "origin": "local-core/standard_status.py",
-      "selection": "runtime-import-closure",
+      "selection": "application-runtime-and-storage",
       "adapted": false
     },
     {
       "path": "rag_arch/standard_tools.py",
       "origin": "local-core/standard_tools.py",
-      "selection": "runtime-import-closure",
+      "selection": "application-runtime-and-storage",
       "adapted": false
     },
     {
       "path": "rag_arch/standards.py",
       "origin": "local-core/standards.py",
-      "selection": "runtime-import-closure",
+      "selection": "application-runtime-and-storage",
       "adapted": false
     },
     {
       "path": "rag_arch/status_benchmark.py",
       "origin": "local-core/status_benchmark.py",
-      "selection": "runtime-import-closure",
+      "selection": "application-runtime-and-storage",
       "adapted": false
     },
     {
       "path": "rag_arch/terminal_completion.py",
       "origin": "local-core/terminal_completion.py",
-      "selection": "runtime-import-closure",
+      "selection": "application-runtime-and-storage",
       "adapted": false
     },
     {
       "path": "rag_arch/terminal_output.py",
       "origin": "local-core/terminal_output.py",
-      "selection": "runtime-import-closure",
+      "selection": "application-runtime-and-storage",
       "adapted": false
     },
     {
       "path": "rag_arch/tool_chat.py",
       "origin": "local-core/tool_chat.py",
-      "selection": "runtime-import-closure",
+      "selection": "application-runtime-and-storage",
       "adapted": false
     },
     {
       "path": "rag_arch/visual_page_index.py",
       "origin": "local-core/visual_page_index.py",
-      "selection": "runtime-import-closure",
+      "selection": "application-runtime-and-storage",
       "adapted": false
+    },
+    {
+      "path": "rag_arch/web/__init__.py",
+      "origin": "local-core/web/__init__.py",
+      "selection": "application-runtime-and-storage",
+      "adapted": false
+    },
+    {
+      "path": "rag_arch/web/app.py",
+      "origin": "local-core/web/app.py",
+      "selection": "application-runtime-and-storage",
+      "adapted": false
+    },
+    {
+      "path": "rag_arch/web/auth.py",
+      "origin": "local-core/web/auth.py",
+      "selection": "application-runtime-and-storage",
+      "adapted": false
+    },
+    {
+      "path": "rag_arch/web/auth_cli.py",
+      "origin": "local-core/web/auth_cli.py",
+      "selection": "application-runtime-and-storage",
+      "adapted": false
+    },
+    {
+      "path": "rag_arch/web/catalog_tools.py",
+      "origin": "local-core/web/catalog_tools.py",
+      "selection": "application-runtime-and-storage",
+      "adapted": false
+    },
+    {
+      "path": "rag_arch/web/chat_runner.py",
+      "origin": "local-core/web/chat_runner.py",
+      "selection": "application-runtime-and-storage",
+      "adapted": false
+    },
+    {
+      "path": "rag_arch/web/contracts.py",
+      "origin": "local-core/web/contracts.py",
+      "selection": "application-runtime-and-storage",
+      "adapted": false
+    },
+    {
+      "path": "rag_arch/web/db.py",
+      "origin": "local-core/web/db.py",
+      "selection": "application-runtime-and-storage",
+      "adapted": false
+    },
+    {
+      "path": "rag_arch/web/demo.py",
+      "origin": "local-core/web/demo.py",
+      "selection": "application-runtime-and-storage",
+      "adapted": false
+    },
+    {
+      "path": "rag_arch/web/document_routes.py",
+      "origin": "local-core/web/document_routes.py",
+      "selection": "application-runtime-and-storage",
+      "adapted": false
+    },
+    {
+      "path": "rag_arch/web/documents.py",
+      "origin": "local-core/web/documents.py",
+      "selection": "application-runtime-and-storage",
+      "adapted": false
+    },
+    {
+      "path": "rag_arch/web/events.py",
+      "origin": "local-core/web/events.py",
+      "selection": "application-runtime-and-storage",
+      "adapted": false
+    },
+    {
+      "path": "rag_arch/web/history.py",
+      "origin": "local-core/web/history.py",
+      "selection": "application-runtime-and-storage",
+      "adapted": true
+    },
+    {
+      "path": "rag_arch/web/legacy_import.py",
+      "origin": "local-core/web/legacy_import.py",
+      "selection": "application-runtime-and-storage",
+      "adapted": true
+    },
+    {
+      "path": "rag_arch/web/migrations/001_multiuser.sql",
+      "origin": "local-core/web/migrations/001_multiuser.sql",
+      "selection": "application-runtime-and-storage",
+      "adapted": false
+    },
+    {
+      "path": "rag_arch/web/migrations/002_task_workers.sql",
+      "origin": "local-core/web/migrations/002_task_workers.sql",
+      "selection": "application-runtime-and-storage",
+      "adapted": false
+    },
+    {
+      "path": "rag_arch/web/migrations/003_shared_login_limits.sql",
+      "origin": "local-core/web/migrations/003_shared_login_limits.sql",
+      "selection": "application-runtime-and-storage",
+      "adapted": false
+    },
+    {
+      "path": "rag_arch/web/migrations/004_process_resources.sql",
+      "origin": "local-core/web/migrations/004_process_resources.sql",
+      "selection": "application-runtime-and-storage",
+      "adapted": false
+    },
+    {
+      "path": "rag_arch/web/persistent_tasks.py",
+      "origin": "local-core/web/persistent_tasks.py",
+      "selection": "application-runtime-and-storage",
+      "adapted": true
+    },
+    {
+      "path": "rag_arch/web/plan_runner.py",
+      "origin": "local-core/web/plan_runner.py",
+      "selection": "application-runtime-and-storage",
+      "adapted": false
+    },
+    {
+      "path": "rag_arch/web/readiness.py",
+      "origin": "local-core/web/readiness.py",
+      "selection": "application-runtime-and-storage",
+      "adapted": false
+    },
+    {
+      "path": "rag_arch/web/resource_recovery.py",
+      "origin": "local-core/web/resource_recovery.py",
+      "selection": "application-runtime-and-storage",
+      "adapted": false
+    },
+    {
+      "path": "rag_arch/web/standards_resources.py",
+      "origin": "local-core/web/standards_resources.py",
+      "selection": "application-runtime-and-storage",
+      "adapted": false
+    },
+    {
+      "path": "rag_arch/web/standards_routes.py",
+      "origin": "local-core/web/standards_routes.py",
+      "selection": "application-runtime-and-storage",
+      "adapted": false
+    },
+    {
+      "path": "rag_arch/web/standards_runner.py",
+      "origin": "local-core/web/standards_runner.py",
+      "selection": "application-runtime-and-storage",
+      "adapted": false
+    },
+    {
+      "path": "rag_arch/web/task_repository.py",
+      "origin": "local-core/web/task_repository.py",
+      "selection": "application-runtime-and-storage",
+      "adapted": false
+    },
+    {
+      "path": "rag_arch/web/task_service.py",
+      "origin": "local-core/web/task_service.py",
+      "selection": "application-runtime-and-storage",
+      "adapted": false
+    },
+    {
+      "path": "rag_arch/web/task_worker.py",
+      "origin": "local-core/web/task_worker.py",
+      "selection": "application-runtime-and-storage",
+      "adapted": true
+    },
+    {
+      "path": "rag_arch/web/tenancy.py",
+      "origin": "local-core/web/tenancy.py",
+      "selection": "application-runtime-and-storage",
+      "adapted": false
+    },
+    {
+      "path": "rag_arch/web/worker_process.py",
+      "origin": "local-core/web/worker_process.py",
+      "selection": "application-runtime-and-storage",
+      "adapted": true
     },
     {
       "path": "rag_arch/web_evidence.py",
       "origin": "local-core/web_evidence.py",
-      "selection": "runtime-import-closure",
+      "selection": "application-runtime-and-storage",
       "adapted": false
     },
     {
       "path": "rag_arch/web_search.py",
       "origin": "local-core/web_search.py",
-      "selection": "runtime-import-closure",
-      "adapted": false
-    },
-    {
-      "path": "rag_arch/output_schemas.py",
-      "origin": "local-current/rag_arch/output_schemas.py",
-      "selection": "react-fastapi-import-closure",
-      "adapted": false
-    },
-    {
-      "path": "rag_arch/page_qa.py",
-      "origin": "local-current/rag_arch/page_qa.py",
-      "selection": "react-fastapi-import-closure",
-      "adapted": false
-    },
-    {
-      "path": "rag_arch/pdf_backend.py",
-      "origin": "local-current/rag_arch/pdf_backend.py",
-      "selection": "react-fastapi-import-closure",
-      "adapted": false
-    },
-    {
-      "path": "rag_arch/qa.py",
-      "origin": "local-current/rag_arch/qa.py",
-      "selection": "react-fastapi-import-closure",
-      "adapted": false
-    },
-    {
-      "path": "rag_arch/web/__init__.py",
-      "origin": "local-current/rag_arch/web/__init__.py",
-      "selection": "react-fastapi-import-closure",
-      "adapted": false
-    },
-    {
-      "path": "rag_arch/web/app.py",
-      "origin": "local-current/rag_arch/web/app.py",
-      "selection": "react-fastapi-import-closure",
-      "adapted": true,
-      "adaptation_note": "2026-10-13: preserve validation warnings in Markdown exports."
-    },
-    {
-      "path": "rag_arch/web/auth.py",
-      "origin": "local-current/rag_arch/web/auth.py",
-      "selection": "react-fastapi-import-closure",
-      "adapted": false
-    },
-    {
-      "path": "rag_arch/web/auth_cli.py",
-      "origin": "local-current/rag_arch/web/auth_cli.py",
-      "selection": "react-fastapi-import-closure",
-      "adapted": false
-    },
-    {
-      "path": "rag_arch/web/catalog_tools.py",
-      "origin": "local-current/rag_arch/web/catalog_tools.py",
-      "selection": "react-fastapi-import-closure",
-      "adapted": false
-    },
-    {
-      "path": "rag_arch/web/chat_runner.py",
-      "origin": "local-current/rag_arch/web/chat_runner.py",
-      "selection": "react-fastapi-import-closure",
-      "adapted": false
-    },
-    {
-      "path": "rag_arch/web/contracts.py",
-      "origin": "local-current/rag_arch/web/contracts.py",
-      "selection": "react-fastapi-import-closure",
-      "adapted": true,
-      "adaptation_note": "2026-10-13: Preserve an optional termination_reason in task results."
-    },
-    {
-      "path": "rag_arch/web/demo.py",
-      "origin": "local-current/rag_arch/web/demo.py",
-      "selection": "react-fastapi-import-closure",
-      "adapted": false
-    },
-    {
-      "path": "rag_arch/web/document_routes.py",
-      "origin": "local-current/rag_arch/web/document_routes.py",
-      "selection": "react-fastapi-import-closure",
-      "adapted": false
-    },
-    {
-      "path": "rag_arch/web/documents.py",
-      "origin": "local-current/rag_arch/web/documents.py",
-      "selection": "react-fastapi-import-closure",
-      "adapted": false
-    },
-    {
-      "path": "rag_arch/web/history.py",
-      "origin": "local-current/rag_arch/web/history.py",
-      "selection": "react-fastapi-import-closure",
-      "adapted": true,
-      "adaptation_note": "2026-10-13: Use a generic operator-supplied history pointer path."
-    },
-    {
-      "path": "rag_arch/web/plan_runner.py",
-      "origin": "local-current/rag_arch/web/plan_runner.py",
-      "selection": "react-fastapi-import-closure",
-      "adapted": true,
-      "adaptation_note": "2026-10-13: Pass the plan context budget to the model settings."
-    },
-    {
-      "path": "rag_arch/web/standards_resources.py",
-      "origin": "local-current/rag_arch/web/standards_resources.py",
-      "selection": "react-fastapi-import-closure",
-      "adapted": false
-    },
-    {
-      "path": "rag_arch/web/standards_routes.py",
-      "origin": "local-current/rag_arch/web/standards_routes.py",
-      "selection": "react-fastapi-import-closure",
-      "adapted": false
-    },
-    {
-      "path": "rag_arch/web/standards_runner.py",
-      "origin": "local-current/rag_arch/web/standards_runner.py",
-      "selection": "react-fastapi-import-closure",
-      "adapted": true,
-      "adaptation_note": "2026-10-13: Expose QA termination_reason and validation warnings to the React client."
-    },
-    {
-      "path": "rag_arch/web/task_service.py",
-      "origin": "local-current/rag_arch/web/task_service.py",
-      "selection": "react-fastapi-import-closure",
-      "adapted": false
-    },
-    {
-      "path": "frontend/.gitignore",
-      "origin": "local-current/frontend/.gitignore",
-      "selection": "react-frontend-source",
-      "adapted": false
-    },
-    {
-      "path": "frontend/index.html",
-      "origin": "local-current/frontend/index.html",
-      "selection": "react-frontend-source",
-      "adapted": false
-    },
-    {
-      "path": "frontend/package.json",
-      "origin": "local-current/frontend/package.json",
-      "selection": "react-frontend-source",
-      "adapted": false
-    },
-    {
-      "path": "frontend/package-lock.json",
-      "origin": "local-current/frontend/package-lock.json",
-      "selection": "react-frontend-source",
-      "adapted": false
-    },
-    {
-      "path": "frontend/tsconfig.json",
-      "origin": "local-current/frontend/tsconfig.json",
-      "selection": "react-frontend-source",
-      "adapted": false
-    },
-    {
-      "path": "frontend/vite.config.ts",
-      "origin": "local-current/frontend/vite.config.ts",
-      "selection": "react-frontend-source",
-      "adapted": false
-    },
-    {
-      "path": "frontend/src/api.test.ts",
-      "origin": "local-current/frontend/src/api.test.ts",
-      "selection": "react-frontend-source",
-      "adapted": true,
-      "adaptation_note": "2026-10-13: Retain UI regression coverage using fictional public fixtures."
-    },
-    {
-      "path": "frontend/src/api.ts",
-      "origin": "local-current/frontend/src/api.ts",
-      "selection": "react-frontend-source",
-      "adapted": false
-    },
-    {
-      "path": "frontend/src/App.mode.test.tsx",
-      "origin": "local-current/frontend/src/App.mode.test.tsx",
-      "selection": "react-frontend-source",
-      "adapted": true,
-      "adaptation_note": "2026-10-13: Retain UI regression coverage using fictional public fixtures."
-    },
-    {
-      "path": "frontend/src/App.natural-report.test.tsx",
-      "origin": "local-current/frontend/src/App.natural-report.test.tsx",
-      "selection": "react-frontend-source",
-      "adapted": false
-    },
-    {
-      "path": "frontend/src/App.tsx",
-      "origin": "local-current/frontend/src/App.tsx",
-      "selection": "react-frontend-source",
-      "adapted": true,
-      "adaptation_note": "2026-10-13: Show citation and format verification failures before preserved model text."
-    },
-    {
-      "path": "frontend/src/layout.css",
-      "origin": "local-current/frontend/src/layout.css",
-      "selection": "react-frontend-source",
-      "adapted": false
-    },
-    {
-      "path": "frontend/src/main.route.test.tsx",
-      "origin": "local-current/frontend/src/main.route.test.tsx",
-      "selection": "react-frontend-source",
-      "adapted": false
-    },
-    {
-      "path": "frontend/src/main.tsx",
-      "origin": "local-current/frontend/src/main.tsx",
-      "selection": "react-frontend-source",
-      "adapted": false
-    },
-    {
-      "path": "frontend/src/PageViewer.test.tsx",
-      "origin": "local-current/frontend/src/PageViewer.test.tsx",
-      "selection": "react-frontend-source",
-      "adapted": true,
-      "adaptation_note": "2026-10-13: Retain UI regression coverage using fictional public fixtures."
-    },
-    {
-      "path": "frontend/src/PageViewer.tsx",
-      "origin": "local-current/frontend/src/PageViewer.tsx",
-      "selection": "react-frontend-source",
-      "adapted": false
-    },
-    {
-      "path": "frontend/src/ResourceControls.test.tsx",
-      "origin": "local-current/frontend/src/ResourceControls.test.tsx",
-      "selection": "react-frontend-source",
-      "adapted": true,
-      "adaptation_note": "2026-10-13: Retain UI regression coverage using fictional public fixtures."
-    },
-    {
-      "path": "frontend/src/ResourceControls.tsx",
-      "origin": "local-current/frontend/src/ResourceControls.tsx",
-      "selection": "react-frontend-source",
-      "adapted": true,
-      "adaptation_note": "2026-10-13: Use fictional example identifiers in public placeholders."
-    },
-    {
-      "path": "frontend/src/route.ts",
-      "origin": "local-current/frontend/src/route.ts",
-      "selection": "react-frontend-source",
-      "adapted": false
-    },
-    {
-      "path": "frontend/src/StandardsCatalog.test.tsx",
-      "origin": "local-current/frontend/src/StandardsCatalog.test.tsx",
-      "selection": "react-frontend-source",
-      "adapted": true,
-      "adaptation_note": "2026-10-13: Retain UI regression coverage using fictional public fixtures."
-    },
-    {
-      "path": "frontend/src/store.test.ts",
-      "origin": "local-current/frontend/src/store.test.ts",
-      "selection": "react-frontend-source",
-      "adapted": true,
-      "adaptation_note": "2026-10-13: Retain UI regression coverage using fictional public fixtures."
-    },
-    {
-      "path": "frontend/src/store.ts",
-      "origin": "local-current/frontend/src/store.ts",
-      "selection": "react-frontend-source",
-      "adapted": false
-    },
-    {
-      "path": "frontend/src/styles.css",
-      "origin": "local-current/frontend/src/styles.css",
-      "selection": "react-frontend-source",
-      "adapted": false
-    },
-    {
-      "path": "frontend/src/types.ts",
-      "origin": "local-current/frontend/src/types.ts",
-      "selection": "react-frontend-source",
-      "adapted": true,
-      "adaptation_note": "2026-10-13: Accept the optional QA termination reason."
-    },
-    {
-      "path": "frontend/src/WorkspaceContext.tsx",
-      "origin": "local-current/frontend/src/WorkspaceContext.tsx",
-      "selection": "react-frontend-source",
-      "adapted": false
-    },
-    {
-      "path": "frontend/src/generated/api.ts",
-      "origin": "local-current/frontend/src/generated/api.ts",
-      "selection": "react-frontend-source",
-      "adapted": true,
-      "adaptation_note": "2026-10-13: Regenerated from the public FastAPI contract."
-    },
-    {
-      "path": "frontend/src/test/setup.ts",
-      "origin": "local-current/frontend/src/test/setup.ts",
-      "selection": "react-frontend-source",
-      "adapted": false
-    },
-    {
-      "path": "scripts/render_docx_pages.ps1",
-      "origin": "local-current/scripts/render_docx_pages.ps1",
-      "selection": "document-page-helper",
+      "selection": "application-runtime-and-storage",
       "adapted": false
     }
-  ],
-  "initial_public_snapshot": "403cb3d",
-  "provenance_note": "The source selection was checked locally against a private workspace. That comparison cannot be reproduced from this public repository. Later public fixes are recorded per file.",
-  "web_source_added_on": "2026-10-13"
+  ]
 }

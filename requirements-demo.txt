@@ -1,3 +1,0 @@
-# Standalone no-key Streamlit demo; CLI samples are unchanged.
--r requirements.txt
-streamlit==1.63.0

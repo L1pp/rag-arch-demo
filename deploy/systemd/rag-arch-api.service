@@ -1,0 +1,37 @@
+[Unit]
+Description=RAG Arch Demo multi-user API
+Wants=network-online.target
+After=network-online.target
+# For a PostgreSQL system service on this same host, add After=<actual-postgresql-unit>.
+# Omit that dependency when using a managed/remote PostgreSQL endpoint.
+
+[Service]
+Type=simple
+User=ragarchdemo
+Group=ragarchdemo
+WorkingDirectory=/opt/rag-arch-demo
+EnvironmentFile=/etc/rag-arch-demo/rag-arch.env
+Environment=PYTHONUNBUFFERED=1
+UMask=0077
+
+# Nginx only. Never bind the API listener to a public interface.
+ExecStart=/opt/rag-arch-demo/.venv-web/bin/python -m uvicorn rag_arch.web.app:app --host 127.0.0.1 --port 8000 --workers 2 --proxy-headers --forwarded-allow-ips 127.0.0.1 --timeout-graceful-shutdown 30
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=90s
+KillSignal=SIGTERM
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+LockPersonality=true
+RestrictSUIDSGID=true
+# Upload originals and page caches live below this project-relative runtime path.
+ReadWritePaths=/opt/rag-arch-demo/data/runtime
+
+[Install]
+WantedBy=multi-user.target

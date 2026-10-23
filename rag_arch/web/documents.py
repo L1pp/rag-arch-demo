@@ -7,12 +7,19 @@ resource semantics without taking a lock across model or PDF-worker calls.
 """
 from __future__ import annotations
 
+import asyncio
+from collections import OrderedDict
+from concurrent.futures import Future
 from dataclasses import dataclass
 import json
+import os
 from pathlib import Path, PurePosixPath
-from threading import Lock, RLock
+import re
+import shutil
+import time
+from threading import RLock
 from typing import Any, Iterable
-from uuid import uuid4
+from uuid import NAMESPACE_URL, uuid4, uuid5
 
 from ..collection import (DIRECT_TEXT_MAX_TOKENS, UploadCollection, build_collection,
                           extracted_text_tokens)
@@ -20,6 +27,7 @@ from ..config import ROOT
 from ..document_pages import SUPPORTED_SUFFIXES
 from ..loaders import load_document, validate_upload_sizes
 from ..page_sources import PageSources, plan_page_sources
+from ..retrieval import LocalIndex
 from ..plan_documents import (
     PlanDocument,
     load_registered_document,
@@ -100,31 +108,61 @@ def pages_for_plan(document: PlanDocument, asset: dict[str, Any], corpus=None,
 
 
 class DocumentStore:
-    """In-memory registry plus workspace-scoped persisted upload files."""
+    """Workspace-scoped uploads with optional durable tenant metadata.
+
+    The legacy constructor keeps its in-memory registry for isolated callers.
+    A tenant store must receive both ``user_id`` and ``database``; attachment
+    metadata then comes from PostgreSQL and every query is owner/workspace
+    scoped. Parsed and page/index objects share a bounded LRU, while in-flight
+    builders use futures so identical concurrent work is still single-flight.
+    """
 
     def __init__(self, root: str | Path = ROOT, workspace_id: str = "default",
-                 pdf_backend=None, *, direct_text_max_tokens: int = DIRECT_TEXT_MAX_TOKENS):
+                 pdf_backend=None, *, user_id: int | None = None, database=None,
+                 direct_text_max_tokens: int = DIRECT_TEXT_MAX_TOKENS,
+                 cache_max_entries: int = 64,
+                 cache_max_bytes: int = 64 * 1024 * 1024):
         if type(direct_text_max_tokens) is not int or direct_text_max_tokens < 0:
             raise ValueError("direct_text_max_tokens须为不小于0的整数。")
+        if type(cache_max_entries) is not int or cache_max_entries < 1:
+            raise ValueError("cache_max_entries须为正整数。")
+        if type(cache_max_bytes) is not int or cache_max_bytes < 1:
+            raise ValueError("cache_max_bytes须为正整数。")
+        if (user_id is None) != (database is None):
+            raise ValueError("user_id和database必须同时提供。")
+        if user_id is not None and (isinstance(user_id, bool) or not isinstance(user_id, int) or user_id < 1):
+            raise ValueError("user_id须为正整数。")
         self.root = Path(root).resolve()
         self.workspace_id = self._workspace_id(workspace_id)
+        self.user_id = user_id
+        self.database = database
         self.pdf_backend = pdf_backend
         self.direct_text_max_tokens = direct_text_max_tokens
-        self.upload_root = (self.root / "data/runtime/web_uploads" /
-                            self.workspace_id).resolve()
-        if not self.upload_root.is_relative_to((self.root / "data/runtime/web_uploads").resolve()):
+        self.cache_max_entries = cache_max_entries
+        self.cache_max_bytes = cache_max_bytes
+        self._storage_root = (self.root / "data/runtime/web_uploads").resolve()
+        if self.user_id is None:
+            self.upload_root = (self._storage_root / self.workspace_id).resolve()
+            expected_parts = (self.workspace_id,)
+        else:
+            self.upload_root = (self._storage_root / str(self.user_id) /
+                                self.workspace_id).resolve()
+            expected_parts = (str(self.user_id), self.workspace_id)
+        try:
+            actual_parts = self.upload_root.relative_to(self._storage_root).parts
+        except ValueError:
+            actual_parts = ()
+        if actual_parts != expected_parts:
             raise ValueError("上传目录无效。")
 
         self._lock = RLock()
         self._assets: dict[str, UploadAsset] = {}
-        self._loaded: dict[str, Any] = {}
-        self._load_locks: dict[str, Lock] = {}
-        self._chat_cache: dict[tuple[tuple[str, ...], bool], PreparedChat] = {}
-        self._chat_locks: dict[tuple[tuple[str, ...], bool], Lock] = {}
-        self._collection_ids: dict[tuple[str, ...], str] = {}
-        self._asset_pages: dict[str, PageSources] = {}
-        self._plan_cache: dict[tuple[str, str], PlanContext] = {}
-        self._plan_pages: dict[tuple[str, str, str, int], PageSources] = {}
+        self._cache: OrderedDict[tuple[str, Any], tuple[Any, int]] = OrderedDict()
+        self._cache_bytes = 0
+        self._inflight: dict[tuple[str, Any], Future] = {}
+        self._async_inflight_tasks: dict[tuple[str, Any], asyncio.Task] = {}
+        self._async_inflight_waiters: dict[tuple[str, Any], int] = {}
+        self._closed = False
 
     @staticmethod
     def _workspace_id(value: str) -> str:
@@ -139,6 +177,242 @@ class DocumentStore:
         return {"asset_id": record.asset_id, "filename": record.filename,
                 "size_bytes": record.size_bytes}
 
+    def _cache_get(self, namespace: str, key: Any):
+        token = (namespace, key)
+        with self._lock:
+            entry = self._cache.get(token)
+            if entry is None:
+                return None
+            self._cache.move_to_end(token)
+            return entry[0]
+
+    def _cache_put(self, namespace: str, key: Any, value: Any, weight_bytes: int):
+        weight = max(1, int(weight_bytes))
+        if weight > self.cache_max_bytes:
+            return value
+        token = (namespace, key)
+        with self._lock:
+            if self._closed:
+                return value
+            previous = self._cache.pop(token, None)
+            if previous is not None:
+                self._cache_bytes -= previous[1]
+            self._cache[token] = (value, weight)
+            self._cache_bytes += weight
+            while (len(self._cache) > self.cache_max_entries or
+                   self._cache_bytes > self.cache_max_bytes):
+                _, (_, evicted_weight) = self._cache.popitem(last=False)
+                self._cache_bytes -= evicted_weight
+        return value
+
+    def _memoized(self, namespace: str, key: Any, build, weight):
+        cached = self._cache_get(namespace, key)
+        if cached is not None:
+            return cached
+        token = (namespace, key)
+        with self._lock:
+            # The fast lookup above and the in-flight reservation are separate
+            # critical sections. A builder can finish and remove its Future in
+            # between them, so recheck the LRU while holding the same lock used
+            # to reserve the next build. Cache insertion/eviction also uses this
+            # lock, making the check-and-reserve decision atomic.
+            entry = self._cache.get(token)
+            if entry is not None:
+                self._cache.move_to_end(token)
+                return entry[0]
+            future = self._inflight.get(token)
+            owner = future is None
+            if owner:
+                future = Future()
+                self._inflight[token] = future
+        if not owner:
+            return future.result()
+        try:
+            value = build()
+            self._cache_put(namespace, key, value, weight(value))
+            future.set_result(value)
+            return value
+        except BaseException as exc:
+            future.set_exception(exc)
+            raise
+        finally:
+            with self._lock:
+                if self._inflight.get(token) is future:
+                    self._inflight.pop(token, None)
+
+    async def _amemoized(self, namespace: str, key: Any, build, weight):
+        """Share async cache builds without letting a cancelled waiter cancel peers."""
+        cached = self._cache_get(namespace, key)
+        if cached is not None:
+            return cached
+        token = (namespace, key)
+        with self._lock:
+            entry = self._cache.get(token)
+            if entry is not None:
+                self._cache.move_to_end(token)
+                return entry[0]
+            future = self._inflight.get(token)
+            owner = future is None
+            if owner:
+                future = Future()
+                self._inflight[token] = future
+            self._async_inflight_waiters[token] = self._async_inflight_waiters.get(token, 0) + 1
+
+        if owner:
+            async def complete_build():
+                try:
+                    value = await build()
+                    self._cache_put(namespace, key, value, weight(value))
+                    if not future.done():
+                        future.set_result(value)
+                except BaseException as exc:
+                    if not future.done():
+                        future.set_exception(exc)
+                finally:
+                    with self._lock:
+                        self._async_inflight_tasks.pop(token, None)
+                        if self._inflight.get(token) is future:
+                            self._inflight.pop(token, None)
+
+            try:
+                task = asyncio.create_task(complete_build())
+                with self._lock:
+                    self._async_inflight_tasks[token] = task
+            except BaseException:
+                with self._lock:
+                    if self._inflight.get(token) is future:
+                        self._inflight.pop(token, None)
+                raise
+
+        # shield prevents a cancelled waiter from cancelling a shared build.
+        wrapped = asyncio.wrap_future(future)
+        def consume_unobserved(done):
+            if done.cancelled():
+                return
+            try:
+                done.exception()
+            except BaseException:
+                pass
+        wrapped.add_done_callback(consume_unobserved)
+        try:
+            return await asyncio.shield(wrapped)
+        except asyncio.CancelledError:
+            current = asyncio.current_task()
+            # An exception raised by the shared build is distinct from this
+            # caller receiving a cancellation request; a new caller may retry.
+            if current is not None and current.cancelling() == 0:
+                return await self._amemoized(namespace, key, build, weight)
+            with self._lock:
+                remaining = self._async_inflight_waiters.get(token, 1) - 1
+                if remaining > 0:
+                    self._async_inflight_waiters[token] = remaining
+                else:
+                    self._async_inflight_waiters.pop(token, None)
+                task = self._async_inflight_tasks.get(token)
+                if (owner or remaining <= 0) and task is not None and not task.done():
+                    task.cancel()
+            if (owner or remaining <= 0) and task is not None:
+                # A cancelled builder retains its task slot until the shared
+                # task and any run_local physical operation have drained. Peers
+                # retry the completed shared cancellation with their own closure.
+                while not task.done():
+                    try:
+                        await asyncio.shield(task)
+                    except asyncio.CancelledError:
+                        continue
+                    except BaseException:
+                        break
+                # A Task cancelled before its coroutine's first step cannot run
+                # complete_build's finally block, so settle the shared Future here.
+                if task.cancelled() and not future.done():
+                    with self._lock:
+                        if not future.done():
+                            future.set_exception(asyncio.CancelledError())
+                        if self._inflight.get(token) is future:
+                            self._inflight.pop(token, None)
+                        if self._async_inflight_tasks.get(token) is task:
+                            self._async_inflight_tasks.pop(token, None)
+            raise
+        finally:
+            # Cancelled callers released their borrower in the except block.
+            current = asyncio.current_task()
+            if current is None or current.cancelling() == 0:
+                with self._lock:
+                    remaining = self._async_inflight_waiters.get(token, 0) - 1
+                    if remaining > 0:
+                        self._async_inflight_waiters[token] = remaining
+                    else:
+                        self._async_inflight_waiters.pop(token, None)
+
+    def _private_path(self, asset_id: str, filename: str) -> Path:
+        if not re.fullmatch(r"[0-9a-f]{32}", asset_id):
+            raise ValueError("上传文件登记信息无效。")
+        suffix = Path(filename).suffix.lower()
+        try:
+            path = (self.upload_root / asset_id / ("source" + suffix)).resolve()
+        except (OSError, RuntimeError) as exc:
+            raise ValueError("上传路径无效。") from exc
+        try:
+            if path.relative_to(self.upload_root).parts != (asset_id, "source" + suffix):
+                raise ValueError("上传路径无效。")
+        except ValueError as exc:
+            raise ValueError("上传路径无效。") from exc
+        return path
+
+    def _write_original(self, path: Path, payload: bytes) -> None:
+        path.parent.mkdir(parents=True, exist_ok=False)
+        temporary = path.parent / (".upload-" + uuid4().hex + ".tmp")
+        try:
+            with temporary.open("xb") as stream:
+                stream.write(payload)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temporary, path)
+        finally:
+            try:
+                temporary.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+    def _write_attachment_row(self, asset_id: str, filename: str, size_bytes: int,
+                              storage_key: str, *, status: str) -> None:
+        now = time.time()
+        with self.database.transaction() as connection:
+            connection.execute(
+                """
+                INSERT INTO attachments(
+                    attachment_id, user_id, workspace_id, filename, storage_key,
+                    content_type, size_bytes, status, created_at, updated_at
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                """,
+                (asset_id, self.user_id, self.workspace_id, filename, storage_key,
+                 None, size_bytes, status, now, now),
+            )
+
+    def _update_attachment_status(self, asset_id: str, expected: str, status: str) -> bool:
+        with self.database.transaction() as connection:
+            result = connection.execute(
+                """
+                UPDATE attachments SET status = %s, updated_at = %s
+                WHERE attachment_id = %s AND user_id = %s AND workspace_id = %s
+                  AND status = %s
+                """,
+                (status, time.time(), asset_id, self.user_id, self.workspace_id, expected),
+            )
+            return result.rowcount == 1
+
+    def _record_from_row(self, row) -> UploadAsset:
+        asset_id = row["attachment_id"]
+        filename = _filename(row["filename"])
+        suffix = Path(filename).suffix.lower()
+        expected_key = f"{self.user_id}/{self.workspace_id}/{asset_id}/source{suffix}"
+        if row["storage_key"] != expected_key:
+            raise ValueError("上传文件登记信息无效。")
+        path = self._private_path(asset_id, filename)
+        record = UploadAsset(asset_id, filename, int(row["size_bytes"]), path)
+        self._record_path(record)
+        return record
+
     def add(self, filename: str, data: bytes) -> dict[str, Any]:
         """Persist one upload and return metadata safe for public responses."""
         name = _filename(filename)
@@ -152,26 +426,78 @@ class DocumentStore:
             raise ValueError("目前支持 PDF、DOCX、TXT 和 MD 文字文件。")
 
         asset_id = uuid4().hex
-        directory = (self.upload_root / asset_id).resolve()
-        if not directory.is_relative_to(self.upload_root):
-            raise ValueError("上传路径无效。")
-        path = directory / ("source" + Path(name).suffix.lower())
-        directory.mkdir(parents=True, exist_ok=False)
+        path = self._private_path(asset_id, name)
+        if self.user_id is None:
+            try:
+                self._write_original(path, payload)
+            except Exception:
+                shutil.rmtree(path.parent, ignore_errors=True)
+                raise
+            record = UploadAsset(asset_id, name, len(payload), path)
+            with self._lock:
+                self._assets[asset_id] = record
+            return self._public(record)
+
+        storage_key = f"{self.user_id}/{self.workspace_id}/{asset_id}/source{Path(name).suffix.lower()}"
+        pending_created = False
+        directory_created = False
+        ready_update_started = False
         try:
-            path.write_bytes(payload)
+            self._write_attachment_row(asset_id, name, len(payload), storage_key,
+                                       status="processing")
+            pending_created = True
+            # A processing row is not visible to readers. The source is fully
+            # written and atomically renamed before the row becomes ready.
+            path.parent.mkdir(parents=True, exist_ok=False)
+            directory_created = True
+            temporary = path.parent / (".upload-" + uuid4().hex + ".tmp")
+            try:
+                with temporary.open("xb") as stream:
+                    stream.write(payload)
+                    stream.flush()
+                    os.fsync(stream.fileno())
+                os.replace(temporary, path)
+            finally:
+                try:
+                    temporary.unlink(missing_ok=True)
+                except OSError:
+                    pass
+            ready_update_started = True
+            if not self._update_attachment_status(asset_id, "processing", "ready"):
+                raise RuntimeError("附件登记状态已变化，未能完成上传。")
         except Exception:
-            # The unique directory contains no user data before this write;
-            # leave cleanup to the caller/normal runtime cleanup on failure.
+            # Before the ready transition, cleanup cannot invalidate a file
+            # that another reader could observe. Once the ready transaction
+            # starts, preserve the original because its commit may be unknown.
+            if not ready_update_started and directory_created:
+                shutil.rmtree(path.parent, ignore_errors=True)
+            if pending_created and not ready_update_started:
+                try:
+                    self._update_attachment_status(asset_id, "processing", "failed")
+                except Exception:
+                    pass
             raise
         record = UploadAsset(asset_id, name, len(payload), path)
-        with self._lock:
-            self._assets[asset_id] = record
         return self._public(record)
 
     def get(self, asset_id: str) -> UploadAsset:
         """Return an internal registration, including its approved path."""
         if not isinstance(asset_id, str) or not asset_id:
             raise KeyError(asset_id)
+        if self.database is not None:
+            with self.database.transaction() as connection:
+                row = connection.execute(
+                    """
+                    SELECT attachment_id, filename, storage_key, size_bytes
+                    FROM attachments
+                    WHERE attachment_id = %s AND user_id = %s AND workspace_id = %s
+                      AND status = 'ready'
+                    """,
+                    (asset_id, self.user_id, self.workspace_id),
+                ).fetchone()
+            if row is None:
+                raise KeyError(asset_id)
+            return self._record_from_row(row)
         with self._lock:
             record = self._assets.get(asset_id)
             if record is None:
@@ -180,12 +506,36 @@ class DocumentStore:
 
     def list(self) -> list[dict[str, Any]]:
         """Return only public asset metadata in registration order."""
+        if self.database is not None:
+            with self.database.transaction() as connection:
+                rows = connection.execute(
+                    """
+                    SELECT attachment_id, filename, storage_key, size_bytes
+                    FROM attachments
+                    WHERE user_id = %s AND workspace_id = %s AND status = 'ready'
+                    ORDER BY created_at, attachment_id
+                    """,
+                    (self.user_id, self.workspace_id),
+                ).fetchall()
+            result = []
+            for row in rows:
+                try:
+                    result.append(self._public(self._record_from_row(row)))
+                except (OSError, ValueError):
+                    # A ready row with a missing or invalid source is not a
+                    # usable upload and must not be advertised as downloadable.
+                    continue
+            return result
         with self._lock:
             return [self._public(record) for record in self._assets.values()]
 
     def _record_path(self, record: UploadAsset) -> Path:
-        path = record.path.resolve()
-        if not path.is_relative_to(self.upload_root) or not path.is_file():
+        try:
+            path = record.path.resolve()
+        except (OSError, RuntimeError) as exc:
+            raise ValueError("上传文件已不可用，请重新上传。") from exc
+        if (path != record.path or not path.is_relative_to(self.upload_root) or
+                not path.is_file()):
             raise ValueError("上传文件已不可用，请重新上传。")
         try:
             if path.stat().st_size != record.size_bytes:
@@ -207,23 +557,12 @@ class DocumentStore:
     def load(self, asset_id: str):
         """Parse one upload once and reuse its ``LoadedDocument`` instance."""
         record = self.get(asset_id)
-        with self._lock:
-            cached = self._loaded.get(asset_id)
-            parse_lock = self._load_locks.setdefault(asset_id, Lock())
-        if cached is not None:
-            return cached
-        with parse_lock:
-            with self._lock:
-                cached = self._loaded.get(asset_id)
-            if cached is not None:
-                return cached
+        def build():
             data, _ = self._load_bytes(record)
-            loaded = self._parse_upload(record, data)
-            with self._lock:
-                # A registry entry is immutable; this also avoids replacing a
-                # result that another worker stored while parsing outside the lock.
-                cached = self._loaded.setdefault(asset_id, loaded)
-            return cached
+            return self._parse_upload(record, data)
+
+        return self._memoized("loaded", asset_id, build,
+                              lambda _: max(1, record.size_bytes * 4))
 
     def _build_collection(self, records: list[UploadAsset], embeddings=None,
                           *, loaded_documents=None):
@@ -263,27 +602,20 @@ class DocumentStore:
         should_embed = (text_tokens > self.direct_text_max_tokens
                         and (embeddings is not None or callable(embeddings_factory)))
         key = (ids, should_embed)
-        with self._lock:
-            cached = self._chat_cache.get(key)
-            build_lock = self._chat_locks.setdefault(key, Lock())
-        if cached is not None:
-            return cached
 
-        with build_lock:
-            with self._lock:
-                cached = self._chat_cache.get(key)
-            if cached is not None:
-                return cached
+        def build():
             if should_embed and embeddings is None:
-                embeddings = embeddings_factory()
-                if embeddings is None:
+                resolved_embeddings = embeddings_factory()
+                if resolved_embeddings is None:
                     raise ValueError(f"附件提取正文合计超过 {self.direct_text_max_tokens:,} 估算 Token，向量服务不可用；未改用关键词检索。")
-            collection = self._build_collection(records, embeddings=embeddings if should_embed else None,
+            else:
+                resolved_embeddings = embeddings
+            collection = self._build_collection(records, embeddings=resolved_embeddings if should_embed else None,
                                                 loaded_documents=loaded_documents)
             # Switching retrieval mode changes the index, not the selected documents.
             # Preserve their history/page scope across keyword and vector variants.
-            with self._lock:
-                collection_id = self._collection_ids.setdefault(ids, uuid4().hex)
+            identity = "\0".join((str(self.root), str(self.user_id), self.workspace_id, *ids))
+            collection_id = uuid5(NAMESPACE_URL, "rag-arch-upload-set:" + identity).hex
             collection.collection_id = collection_id
             for chunk in collection.chunks:
                 chunk.collection_id = collection_id
@@ -297,24 +629,82 @@ class DocumentStore:
             }
             prepared = PreparedChat(collection, pages, public_assets, ids,
                                     self.workspace_id, document_assets)
-            with self._lock:
-                return self._chat_cache.setdefault(key, prepared)
+            return prepared
+
+        return self._memoized("chat", key, build,
+                              lambda _: max(1, sum(record.size_bytes for record in records) * 8))
+
+    async def aprepare_chat(self, attachment_ids: Iterable[str] | str,
+                            *, embeddings=None, embeddings_factory=None) -> PreparedChat:
+        """Prepare uploaded chat context while keeping embedding calls async."""
+        from ..async_support import run_local
+        ids = _ids(attachment_ids)
+        if not ids:
+            raise ValueError("请先选择附件。")
+        if embeddings_factory is not None and not callable(embeddings_factory):
+            raise TypeError("embeddings_factory 须为可调用对象。")
+        ids = tuple(sorted(ids))
+        records = await run_local(lambda: [self.get(asset_id) for asset_id in ids])
+        await run_local(validate_upload_sizes, (record.size_bytes for record in records))
+        loaded_documents = await run_local(
+            lambda: [self.load(record.asset_id) for record in records])
+        text_tokens = await run_local(extracted_text_tokens, loaded_documents)
+        should_embed = (text_tokens > self.direct_text_max_tokens
+                        and (embeddings is not None or callable(embeddings_factory)))
+        key = (ids, should_embed)
+
+        async def build():
+            resolved_embeddings = embeddings
+            if should_embed and resolved_embeddings is None:
+                resolved_embeddings = await run_local(embeddings_factory)
+                if resolved_embeddings is None:
+                    raise ValueError(f"附件提取正文合计超过 {self.direct_text_max_tokens:,} 估算 Token，向量服务不可用；未改用关键词检索。")
+
+            files = await run_local(lambda: [
+                (record.filename, self._load_bytes(record)[0]) for record in records])
+            collection = await run_local(
+                build_collection, files, None,
+                direct_text_max_tokens=self.direct_text_max_tokens,
+                documents=loaded_documents)
+            if should_embed:
+                collection.index = await LocalIndex.acreate(collection.chunks, resolved_embeddings)
+                collection.uses_embeddings = True
+
+            identity = "\0".join((str(self.root), str(self.user_id), self.workspace_id, *ids))
+            collection_id = uuid5(NAMESPACE_URL, "rag-arch-upload-set:" + identity).hex
+            collection.collection_id = collection_id
+            for chunk in collection.chunks:
+                chunk.collection_id = collection_id
+            pages = await run_local(self._chat_pages, records, collection.collection_id)
+            public_assets = await run_local(lambda: [self._public(record) for record in records])
+            documents = list(getattr(collection, "documents", ()) or ())
+            document_assets = {
+                document.doc_id: public_assets[index]
+                for index, document in enumerate(documents)
+                if index < len(public_assets) and getattr(document, "doc_id", None)
+            }
+            return PreparedChat(collection, pages, public_assets, ids,
+                                self.workspace_id, document_assets)
+
+        return await self._amemoized(
+            "chat", key, build,
+            lambda _: max(1, sum(record.size_bytes for record in records) * 8))
 
     def pages_for_asset(self, asset_id: str):
         """Return the cached single-upload page service, if it is pageable."""
         record = self.get(asset_id)
         if Path(record.filename).suffix.lower() not in SUPPORTED_SUFFIXES:
             return None
-        with self._lock:
-            cached = self._asset_pages.get(asset_id)
-        if cached is not None:
-            return cached
-        service = PageSources(self.root, collection_id=f"upload:{asset_id}",
-                              pdf_backend=self.pdf_backend)
-        service.add(f"upload:{asset_id}", record.filename,
-                    source_kind="upload", path=record.path, asset_id=asset_id)
-        with self._lock:
-            return self._asset_pages.setdefault(asset_id, service)
+
+        def build():
+            service = PageSources(self.root, collection_id=f"upload:{asset_id}",
+                                  pdf_backend=self.pdf_backend)
+            service.add(f"upload:{asset_id}", record.filename,
+                        source_kind="upload", path=record.path, asset_id=asset_id)
+            return service
+
+        return self._memoized("asset_pages", asset_id, build,
+                              lambda _: max(1, record.size_bytes))
 
     def _uploaded_plan(self, asset_id: str, record: UploadAsset) -> PlanDocument:
         loaded = self.load(asset_id)
@@ -355,41 +745,44 @@ class DocumentStore:
             if plan_id not in REGISTERED_PLAN_IDS:
                 raise KeyError("方案未登记。")
             key = ("registered", plan_id)
-            with self._lock:
-                cached = self._plan_cache.get(key)
-            if cached is not None:
-                return cached
-            document = load_registered_document(plan_id, root=self.root)
-            asset = self._registered_asset(document)
+
+            def build_registered():
+                document = load_registered_document(plan_id, root=self.root)
+                asset = self._registered_asset(document)
+                context_id = f"plan:{document.document_id}:{document.source_revision}"
+                return PlanContext(document, asset, context_id)
+
+            return self._memoized("plan", key, build_registered,
+                                  lambda _: 4096)
         else:
             if len(ids) != 1:
                 raise ValueError("方案上传只支持一个附件。")
             asset_id = ids[0]
             key = ("upload", asset_id)
-            with self._lock:
-                cached = self._plan_cache.get(key)
-            if cached is not None:
-                return cached
             record = self.get(asset_id)
-            asset = {"filename": record.filename, "path": str(record.path)}
-            document = self._uploaded_plan(asset_id, record)
 
-        context_id = f"plan:{document.document_id}:{document.source_revision}"
-        result = PlanContext(document, asset, context_id)
-        with self._lock:
-            return self._plan_cache.setdefault(key, result)
+            def build_uploaded():
+                asset = {"filename": record.filename, "path": str(record.path)}
+                document = self._uploaded_plan(asset_id, record)
+                context_id = f"plan:{document.document_id}:{document.source_revision}"
+                return PlanContext(document, asset, context_id)
+
+            return self._memoized("plan", key, build_uploaded,
+                                  lambda _: max(1, record.size_bytes * 4))
 
     def pages_for_plan(self, document: PlanDocument, asset: dict[str, Any], corpus=None):
         path = str(asset.get("path") or "")
         key = (document.document_id, document.source_revision, path, id(corpus))
-        with self._lock:
-            cached = self._plan_pages.get(key)
-        if cached is not None:
-            return cached
-        service = pages_for_plan(document, asset, corpus, root=self.root,
-                                 pdf_backend=self.pdf_backend)
-        with self._lock:
-            return self._plan_pages.setdefault(key, service)
+
+        def build():
+            return pages_for_plan(document, asset, corpus, root=self.root,
+                                  pdf_backend=self.pdf_backend)
+
+        try:
+            weight = max(1, Path(path).stat().st_size)
+        except OSError:
+            weight = 1
+        return self._memoized("plan_pages", key, build, lambda _: weight)
 
     def registered_plans(self) -> list[dict[str, str]]:
         """List the public registered-plan allowlist without parsing originals."""
@@ -415,14 +808,9 @@ class DocumentStore:
         left in place.  A shared PDF backend is owned by its caller.
         """
         with self._lock:
-            self._loaded.clear()
-            self._load_locks.clear()
-            self._chat_cache.clear()
-            self._chat_locks.clear()
-            self._collection_ids.clear()
-            self._asset_pages.clear()
-            self._plan_cache.clear()
-            self._plan_pages.clear()
+            self._closed = True
+            self._cache.clear()
+            self._cache_bytes = 0
 
 
 __all__ = [

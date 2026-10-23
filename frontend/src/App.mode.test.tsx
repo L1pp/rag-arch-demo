@@ -1,12 +1,18 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
-import { fireEvent, render, screen } from '@testing-library/react'
+import { fireEvent, render, screen, waitFor } from '@testing-library/react'
 import App from './App'
-import { initialState, reducer } from './store'
+import { initialState, reducer, tenantStorageKey } from './store'
 import { assistantIds, type TaskSnapshot, type WorkspaceSnapshot } from './types'
 import { useWorkspace } from './WorkspaceContext'
 
 let context: ReturnType<typeof useWorkspace>
 vi.mock('./WorkspaceContext', () => ({ useWorkspace: () => context }))
+const apiMock = vi.hoisted(() => ({
+  ApiError: class extends Error { constructor(message: string, readonly status: number) { super(message) } },
+  downloadTask: vi.fn(), getStandardCandidates: vi.fn(), getStandardsCatalog: vi.fn(), logout: vi.fn(), redirectToLogin: vi.fn(),
+  taskDownloadUrl: vi.fn((taskId: string, workspaceId: string, format: string) => `/api/tasks/${taskId}/download?workspace_id=${workspaceId}&format=${format}`),
+}))
+vi.mock('./api', () => apiMock)
 
 function workspace(): WorkspaceSnapshot {
   return {
@@ -19,6 +25,11 @@ function workspace(): WorkspaceSnapshot {
   }
 }
 beforeEach(() => {
+  apiMock.getStandardCandidates.mockReset()
+  apiMock.downloadTask.mockReset().mockResolvedValue(undefined)
+  apiMock.getStandardsCatalog.mockReset().mockResolvedValue({ entries: [] })
+  apiMock.logout.mockReset().mockResolvedValue({ authenticated: false })
+  apiMock.redirectToLogin.mockReset()
   const state = reducer(initialState(), { type: 'snapshot', snapshot: workspace(), now: Date.now() })
   state.resourcesLoading = false
   context = {
@@ -28,6 +39,20 @@ beforeEach(() => {
 })
 
 describe('execution mode presentation', () => {
+  it('logs out through JSON and removes the active tenant draft cache', async () => {
+    context.state.ownerUserId = 77
+    context.state.workspaceId = 'workspace-77'
+    const cacheKey = tenantStorageKey(77, 'workspace-77')
+    localStorage.setItem(cacheKey, JSON.stringify({ owner_user_id: 77, workspace_id: 'workspace-77', drafts: {} }))
+
+    render(<App />)
+    fireEvent.click(screen.getByRole('button', { name: '退出' }))
+
+    await waitFor(() => expect(apiMock.logout).toHaveBeenCalledTimes(1))
+    expect(localStorage.getItem(cacheKey)).toBeNull()
+    expect(apiMock.redirectToLogin).toHaveBeenCalledTimes(1)
+  })
+
   it('shows real chat without demo controls or a fake reply label', () => {
     const task: TaskSnapshot = {
       task_id: 'real-task', assistant_id: 'chat', request_id: 'real-request', prompt: '你好',
@@ -63,7 +88,7 @@ describe('execution mode presentation', () => {
 
   it('shows the standards assistant as a real BM25-backed model without demo controls', () => {
     context.state.selected = 'standards'
-    context.state.assistants.standards.draft.prompt = 'DEMO-STD-01 中施工荷载有哪些要求？'
+    context.state.assistants.standards.draft.prompt = 'GB 55023-2022 中支撑脚手架施工荷载有哪些要求？'
     render(<App/>)
     expect(screen.getByText('查阅规范条文与版本信息')).toBeInTheDocument()
     expect(screen.queryByText(/演示设置/)).not.toBeInTheDocument()
@@ -73,41 +98,7 @@ describe('execution mode presentation', () => {
     expect(screen.getByText('回答附规范依据。')).toBeInTheDocument()
   })
 
-  it.each([
-    { name: '引用被拒绝', status: 'insufficient_evidence', termination_reason: 'citation_rejected', title: '引用未通过核验', disallowed: '资料不足以支持结论' },
-    { name: '格式错误', status: 'insufficient_evidence', termination_reason: 'invalid_result', title: '输出格式未通过核验', disallowed: '资料不足' },
-    { name: '确实缺少证据', status: 'insufficient_evidence', termination_reason: 'insufficient_evidence', title: '资料不足以支持结论', disallowed: null },
-    { name: '只有状态没有原因', status: 'insufficient_evidence', termination_reason: '', title: '回答尚未通过核验', disallowed: '资料不足以支持结论' },
-    { name: '正常回答', status: 'answered', termination_reason: 'answered', title: null, disallowed: null },
-  ])('marks $name correctly and preserves the answer text', ({ status, termination_reason, title, disallowed }) => {
-    const task: TaskSnapshot = {
-      task_id: 'validation-task', assistant_id: 'standards', request_id: 'validation-request', prompt: '自编规范示例问题',
-      status: 'completed', stage: 'completed', detail: '回答已完成', created_at: '2026-09-14T13:00:00Z',
-      started_at: '2026-09-14T13:00:00Z', finished_at: '2026-09-14T13:00:01Z', elapsed_seconds: 1,
-      duration_seconds: null, updated_seq: 1, simulation: false,
-      result: {
-        text: '这是保留的模型原文。', simulation: false, model: 'test-model', warnings: [], web_sources: [],
-        native_tool_usage: {}, token_usage: {}, citations: [], catalog_matches: [], status, termination_reason,
-      },
-    }
-    context.state.selected = 'standards'
-    context.state.assistants.standards.execution_mode = 'model'
-    context.state.assistants.standards.tasks = [task]
-    render(<App />)
-
-    expect(screen.getByText('这是保留的模型原文。')).toBeInTheDocument()
-    if (title) {
-      const notice = screen.getByRole('alert')
-      expect(notice).toHaveTextContent(title)
-      if (termination_reason === 'citation_rejected' || termination_reason === 'invalid_result') {
-        expect(notice).toHaveTextContent('下方保留模型原文供检查')
-      }
-      if (disallowed) expect(notice).not.toHaveTextContent(disallowed)
-    } else {
-      expect(screen.queryByRole('alert')).not.toBeInTheDocument()
-    }
-  })
-  it('renders standards citations as evidence cards with original-page links', () => {
+  it('renders real standards citations as evidence cards with original-page links', () => {
     const task: TaskSnapshot = {
       task_id: 'standards-task', assistant_id: 'standards', request_id: 'standards-request', prompt: '防水要求',
       status: 'completed', stage: 'completed', detail: '回答已完成', created_at: '2026-09-14T13:00:00Z',
@@ -116,8 +107,8 @@ describe('execution mode presentation', () => {
       result: {
         text: '请按规范施工。', simulation: false, model: 'test-standards-model', warnings: [], web_sources: [],
         native_tool_usage: {}, token_usage: {}, citations: [{
-          evidence_id: 'ev-1', std_no: 'DEMO-STD-02', title: '自编防水示例规范', clause_no: '示例条款一',
-          text: '防水工程应满足设计要求。', page_url: '/viewer/pages?std=demo-std-02&evidence=ev-1', history_url: '/viewer/history/?std=demo-std-02',
+          evidence_id: 'ev-1', std_no: 'GB 55008-2021', title: '工程防水通用规范', clause_no: '4.2.1',
+          text: '防水工程应满足设计要求。', page_url: '/viewer/pages?std=gb-55008&evidence=ev-1', history_url: '/viewer/history/?std=gb-55008',
         }], catalog_matches: [], answer_scope: 'clause', status: 'grounded', corpus_id: 'standards', grounded: true, tool_calls: 1,
       },
     }
@@ -143,14 +134,14 @@ describe('execution mode presentation', () => {
         text: '方案核查摘要', simulation: false, model: 'test-plan-model', warnings: [], web_sources: [],
         native_tool_usage: {}, token_usage: {}, report_markdown: '# 方案核查摘要\n\n总体可执行\n\n## 发现\n\n发现一项待补充说明\n\n图像页未完整读取',
         report: { answer: '总体可执行', findings: ['发现一项待补充说明'], coverage: '已覆盖主要章节', limitations: '图像页未完整读取' },
-        citations: [{ evidence_id: 'plan-ev-1', std_no: 'DEMO-STD-01', title: '自编施工方案示例引用', clause_no: '示例条款二', text: '规范引用摘要', page_url: '/viewer/pages?std=demo-std-01&evidence=plan-ev-1', history_url: '/viewer/history/?std=demo-std-01' }],
+        citations: [{ evidence_id: 'plan-ev-1', std_no: 'GB 55023-2022', title: '建筑施工脚手架安全技术统一标准', clause_no: '6.2.1', text: '规范引用摘要', page_url: '/viewer/pages?std=gb-55023&evidence=plan-ev-1', history_url: '/viewer/history/?std=gb-55023' }],
         files: [{ asset_id: 'report-1', filename: '方案核查报告.md', size_bytes: 1024, page_url: '/viewer/pages?asset=plan-1&workspace_id=work' }],
       },
     }
     context.state.selected = 'plan'
     context.state.assistants.plan.tasks = [task]
-    context.state.assistants.plan.draft.registered_plan_id = 'DEMO-PLAN-01'
-    context.state.plans = [{ plan_id: 'DEMO-PLAN-01', label: 'DEMO-PLAN-01 自编方案', filename: 'DEMO-PLAN-01.pdf' }]
+    context.state.assistants.plan.draft.registered_plan_id = 'P01'
+    context.state.plans = [{ plan_id: 'P01', label: 'P01 主体方案', filename: 'P01.pdf' }]
     render(<App/>)
     expect(screen.getByRole('region', { name: '方案核查报告' })).toBeInTheDocument()
     expect(screen.getByRole('heading', { name: '方案核查摘要' })).toBeInTheDocument()

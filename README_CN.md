@@ -2,72 +2,53 @@
 
 [English](README.md) | [简体中文](README_CN.md)
 
-这是建筑资料助手的代码展示仓库。默认 Web 入口是 React 单页应用，由 FastAPI 后端提供服务。可以沿着代码查看资料上传、检索、证据引用、方案核查、任务进度与取消、来源页查看和报告下载的实现。
+本仓库展示建筑资料助手当前的 React + FastAPI 实现。React 前端、FastAPI API、PostgreSQL 任务库和 AI worker 分开运行。代码展示账号内任务如何经过资料处理、混合检索、证据引用、方案核查、可续传进度事件和报告导出。
 
-公开目录包含选取的应用代码和自编样例，不包含私有规范库、原件、凭据或运行数据库。因此，主 Web 工作台不是开箱即用的公开服务；使用者需要自行准备兼容的模型配置、资料库和所需来源文件。请先看[Web 启动说明](docs/web_setup.md)。
+公开目录包含应用代码与自编虚构样例，不含完整规范库、来源原件、API 凭据、数据库或生成后的语料/向量包。使用者自行准备 PostgreSQL、模型配置、语料，以及需要查看来源页时所需的原件。Web 工作台用于展示工程实现，不是克隆即可运行的托管服务。请看[启动说明](docs/web_setup.md)。
 
-## 主 Web 工作台
+## 当前 Web 架构
 
-React 页面调用 FastAPI 的工作区、助手任务、SSE 进度、任务取消、资料上传、来源页、历史记录和报告下载接口，后端再连接保留的检索与 Agent 实现。代码展示实际应用链路，项目私有资料不随仓库发布。
+在同一部署中，每个账号的任务、附件、历史和审计记录彼此隔离。PostgreSQL 持久保存认证、任务和事件状态；独立 API 进程接收请求，AI worker 领取并执行持久任务。客户端断线后可以携带游标重新订阅任务事件。数据库约束每个账号的助手任务槽和全站执行上限。
 
-登录功能管理本地账号，但多个账号共用本地工作区和运行数据，不提供按账号隔离数据。仓库中的启动方式将服务绑定到本机地址，适合本地阅读和检查。
+Worker 保留检索和 Agent 链路。稠密向量、BM25 索引和语料记录可通过只读内存映射包共享，完整语料记录按需解码。模型、搜索、嵌入和重排等网络编排在 worker 中异步执行；本地计算和文件处理由受限的进程资源管理。[架构说明](docs/architecture.md)将这些链路映射到源码。
 
-## 保留的独立样例入口
+## 启动本地工作台
 
-自编的离线 CLI 小样例仍可运行：
+按[启动步骤](docs/web_setup.md)准备 Python 与前端依赖，显式执行 PostgreSQL 数据库迁移、创建账号，并分别启动 API、worker 和 React 开发服务器。真实资料流程需要使用者提供模型配置和资料。
+
+自编离线 CLI 仍提供一个小型确定性样例：
 
 ~~~~bash
 python -m demo --output output
 ~~~~
 
-结果写入 output/，包括 Markdown 报告和 JSON 结果。离线模式以确定性替身代替模型、向量和重排服务，只演示自编样例覆盖的流程，不能据此核查任意方案。
+结果写入 output/ 下的 Markdown 和 JSON 文件。替身仅演示自编样例，不核查任意方案。
 
-独立的无密钥 Streamlit 小样例保留在 streamlit_demo.py：
+## 贡献与公开范围
 
-~~~~bash
-python -m pip install -r requirements-demo.txt
-python -m streamlit run streamlit_demo.py --server.address 127.0.0.1 --server.port 8501
-~~~~
+我主导完成建筑资料助手的实现，并有权公开本仓库选取的代码。源码包含资料读取与来源定位、BM25 和向量检索、RRF 融合、重排、证据工具、Agent 工具调用、方案引句核验、引用校验和报告生成。课程借鉴说明与第三方组件信息保留在[来源说明](THIRD_PARTY_NOTICES.md)。
 
-它是轻量独立样例，不是 React/FastAPI 主工作台。首次发布时的 Streamlit 历史截图见下方链接。
+公开样例资料为自编虚构内容。完整内部语料、客户材料、运行状态、私有评测输入，以及基于这些资料生成的派生产物均未发布。公开的历史评测数字汇总在[效果说明](docs/evaluation.md)；原始输入和报告不公开。
 
-## 核心实现与贡献范围
+## 较早版本的 React 界面示意
 
-我主导完成建筑资料助手的实现，并有权公开本仓库选取的代码。源码展示资料读取与来源定位、BM25 和向量检索、RRF 融合、重排、证据工具、Agent 工具循环、方案引句核验、引用校验和报告交付。课程借鉴说明与第三方组件信息保留在[来源说明](THIRD_PARTY_NOTICES.md)。
+以下截图于 2026-10-13 使用虚构离线样例拍摄，展示的是较早版本的 React 界面，不包含当前账号、PostgreSQL 任务库或 worker 链路。截图不代表真实模型服务或生产部署已验证。
 
-[架构说明](docs/architecture.md)将 Web 与检索链路映射到源码；[Web 启动说明](docs/web_setup.md)说明主应用所需的配置和由使用者准备的资料。
-
-## React + FastAPI 界面截图
-
-截图在隔离的临时环境中拍摄：将离线样例结果接入当前 React 页面。画面资料为自编虚构内容。正常使用主工作台仍需自行配置 API、资料库和来源文件；截图不代表在线模型服务或生产部署已验证。
-
-![新版工作台：自编虚构资料](docs/screenshots/react-01-workbench.png)
-![新版证据页：离线演示结果](docs/screenshots/react-02-evidence.png)
-![新版方案核查页：离线演示结果](docs/screenshots/react-03-plan-review.png)
-
-首次发布时的 Streamlit 截图仍保留：[资料](docs/screenshots/01-library.png)、[检索与引用](docs/screenshots/02-qa.png)和[方案核查](docs/screenshots/03-review.png)。
-
-## 现有效果与限制
-
-历史 60 题检索回归中，同一 RRF 候选池加入重排后，Recall@8 为 0.8444→0.8722，完整证据命中为 44/60→47/60；Top-4 完整证据同时由 40/60 降至 39/60。固定 240 题 AECBench 问答中，可解码选项正确率为 146/240→184/240。
-
-五方案整案评测采用 59 个固定开发参考项，结果是参考覆盖，不是全报告准确率；未证明 RAG 稳定提高整案技术发现。[效果说明](docs/evaluation.md)介绍评测范围、人工复核对照、不利结果和不能归因的变化。公开样例不复现这些成绩。
-
-引用校验能检查来源与引句，不能自动证明工程适用性、结论正确或缺陷发现完整。文字提取缺口、图表和复杂计算仍需人工复核。
+![较早版本工作台示意](docs/screenshots/react-01-workbench.png)
+![较早版本证据页与自编离线结果](docs/screenshots/react-02-evidence.png)
+![较早版本方案核查页与自编离线结果](docs/screenshots/react-03-plan-review.png)
 
 ## 仓库导航
 
-- frontend/：React 页面与构建配置。
-- rag_arch/web/：FastAPI 应用、登录、任务、上传、来源与历史接口。
-- rag_arch/：检索、证据、Agent、方案核查和报告实现。
-- demo/、examples/：离线 CLI 样例与自编虚构输入。
-- streamlit_demo.py：独立的小型 Streamlit 样例。
-- docs/：启动、架构、效果、发布范围说明、新版 React 截图和历史 Streamlit 截图。
+- frontend/：React 应用。
+- rag_arch/web/：FastAPI API、认证、持久化、任务、事件、上传与下载。
+- rag_arch/：资料处理、检索、证据、Agent、方案核查和报告。
+- scripts/：显式数据库迁移及本地语料/索引准备。
+- demo/、examples/：自编离线 CLI 样例和虚构输入。
+- docs/：架构、启动、效果边界、发布范围、历史界面截图和验证记录。
 
-[首次发布验证记录](docs/validation.md)验证的是原 Streamlit 样例，不是当前 React/FastAPI 工作台。[发布说明](docs/publication.md)介绍本次公开源码的范围。
-
-本次有限验证见[前后端迁移验证](docs/web_validation_20261013.md)。
+建议先读[架构说明](docs/architecture.md)、[启动说明](docs/web_setup.md)和[发布说明](docs/publication.md)。2026-10-12 和 2026-10-13 的验证文档仅记录较早版本的实现。本次迁移的验证记录见[这里](docs/web_validation_20261023.md)，将在最终测试和审阅证据确定后补全。
 
 ## 许可证
 
-本项目自有代码采用 [MIT 许可](LICENSE)。第三方依赖遵循各自许可，不保证依赖及产物满足所有商业用途；使用者应自行核对相关授权。组件与来源见[第三方说明](THIRD_PARTY_NOTICES.md)。
+本项目自有代码采用 [MIT 许可](LICENSE)。第三方依赖遵循各自许可；不保证依赖及产物满足所有商业用途，使用者应自行核对相关授权。组件与来源见[第三方说明](THIRD_PARTY_NOTICES.md)。

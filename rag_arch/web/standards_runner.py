@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from concurrent.futures import CancelledError
 from copy import copy, deepcopy
+import asyncio
 import json
 
 from langchain_core.tools import StructuredTool
@@ -17,10 +18,12 @@ from ..generation_experiments import safe_error
 from ..graph_agent import StandardAgent, _usage_total
 from ..output_schemas import STANDARD_ANSWER_SCHEMA, schema_for_model
 from ..providers import create_reranker, create_web_search_provider
-from ..runtime_audit import record_event, record_run
+from ..runtime_audit import record_event, record_run, tenant_audit_metadata
+from ..runtime_audit import arecord_event, arecord_run
 from .catalog_tools import CatalogPlanTools as StandardTools
 from ..tool_chat import create_tool_chat_model
 from .chat_runner import _ObservedModel
+from ..async_support import TaskResourceCleanupError, run_local
 
 
 class _CancelledDuringTool(BaseException):
@@ -119,6 +122,86 @@ def _observed_tool(tool, progress, cancel_event):
     if response_format in {"content", "content_and_artifact"}:
         kwargs["response_format"] = response_format
     return StructuredTool.from_function(**kwargs)
+
+
+def _async_observed_tool(tool, progress, cancel_event, *, require_coroutine=False):
+    """Wrap a tool with a real coroutine; local sync work uses the bounded executor."""
+    name = getattr(tool, "name", None) or "standard_tool"
+    description = getattr(tool, "description", None) or "读取本地规范资料。"
+    args_schema = getattr(tool, "args_schema", None)
+    return_direct = bool(getattr(tool, "return_direct", False))
+    response_format = getattr(tool, "response_format", "content")
+    has_coroutine = callable(getattr(tool, "coroutine", None))
+    network_named = any(token in name.lower() for token in ("web", "http", "online", "remote"))
+
+    async def invoke_tool(**kwargs):
+        await _aprogress(progress, cancel_event, "tool", f"正在调用规范工具 {name}")
+        await arecord_event("standards_tool_started", tool_name=name, arguments=deepcopy(kwargs))
+        try:
+            if has_coroutine:
+                value = await tool.ainvoke(deepcopy(kwargs))
+            elif require_coroutine or network_named:
+                raise RuntimeError(f"工具 {name} 未提供异步网络接口。")
+            else:
+                value = await run_local(tool.invoke, deepcopy(kwargs))
+        except CancelledError:
+            if cancel_event is not None and cancel_event.is_set():
+                raise _CancelledDuringTool("本轮规范问答已取消。") from None
+            raise
+        _check_cancel(cancel_event)
+        await arecord_event("standards_tool_returned", tool_name=name, result=deepcopy(value))
+        await _aprogress(progress, cancel_event, "tool", f"规范工具 {name}已返回")
+        return value
+
+    options = {"func": None, "coroutine": invoke_tool, "name": name,
+               "description": description, "return_direct": return_direct,
+               "args_schema": args_schema, "infer_schema": args_schema is None}
+    if response_format in {"content", "content_and_artifact"}:
+        options["response_format"] = response_format
+    return StructuredTool.from_function(**options)
+
+
+def _async_observed_tools(standard_tools, progress, cancel_event):
+    class AsyncObservedTools:
+        def __init__(self, inner):
+            self._inner = inner
+
+        def __getattr__(self, name):
+            return getattr(self._inner, name)
+
+        def as_langchain_tools(self):
+            return [_async_observed_tool(tool, progress, cancel_event)
+                    for tool in self._inner.as_langchain_tools()]
+
+    return AsyncObservedTools(standard_tools)
+
+
+class _AsyncObservedWebProvider:
+    def __init__(self, provider, progress, cancel_event):
+        self._provider = provider
+        self._progress = progress
+        self._cancel_event = cancel_event
+        self.available = getattr(provider, "available", False)
+
+    def __getattr__(self, name):
+        return getattr(self._provider, name)
+
+    def as_langchain_tool(self):
+        original = self._provider.as_langchain_tool()
+        return _async_observed_tool(original, self._progress, self._cancel_event,
+                                    require_coroutine=True)
+
+
+async def _aprogress(progress, cancel_event, stage, detail):
+    _check_cancel(cancel_event)
+    if callable(progress):
+        try:
+            await run_local(progress, stage, detail)
+        except CancelledError:
+            if cancel_event is not None and cancel_event.is_set():
+                raise _CancelledDuringTool("本轮规范问答已取消。") from None
+            raise
+    _check_cancel(cancel_event)
 
 
 def _factory_call(factory, settings, schema):
@@ -284,7 +367,8 @@ def run_standards(request, progress, cancel_event, *, resources, settings=None, 
         raise RuntimeError(json.dumps(safe_error(exc, component="standards"), ensure_ascii=False)) from None
     question = question.strip()
     samples = []
-    with record_run("web_standard_agent", settings, question, task_id=request.get("task_id")) as audit:
+    with record_run("web_standard_agent", settings, question,
+                    **tenant_audit_metadata(request)) as audit:
         agent_output = None
         try:
             _notify(progress, cancel_event, "preparing", "正在准备规范资料和 Agent")
@@ -368,3 +452,169 @@ def run_standards(request, progress, cancel_event, *, resources, settings=None, 
                                 "traces": deepcopy(getattr(agent_output, "traces", []))})
             audit.set_result(payload)
             raise RuntimeError(json.dumps(error, ensure_ascii=False)) from None
+
+
+async def arun_standards(request, progress, cancel_event, *, resources, settings=None,
+                         model_factory=None):
+    """Run standards QA through native async model, index and provider APIs."""
+    from ..providers import async_close_model
+    from ..tool_chat import create_async_tool_chat_model
+
+    if not isinstance(request, dict):
+        raise ValueError("规范任务请求须为对象。")
+    question = request.get("prompt")
+    if not isinstance(question, str) or not question.strip():
+        raise ValueError("请输入规范问题。")
+    if resources is None or not callable(getattr(resources, "aprepare", None)):
+        raise ValueError("规范资料资源未提供异步准备接口。")
+    if cancel_event is not None and cancel_event.is_set():
+        raise CancelledError("本轮规范问答已取消。")
+    try:
+        settings = settings if settings is not None else load_settings()
+    except Exception as exc:
+        raise RuntimeError(json.dumps(safe_error(exc, component="standards"), ensure_ascii=False)) from None
+
+    question = question.strip()
+    samples = []
+    model = None
+    owned_models = []
+    web_provider = None
+    completed_result = None
+    primary_failed = False
+    primary_cancelled = False
+    async with arecord_run("web_standard_agent", settings, question,
+                           **tenant_audit_metadata(request)) as audit:
+        agent_output = None
+        try:
+            await _aprogress(progress, cancel_event, "preparing", "正在准备规范资料和 Agent")
+            bundle = await resources.aprepare()
+            index = copy(bundle.index)
+            index.local = copy(bundle.index.local)
+            embeddings = getattr(index, "embeddings", None)
+            clone = getattr(embeddings, "clone", None)
+            if embeddings is not None:
+                if callable(clone):
+                    embeddings = clone()
+                    index.embeddings = embeddings
+                    index.local.embeddings = embeddings
+                else:
+                    index.embeddings = None
+                    index.local.embeddings = None
+                    index.local._vectors = None
+            index.candidate_pool = 30
+            index.rrf_constant = 60
+            if (getattr(index, "embeddings", None) is not None
+                    and settings.reranker_default_enabled and settings.reranker_ready):
+                index.reranker = await run_local(create_reranker, settings)
+            default_mode = ("hybrid" if getattr(index, "embeddings", None) is not None
+                            and getattr(index, "reranker", None) is not None else
+                            "rrf" if getattr(index, "embeddings", None) is not None else "bm25")
+            corpus_id = getattr(index, "collection_id", None)
+            if not isinstance(corpus_id, str) or not corpus_id:
+                raise ValueError("规范语料缺少稳定的corpus_id。")
+            toolset = StandardTools(settings, index=index,
+                                    default_mode=default_mode, top_k=8,
+                                    before_request=lambda: _check_cancel(cancel_event),
+                                    persist_batches=False, allow_index_build=False,
+                                    default_hybrid_fallback_to_rrf=True,
+                                    fixed_search_mode=default_mode)
+            toolset.begin_run()
+            toolset.catalog_index = bundle.catalog
+            toolset.catalog_request_check = lambda: _check_cancel(cancel_event)
+            observed_tools = _async_observed_tools(toolset, progress, cancel_event)
+            schema = await run_local(schema_for_model, settings.chat_model, STANDARD_ANSWER_SCHEMA)
+            factory = model_factory or create_async_tool_chat_model
+            def _create_model():
+                created = _factory_call(factory, settings, schema)
+                if created is not None:
+                    owned_models.append(created)
+                return created
+
+            model = await run_local(_create_model)
+            if model is None:
+                raise ValueError("聊天模型未配置。")
+            web_provider = create_web_search_provider(settings)
+            observed_model = _ObservedModel(model, progress, cancel_event, samples)
+            history = await run_local(_history_for_agent, request.get("history"), corpus_id)
+            page_service = getattr(bundle, "pages", None)
+            if page_service is not None:
+                page_service = _NavigationPageService(page_service)
+            def _create_agent():
+                return StandardAgent(observed_model, observed_tools, page_service=page_service,
+                    web_provider=(_AsyncObservedWebProvider(web_provider, progress, cancel_event)
+                                  if web_provider is not None else None),
+                    input_budget_tokens=(settings.chat_context_budget_tokens - settings.chat_max_tokens))
+
+            agent = await run_local(_create_agent)
+            output = await agent.arun(question, corpus_id=corpus_id, history=history)
+            agent_output = output
+            _check_cancel(cancel_event)
+            await _aprogress(progress, cancel_event, "assembling", "正在整理规范证据和引用")
+            result = await run_local(_build_result, output, resources, settings, audit, request)
+            if getattr(output, "termination_reason", None) in _TECHNICAL_FAILURE_REASONS:
+                raise RuntimeError("规范 Agent 技术调用失败，未生成可用结论。")
+            completed_result = result
+            return result
+        except BaseException as exc:
+            cancelled = ((cancel_event is not None and cancel_event.is_set())
+                         or isinstance(exc, (CancelledError, _CancelledDuringTool, asyncio.CancelledError)))
+            if cancelled:
+                primary_cancelled = True
+                payload = {"task_id": request.get("task_id"), "status": "cancelled",
+                           "simulation": False, "model": settings.chat_model,
+                           "token_usage": _usage_total(samples), "audit_log": audit.info}
+                if agent_output is not None:
+                    payload.update({"agent_result": agent_output,
+                                    "evidence": deepcopy(getattr(agent_output, "evidence", [])),
+                                    "traces": deepcopy(getattr(agent_output, "traces", []))})
+                audit.set_result(payload)
+                current_task = asyncio.current_task()
+                if (isinstance(exc, asyncio.CancelledError) and current_task is not None
+                        and current_task.cancelling()):
+                    raise
+                raise CancelledError("本轮规范问答已取消。") from None
+            primary_failed = True
+            error = safe_error(exc if isinstance(exc, Exception) else Exception(type(exc).__name__),
+                               component="standards")
+            payload = {"task_id": request.get("task_id"), "status": "failed",
+                       "simulation": False, "model": settings.chat_model, "error": error,
+                       "token_usage": _usage_total(samples), "audit_log": audit.info}
+            if agent_output is not None:
+                payload.update({"agent_result": agent_output,
+                                "evidence": deepcopy(getattr(agent_output, "evidence", [])),
+                                "traces": deepcopy(getattr(agent_output, "traces", []))})
+            audit.set_result(payload)
+            raise RuntimeError(json.dumps(error, ensure_ascii=False)) from None
+        finally:
+            close_failures = []
+            seen = set()
+            for resource in (*owned_models, web_provider):
+                if resource is None or id(resource) in seen:
+                    continue
+                seen.add(id(resource))
+                try:
+                    await async_close_model(resource)
+                except BaseException as exc:
+                    close_failures.append(type(exc).__name__)
+            if close_failures:
+                mark_cleanup = getattr(cancel_event, "mark_resource_cleanup_failed", None)
+                if callable(mark_cleanup):
+                    mark_cleanup()
+                await arecord_event("web_standards_resource_close_failed", exception_types=close_failures)
+                if completed_result is not None:
+                    cleanup_error = TaskResourceCleanupError("standards",
+                                                            exception_types=close_failures)
+                    error = cleanup_error.as_error()
+                    audit.set_result({"task_id": request.get("task_id"), "status": "failed",
+                        "simulation": False, "model": settings.chat_model, "error": error,
+                        "token_usage": _usage_total(samples), "audit_log": audit.info})
+                    raise cleanup_error
+                if primary_failed and not primary_cancelled:
+                    cleanup_error = TaskResourceCleanupError("standards",
+                                                            exception_types=close_failures)
+                    previous = audit.result if isinstance(audit.result, dict) else {}
+                    error = cleanup_error.as_error()
+                    if previous.get("error") is not None:
+                        error["operation_error"] = previous["error"]
+                    audit.set_result({**previous, "status": "failed", "error": error})
+                    raise cleanup_error

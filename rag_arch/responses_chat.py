@@ -14,7 +14,7 @@ import time
 from typing import Any, ClassVar
 
 import httpx
-from pydantic import Field, SecretStr
+from pydantic import Field, PrivateAttr, SecretStr
 from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 from langchain_core.outputs import ChatGeneration, ChatResult
@@ -22,6 +22,7 @@ from langchain_core.utils.function_calling import convert_to_openai_tool
 
 from .model_input_view import MODEL_INPUT_VIEW_VERSION, model_message_content
 from .config import DEFAULT_REQUEST_TIMEOUT_SECONDS
+from .request_control import check_request_control
 from .web_search import _http_url, _source_rows
 
 NATIVE_NAMES = ("web_search", "web_extractor", "code_interpreter")
@@ -392,6 +393,9 @@ class ResponsesChat(BaseChatModel):
     enforce_stream_deadline: bool = True
     enforce_stream_read_timeout: bool = True
     http_client: Any = Field(default=None, repr=False, exclude=True)
+    http_async_client: Any = Field(default=None, repr=False, exclude=True)
+    root_async_client: Any = Field(default=None, repr=False, exclude=True)
+    _owns_root_async_client: bool = PrivateAttr(default=False)
     api_protocol: ClassVar[str] = "responses"
     preserves_reasoning_content: ClassVar[bool] = True
     model_input_view_version: ClassVar[str] = MODEL_INPUT_VIEW_VERSION
@@ -436,7 +440,7 @@ class ResponsesChat(BaseChatModel):
             formatted.append({"type": "function", **converted["function"]})
         return self.bind(tools=formatted, **kwargs)
 
-    def _generate(self, messages, stop=None, run_manager=None, **kwargs):
+    def _request_data(self, messages, stop=None, **kwargs):
         if stop:
             raise ValueError("当前Responses端点未列stop参数，不静默忽略。")
         local = deepcopy(kwargs.pop("tools", []))
@@ -460,6 +464,10 @@ class ResponsesChat(BaseChatModel):
             body["reasoning"] = {"effort": self.reasoning_effort}
         url = self.base_url.rstrip("/") + "/responses"
         headers = {"Authorization": "Bearer " + self.api_key.get_secret_value()}
+        return body, url, headers, timeout
+
+    def _generate(self, messages, stop=None, run_manager=None, **kwargs):
+        body, url, headers, timeout = self._request_data(messages, stop, **kwargs)
         if body["stream"]:
             if self.http_client is not None and not isinstance(self.http_client, httpx.AsyncClient):
                 raise ValueError("流式Responses测试注入须为httpx.AsyncClient；不同步复用同步http_client。")
@@ -495,8 +503,50 @@ class ResponsesChat(BaseChatModel):
             raise ResponsesServiceError(response if response is not None else _stream_error_response(payload), payload)
         return ChatResult(generations=[ChatGeneration(message=responses_message(payload))])
 
+    def _get_async_client(self, timeout):
+        if isinstance(self.http_async_client, httpx.AsyncClient):
+            client = self.http_async_client
+        elif self.http_async_client is not None:
+            raise ValueError("异步Responses调用注入须为httpx.AsyncClient。")
+        elif isinstance(self.http_client, httpx.AsyncClient):
+            client = self.http_client
+        elif self.http_client is not None:
+            raise ValueError("异步Responses调用注入须为httpx.AsyncClient；不同步复用同步http_client。")
+        else:
+            client = self.root_async_client
+            if client is None:
+                client = httpx.AsyncClient(timeout=timeout, follow_redirects=False)
+                self.root_async_client = client
+                self._owns_root_async_client = True
+        from .runtime_audit import ensure_async_request_audit
+        return ensure_async_request_audit(client)
+
+    async def _agenerate(self, messages, stop=None, run_manager=None, **kwargs):
+        """Native async Responses transport; synchronous `_generate` stays intact."""
+        body, url, headers, timeout = self._request_data(messages, stop, **kwargs)
+        check_request_control()
+        client = self._get_async_client(timeout)
+        if body["stream"]:
+            payload = await self._post_stream_async(client, url, body, timeout, headers)
+            response = None
+        else:
+            from .runtime_audit import arecord_async_response
+            response = await client.post(url, json=body, timeout=timeout, headers=headers)
+            await arecord_async_response(response)
+            try:
+                payload = response.json()
+            except ValueError:
+                if not response.is_success:
+                    raise ResponsesServiceError(response, {}) from None
+                raise
+            if not response.is_success:
+                raise ResponsesServiceError(response, payload)
+        if payload.get("error") or payload.get("status") not in {"completed", "incomplete"}:
+            raise ResponsesServiceError(response if response is not None else _stream_error_response(payload), payload)
+        return ChatResult(generations=[ChatGeneration(message=responses_message(payload))])
+
     async def _post_stream_async(self, client, url, body, timeout, headers):
-        from .runtime_audit import _request_hook, _response_hook, record_event
+        from .runtime_audit import arecord_event, ensure_async_request_audit
         started = time.monotonic()
         total_timeout = _timeout_seconds(timeout, self.timeout_seconds)
         stream_deadline = total_timeout if self.enforce_stream_deadline else None
@@ -510,44 +560,38 @@ class ResponsesChat(BaseChatModel):
         pending = None
         owned = client is None
         client = client or httpx.AsyncClient(timeout=stream_timeout, follow_redirects=False)
-
-        async def _audit_request(request):
-            _request_hook(request)
-
-        saved_request_hooks = list(client.event_hooks["request"])
-        saved_response_hooks = list(client.event_hooks["response"])
-        client.event_hooks["request"] = saved_request_hooks + [_audit_request]
-        # The sync audit response hook reads the complete body. Stream response
-        # headers and body are recorded explicitly below instead.
-        client.event_hooks["response"] = [hook for hook in saved_response_hooks if hook is not _response_hook]
+        ensure_async_request_audit(client)
         response = None
         call_id = None
         request_accepted = False
         deadline_scope = asyncio.timeout(stream_deadline)
         try:
+            check_request_control()
             async with deadline_scope:
                 async with client.stream("POST", url, json=body, timeout=stream_timeout, headers=headers) as response:
                     owner = response.request.extensions.get("rag_audit_owner")
                     call_id = owner[1] if isinstance(owner, tuple) and len(owner) == 2 else None
-                    record_event("model_http_connected", call_id=call_id, http_status=response.status_code,
+                    await arecord_event("model_http_connected", call_id=call_id,
+                                 http_status=response.status_code,
                                  request_id=response.headers.get("x-request-id"), stream=True,
                                  stream_deadline_seconds=stream_deadline, idle_timeout_seconds=idle_timeout)
                     if not response.is_success:
                         payload = await _read_error_payload_async(response)
                         raise ResponsesServiceError(response, payload)
 
-                    def _flush_pending():
+                    async def _flush_pending():
                         nonlocal pending
                         if pending:
-                            record_event("model_http_stream", call_id=call_id, **pending)
+                            await arecord_event("model_http_stream", call_id=call_id, **pending)
                             pending = None
 
-                    def _record_row(row, *, first=False):
-                        record_event("model_http_stream", call_id=call_id,
+                    async def _record_row(row, *, first=False):
+                        await arecord_event("model_http_stream", call_id=call_id,
                                      **({"first_event": True} if first else {}), **row)
 
-                    def _finish(payload, *, timed_out=False):
-                        record_event("model_http_response", call_id=call_id, http_status=response.status_code,
+                    async def _finish(payload, *, timed_out=False):
+                        await arecord_event("model_http_response", call_id=call_id,
+                                     http_status=response.status_code,
                                      request_id=response.headers.get("x-request-id"), body=payload, stream=True,
                                      request_accepted=request_accepted,
                                      heartbeat_count=heartbeat_count,
@@ -580,23 +624,23 @@ class ResponsesChat(BaseChatModel):
                             if _is_delta_event(data):
                                 pending = _merge_delta_audit(None, {**row, "first_event": True})
                                 continue
-                            _record_row(row, first=True)
+                            await _record_row(row, first=True)
                         elif _is_delta_event(data):
                             pending = _merge_delta_audit(pending, row)
                             if pending.get("delta_count", 1) >= 20 or pending.get("delta_chars", 0) >= 400:
-                                _flush_pending()
+                                await _flush_pending()
                             continue
                         else:
-                            _flush_pending()
-                            _record_row(row)
+                            await _flush_pending()
+                            await _record_row(row)
                         if (data.get("type") or event_type) in {
                                 "response.completed", "response.incomplete", "response.failed", "error"}:
                             # A Responses terminal event completes this call even
                             # when the HTTP server leaves its SSE connection open.
                             break
-                    _flush_pending()
+                    await _flush_pending()
                     if heartbeat_count:
-                        record_event("model_http_stream", call_id=call_id, type="sse_comment",
+                        await arecord_event("model_http_stream", call_id=call_id, type="sse_comment",
                                      heartbeat_count=heartbeat_count)
                     payload, _, error = assemble_streamed_response(events)
                     if error:
@@ -605,7 +649,7 @@ class ResponsesChat(BaseChatModel):
                         failure = RuntimeError("Responses流式结束但没有completed载荷。")
                         failure.request_accepted = request_accepted
                         raise failure
-                    return _finish(payload)
+                    return await _finish(payload)
         except (TimeoutError, httpx.TimeoutException) as exc:
             timeout_kind = ("stream_deadline" if deadline_scope.expired() else
                             "read_idle" if isinstance(exc, httpx.ReadTimeout) else
@@ -613,12 +657,12 @@ class ResponsesChat(BaseChatModel):
                             "write" if isinstance(exc, httpx.WriteTimeout) else
                             "pool" if isinstance(exc, httpx.PoolTimeout) else "transport_timeout")
             if pending:
-                record_event("model_http_stream", call_id=call_id, **pending)
+                await arecord_event("model_http_stream", call_id=call_id, **pending)
                 pending = None
             if heartbeat_count:
-                record_event("model_http_stream", call_id=call_id, type="sse_comment",
+                await arecord_event("model_http_stream", call_id=call_id, type="sse_comment",
                              heartbeat_count=heartbeat_count)
-            record_event("model_http_stream_error", call_id=call_id, error_type="TimeoutException",
+            await arecord_event("model_http_stream_error", call_id=call_id, error_type="TimeoutException",
                          heartbeat_count=heartbeat_count,
                          timeout_kind=timeout_kind, stream_deadline_seconds=stream_deadline,
                          idle_timeout_seconds=idle_timeout,
@@ -628,12 +672,12 @@ class ResponsesChat(BaseChatModel):
             if error and response is not None:
                 raise ResponsesServiceError(response, error) from None
             if isinstance(payload, dict) and payload.get("status") == "completed" and response is not None:
-                return _finish(payload, timed_out=True)
+                return await _finish(payload, timed_out=True)
             if isinstance(payload, dict) and response is not None:
                 payload = dict(payload)
                 payload["status"] = "incomplete"
                 payload["incomplete_reason"] = "stream_timeout"
-                return _finish(payload, timed_out=True)
+                return await _finish(payload, timed_out=True)
             if isinstance(exc, TimeoutError):
                 request = response.request if response is not None else httpx.Request("POST", url)
                 message = ("Responses stream exceeded wall-clock timeout" if deadline_scope.expired()
@@ -648,8 +692,6 @@ class ResponsesChat(BaseChatModel):
             exc.request_accepted = request_accepted
             raise
         finally:
-            client.event_hooks["request"] = saved_request_hooks
-            client.event_hooks["response"] = saved_response_hooks
             if owned:
                 await client.aclose()
 
