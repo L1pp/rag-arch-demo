@@ -1,6 +1,6 @@
 # React + FastAPI 本地启动说明
 
-[English](web_setup_en.md) | [简体中文](web_setup.md) | [架构说明](architecture.md)
+[English](../setup.md) | [简体中文](setup.md) | [架构说明](architecture.md)
 
 公开工作台由 React 前端、FastAPI API、PostgreSQL 数据库和独立 AI worker 组成。它用于展示源码，不是打包好的托管服务。使用者自行准备 PostgreSQL、模型密钥、语料，以及需要打开来源页时用到的原件。
 
@@ -21,7 +21,7 @@
 ~~~~powershell
 python -m venv .venv-web
 .\.venv-web\Scripts\Activate.ps1
-python -m pip install -r requirements-web.txt
+python -m pip install -r requirements/web.txt
 python -m pip install --no-deps -e .
 Push-Location frontend
 npm ci
@@ -80,13 +80,13 @@ $env:RAG_ARCH_DATABASE_URL = 'postgresql://<应用用户>:<密码>@<主机>:5432
 $env:RAG_ARCH_DATABASE_SCHEMA = 'rag_arch'
 $env:RAG_ARCH_AUTH_COOKIE_SECURE = 'false'
 $env:RAG_ARCH_FRONTEND_ORIGINS = 'http://127.0.0.1:5173'
-.\start_web.ps1
+.\scripts\start_web.ps1
 ~~~~
 
 在第二个终端设置相同的数据库变量并启动 worker：
 
 ~~~~powershell
-.\start_worker.ps1
+.\scripts\start_worker.ps1
 ~~~~
 
 在第三个终端启动前端开发服务器：

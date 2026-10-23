@@ -221,10 +221,14 @@ class AsyncRunnerTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_chat_uses_async_only_models_and_keeps_parallel_audits_tenant_scoped(self):
         models = {101: AsyncOnlyModel("用户101回答"), 202: AsyncOnlyModel("用户202回答")}
-        model_queue = iter(models.values())
 
         def create_async_chat_model(_settings):
-            return next(model_queue)
+            # Executor arrival order is independent of asyncio.gather result order.
+            audit = _current.get()
+            self.assertIsNotNone(audit)
+            user_id = audit.info["user_id"]
+            self.assertIn(user_id, models)
+            return models[user_id]
 
         async def fake_qa(question, *, chat_model, **kwargs):
             response = await chat_model.ainvoke([question])
@@ -242,16 +246,22 @@ class AsyncRunnerTests(unittest.IsolatedAsyncioTestCase):
                 for uid in models
             ])
 
-        self.assertEqual([result["text"] for result in results], ["用户101回答", "用户202回答"])
+        for user_id, result in zip(models, results):
+            self.assertEqual(result["text"], f"用户{user_id}回答")
+            self.assertEqual(result["audit_log"]["user_id"], user_id)
+            self.assertEqual(result["audit_log"]["workspace_id"], f"workspace-{user_id}")
         self.assertTrue(all(result["token_usage"]["total_tokens"] == 10 for result in results))
         self.assertTrue(all(result["model_calls"] == 1 for result in results))
         self.assertTrue(all(model.client.closed for model in models.values()))
         self.assertIsNone(_current.get())
         rows = self.audit_result_rows()
         self.assertEqual({row["audit_log"]["user_id"] for row in rows}, {101, 202})
-        self.assertEqual({row["audit_log"]["workspace_id"] for row in rows},
-                         {"workspace-101", "workspace-202"})
-        self.assertEqual({result["audit_log"]["user_id"] for result in results}, {101, 202})
+        self.assertEqual(len(rows), len(models))
+        for row in rows:
+            user_id = row["audit_log"]["user_id"]
+            self.assertEqual(row["text"], f"用户{user_id}回答")
+            self.assertEqual(row["audit_log"]["workspace_id"], f"workspace-{user_id}")
+            self.assertEqual(row["task_id"], f"chat-{user_id}")
         self.assertTrue(all(thread != self.loop_thread for thread in self.progress_threads))
 
     async def test_chat_embedding_prepare_retrieval_and_cancel_cleanup_are_async(self):

@@ -4,9 +4,10 @@ param(
     [switch]$Simulation
 )
 $ErrorActionPreference = 'Stop'
-$workerPython = Join-Path $PSScriptRoot '.venv-web\Scripts\python.exe'
+$repoRoot = Split-Path -Parent $PSScriptRoot
+$workerPython = Join-Path $repoRoot '.venv-web\Scripts\python.exe'
 if (-not (Test-Path -LiteralPath $workerPython)) {
-    throw '请先创建 .venv-web 并安装 requirements.txt。'
+    throw '请先创建 .venv-web 并安装 requirements/web.txt。'
 }
 if ($Concurrency -lt 1) {
     throw 'Concurrency必须为正整数。'
@@ -15,7 +16,7 @@ if ($MaxTasks -lt 0) {
     throw 'MaxTasks不能为负数。'
 }
 
-Push-Location -LiteralPath $PSScriptRoot
+Push-Location -LiteralPath $repoRoot
 try {
     $workerArgs = @('-m', 'rag_arch.web.worker_process', 'run',
                     '--concurrency', "$Concurrency")

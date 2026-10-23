@@ -1,6 +1,6 @@
 # Public Demo Regression Fixes — 2026-10-12
 
-[English](review_fixes_20261012_en.md) | [简体中文](review_fixes_20261012.md)
+[English](review-fixes-2026-10-12.md) | [简体中文](../zh-CN/validation/review-fixes-2026-10-12.md)
 
 This addresses the four reproducible findings reviewed at `e5fca44`. The documentation-only commit `956f0e7` had not changed those runtime paths. The changes repair workflow and citation boundaries without expanding product features.
 

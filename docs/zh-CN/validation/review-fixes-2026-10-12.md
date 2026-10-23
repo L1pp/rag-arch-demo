@@ -1,6 +1,6 @@
 # 2026-10-12 公开演示回归修复
 
-[English](review_fixes_20261012_en.md) | [简体中文](review_fixes_20261012.md)
+[English](../../validation/review-fixes-2026-10-12.md) | [简体中文](review-fixes-2026-10-12.md)
 
 复核针对 `e5fca44` 提出的四处可复现问题；语言文档提交 `956f0e7` 尚未改变这些运行逻辑。本次只修流程与引用边界，不扩展产品功能。
 
