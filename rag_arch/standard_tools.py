@@ -5,6 +5,7 @@ that material are never executed, opened or treated as tool instructions.
 """
 from __future__ import annotations
 
+from collections.abc import Mapping, Sequence
 from copy import deepcopy
 import json
 from pathlib import Path
@@ -59,23 +60,22 @@ def _reference_key(value: str) -> str:
     return "/".join(normalized)
 
 
-def _chunk_reference_keys(chunk) -> set[str]:
-    evidence_id = chunk.chunk_id
+def _reference_keys(evidence_id: str, locator: Mapping) -> set[str]:
     _, _, suffix = evidence_id.partition("/")
-    if chunk.locator.get("exact_clause_lookup") is False:
+    if locator.get("exact_clause_lookup") is False:
         # A retained cross-reference/OCR candidate is addressable by its real
         # evidence ID or qualified source suffix, never as a bare printed clause.
         return {_reference_key(value) for value in (evidence_id, suffix if "/" in suffix else "") if value}
     values = {evidence_id, suffix}
-    if chunk.locator.get("evidence_kind") == "clause":
-        values.add(chunk.locator.get("clause_no") or "")
-        if chunk.locator.get("record_kind") == "formula" and chunk.locator.get("formula_no"):
-            values.update(("formula/" + str(chunk.locator["formula_no"]), "公式" + str(chunk.locator["formula_no"])))
-    elif chunk.locator.get("evidence_kind") == "table":
-        if chunk.locator.get("printed_table_no_verified") is True and chunk.locator.get("table_id"):
+    if locator.get("evidence_kind") == "clause":
+        values.add(locator.get("clause_no") or "")
+        if locator.get("record_kind") == "formula" and locator.get("formula_no"):
+            values.update(("formula/" + str(locator["formula_no"]), "公式" + str(locator["formula_no"])))
+    elif locator.get("evidence_kind") == "table":
+        if locator.get("printed_table_no_verified") is True and locator.get("table_id"):
             # Independent visually verified objects may append a proof suffix
             # to their stable ID; the separately verified printed number is exact.
-            number = chunk.locator.get("table_no")
+            number = locator.get("table_no")
             if number:
                 values.add("table/" + str(number))
         # A printed table number comes only from the actual table-ID segment.
@@ -84,6 +84,35 @@ def _chunk_reference_keys(chunk) -> set[str]:
         if match:
             values.add("table/" + match.group(1))
     return {_reference_key(value) for value in values if value}
+
+
+def _metadata_reference_candidate(evidence_id: str, locator: Mapping,
+                                  requested_reference: str) -> bool:
+    """Narrowly select lazy rows when persisted projections omit alias fields."""
+    if locator.get("exact_clause_lookup") is False:
+        return False
+    if (locator.get("evidence_kind") == "clause"
+            and locator.get("record_kind") == "formula"
+            and (requested_reference.startswith("FORMULA/")
+                 or requested_reference.startswith("公式"))):
+        # formula_no is not persisted in older mmap metadata. The full Chunk
+        # locator is checked after this low-cardinality candidate filter.
+        return True
+    if locator.get("evidence_kind") == "table" and requested_reference.startswith("TABLE/"):
+        table_no = locator.get("table_no")
+        if (table_no is not None
+                and _reference_key("table/" + str(table_no)) == requested_reference):
+            # printed_table_no_verified is not persisted; the loaded Chunk
+            # remains authoritative, so an unverified number is still rejected.
+            return True
+        suffix = _reference_key(evidence_id.partition("/")[2])
+        return (suffix.startswith(requested_reference + "-")
+                or suffix.startswith(requested_reference + "/"))
+    return False
+
+
+def _chunk_reference_keys(chunk) -> set[str]:
+    return _reference_keys(chunk.chunk_id, chunk.locator)
 
 
 def _resolved_reference(chunk) -> dict:
@@ -96,11 +125,83 @@ def _resolved_reference(chunk) -> dict:
 def _controlled_lookup(index, std_no: str, reference: str) -> tuple[list, str, list[dict]]:
     """Resolve only against actual loaded IDs inside one unambiguous edition."""
     loaded = getattr(index, "by_id", None)
-    if not isinstance(loaded, dict):
+    if not isinstance(loaded, Mapping):
         # Legacy injected getters retain exact-only behavior; aliases need a
         # visible loaded index to establish uniqueness and edition identity.
         return [], "exact_only", []
     requested_standard = _key(std_no)
+    requested_reference = _reference_key(reference)
+    attachment_prefix = requested_reference + "/"
+    chunk_ids = getattr(index, "_chunk_ids", None)
+    metadata = getattr(index, "_chunk_metadata", None)
+    metadata_reader = getattr(index, "lookup_metadata", None)
+    if (isinstance(chunk_ids, Sequence) and isinstance(metadata, Sequence)
+            and len(chunk_ids) == len(metadata)):
+        # Mmap indexes expose ID and metadata projections without decoding their
+        # Chunk bodies. Scan those projections, then read only matching IDs.
+        group_numbers = {}
+        candidate_ids, attachment_ids = [], []
+        for row, evidence_id in enumerate(chunk_ids):
+            projection = metadata[row]
+            actual = _key(projection.get("std_no", ""))
+            standard_id = evidence_id.split("/", 1)[0]
+            aliases = {_key(standard_id), actual}
+            aliases.update(re.sub(r"-\d{4}$", "", alias) for alias in tuple(aliases))
+            if requested_standard not in aliases:
+                continue
+            if (re.search(r"-\d{4}$", requested_standard)
+                    and requested_standard not in {actual, _key(standard_id)}):
+                continue
+            locator = metadata_reader(row) if callable(metadata_reader) else projection
+            group_numbers.setdefault(standard_id, locator.get("std_no", projection.get("std_no")))
+            keys = _reference_keys(evidence_id, locator)
+            if (requested_reference in keys
+                    or _metadata_reference_candidate(evidence_id, locator, requested_reference)):
+                candidate_ids.append(evidence_id)
+            elif any(key.startswith(attachment_prefix) for key in keys):
+                attachment_ids.append(evidence_id)
+
+        standards = [{"std_id": sid, "std_no": number}
+                     for sid, number in sorted(group_numbers.items())]
+        matches = []
+        for evidence_id in candidate_ids:
+            try:
+                chunk = loaded[evidence_id]
+            except KeyError:
+                continue
+            # The full locator remains authoritative where a projection lacks
+            # fields; this also preserves exact_clause_lookup restrictions.
+            if requested_reference in _chunk_reference_keys(chunk):
+                matches.append(chunk)
+        matches.sort(key=lambda chunk: chunk.chunk_id)
+        if len(group_numbers) > 1:
+            return matches, "ambiguous_standard", standards
+        if len(matches) > 1:
+            return matches, "ambiguous_alias", standards
+        if matches:
+            chunk = matches[0]
+            if reference.strip() == chunk.chunk_id:
+                mode = "exact_evidence_id"
+            elif reference.strip() == chunk.locator.get("clause_no"):
+                mode = "exact_clause"
+            else:
+                mode = "unique_alias"
+            return matches, mode, standards
+        if len(group_numbers) == 1 and re.fullmatch(r"附件[1-9]\d*", requested_reference):
+            children = []
+            for evidence_id in attachment_ids:
+                try:
+                    chunk = loaded[evidence_id]
+                except KeyError:
+                    continue
+                if any(key.startswith(attachment_prefix) for key in _chunk_reference_keys(chunk)):
+                    children.append(chunk)
+            if children:
+                return sorted(children, key=lambda chunk: chunk.chunk_id), "attachment_members", standards
+        return [], "not_found", standards
+
+    # Non-mmap mappings have no separate metadata projection, so retain the
+    # established scan over already-materialized chunks without copying the map.
     groups = {}
     for chunk in loaded.values():
         actual = _key(chunk.locator.get("std_no", ""))
@@ -115,7 +216,6 @@ def _controlled_lookup(index, std_no: str, reference: str) -> tuple[list, str, l
         groups.setdefault(standard_id, []).append(chunk)
     standards = [{"std_id": sid, "std_no": values[0].locator.get("std_no")}
                  for sid, values in sorted(groups.items())]
-    requested_reference = _reference_key(reference)
     matches = [chunk for values in groups.values() for chunk in values
                if requested_reference in _chunk_reference_keys(chunk)]
     matches.sort(key=lambda chunk: chunk.chunk_id)
@@ -132,12 +232,9 @@ def _controlled_lookup(index, std_no: str, reference: str) -> tuple[list, str, l
         else:
             mode = "unique_alias"
         return matches, mode, standards
-    # Attachments may be stored as several independent sections, not one row.
-    # Offer those real IDs for explicit selection without merging or pretending
-    # that the section is the complete attachment.
     if len(groups) == 1 and re.fullmatch(r"附件[1-9]\d*", requested_reference):
         children = [chunk for chunk in next(iter(groups.values()))
-                    if any(key.startswith(requested_reference + "/") for key in _chunk_reference_keys(chunk))]
+                    if any(key.startswith(attachment_prefix) for key in _chunk_reference_keys(chunk))]
         if children:
             return sorted(children, key=lambda chunk: chunk.chunk_id), "attachment_members", standards
     return [], "not_found", standards

@@ -283,14 +283,18 @@ class ProcessPdfBackend:
     def __init__(self, *, call_timeout=None,
                  cleanup_timeout: float = DEFAULT_PDF_CLEANUP_TIMEOUT_SECONDS,
                  temp_root=None, _worker_callable=None, _identity_probe=None,
-                 _process_probe=None):
+                 _process_probe=None, reopen_after_confirmed_abort: bool = False):
+        if type(reopen_after_confirmed_abort) is not bool:
+            raise ValueError("reopen_after_confirmed_abort须为布尔值。")
         self.call_timeout = _configured_call_timeout(call_timeout)
         self.cleanup_timeout = _positive_finite(cleanup_timeout, "PDF 清理超时")
         self._context = mp.get_context("spawn")
         self._call_lock = threading.Lock()
         self._state_lock = threading.RLock()
         self._closed = False
+        self._permanently_closed = False
         self._broken = False
+        self._reopen_after_confirmed_abort = reopen_after_confirmed_abort
         self._cleanup_error: ResourceCleanupUncertain | None = None
         self._process = None
         self._connection = None
@@ -608,6 +612,25 @@ class ProcessPdfBackend:
             except Exception:
                 self._resource_unknown("pdf_worker_exit_record_failed")
 
+    def _finish_confirmed_abort(self, resource, *, retire_owner: bool) -> None:
+        """Clear a confirmed-dead child and optionally reopen an API-owned client.
+
+        Worker clients remain closed by default. API clients may opt in, but a
+        resource attached to a task supervisor still keeps its retirement
+        semantics. The timed-out call is never replayed here.
+        """
+        self._mark_resource_exited(resource, retire_owner=retire_owner)
+        self._clear_process()
+        if (not self._reopen_after_confirmed_abort or resource is None
+                or getattr(resource, "supervisor", None) is not None):
+            return
+        with self._state_lock:
+            if (self._permanently_closed or self._cleanup_error is not None
+                    or self._process is not None or self._resource is not None):
+                return
+            self._broken = False
+            self._closed = False
+
     def _abort_process(self, error_code: str, *, retire_owner: bool) -> None:
         with self._state_lock:
             process = self._process
@@ -622,8 +645,7 @@ class ProcessPdfBackend:
             with self._state_lock:
                 self._broken = True
                 self._closed = True
-            self._mark_resource_exited(resource, retire_owner=retire_owner)
-            self._clear_process()
+            self._finish_confirmed_abort(resource, retire_owner=retire_owner)
             return
         with self._state_lock:
             self._broken = True
@@ -640,12 +662,11 @@ class ProcessPdfBackend:
         if identity_state == "exited":
             # The original process has exited or the PID now names another
             # process. The supervision handle performs its own exact check.
-            self._mark_resource_exited(resource, retire_owner=retire_owner)
+            self._finish_confirmed_abort(resource, retire_owner=retire_owner)
             try:
                 process.join(timeout=0)
             except (AssertionError, OSError):
                 pass
-            self._clear_process()
             return
         if identity_state != "running":
             self._resource_unknown(error_code + "_identity_unknown")
@@ -661,8 +682,7 @@ class ProcessPdfBackend:
                     pid, expected_token,
                     executable=resource.executable if resource is not None else None)
                 if current_state == "exited":
-                    self._mark_resource_exited(resource, retire_owner=retire_owner)
-                    self._clear_process()
+                    self._finish_confirmed_abort(resource, retire_owner=retire_owner)
                     return
                 if current_state != "running":
                     self._resource_unknown(error_code + "_identity_unknown")
@@ -678,8 +698,7 @@ class ProcessPdfBackend:
                         pid, expected_token,
                         executable=resource.executable if resource is not None else None)
                     if current_state == "exited":
-                        self._mark_resource_exited(resource, retire_owner=retire_owner)
-                        self._clear_process()
+                        self._finish_confirmed_abort(resource, retire_owner=retire_owner)
                         return
                     if current_state != "running":
                         self._resource_unknown(error_code + "_identity_unknown")
@@ -697,8 +716,7 @@ class ProcessPdfBackend:
                     os.close(pidfd)
                 except OSError:
                     pass
-        self._mark_resource_exited(resource, retire_owner=retire_owner)
-        self._clear_process()
+        self._finish_confirmed_abort(resource, retire_owner=retire_owner)
 
     def _stop_process(self) -> None:
         with self._state_lock:
@@ -731,6 +749,7 @@ class ProcessPdfBackend:
 
     def close(self) -> None:
         with self._state_lock:
+            self._permanently_closed = True
             if self._closed:
                 if self._cleanup_error is not None:
                     raise self._cleanup_error

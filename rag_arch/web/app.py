@@ -221,7 +221,8 @@ def create_app(service=None, *, frontend_dir=None, resources=None, documents=Non
     from .standards_resources import StandardsResources
     from .standards_routes import create_standards_router
     from .document_routes import create_document_router, validate_task_documents
-    materials = resources if resources is not None else StandardsResources(root)
+    materials = (resources if resources is not None else
+                 StandardsResources(root, recover_pdf_after_confirmed_abort=True))
     if auth_enabled:
         ttl_seconds = (auth_session_ttl_seconds if auth_session_ttl_seconds is not None
                        else _env_positive_int("RAG_ARCH_AUTH_SESSION_HOURS", 24 * 14) * 60 * 60)

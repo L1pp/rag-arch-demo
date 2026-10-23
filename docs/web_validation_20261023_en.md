@@ -14,9 +14,16 @@ This records local validation of the independent public repository's PR candidat
 | Frontend | 72 tests in 13 files passed; generated API types, TypeScript and Vite build passed |
 | Offline CLI | Report and JSON output completed with socket connections intercepted; zero connection attempts |
 | Python package | Wheel built with all four SQL migrations, worker and CLI, excluding private runtime resources |
-| Publication scope | Rule scan of 221 staged files passed; deployment templates, synthetic fixtures and three existing fictional screenshots were also inspected |
+| Publication scope | Rule scan of 224 staged files passed; deployment templates, synthetic fixtures and three existing fictional screenshots were also inspected |
 
 The first backend run had seven failures caused by a copied test guard fixed to the old port. After adapting it to an explicit loopback test URL and valid port, the full integration run passed. A subsequent focused check hardened the guard against libpq query-parameter overrides. Tests use synthetic documents and fake models, with no real provider model calls. Independent GPT validation subsets overlap and are not added to the coverage total.
+
+## Follow-up regressions from PR review
+
+- Word conversion no longer treats an earlier polling timeout as a final timeout after successful completion. Both repositories passed 14 synthetic supervision tests; cancellation and total-deadline behavior remain intact.
+- API-owned shared PDF clients reopen for a later request only after confirmed cleanup. Four new tests passed in each repository; the public API/worker/tenant subset passed 41 with five database-gated skips. Uncertain cleanup, supervised-worker retirement and permanent shutdown remain conservative.
+- Controlled mmap lookup supports the lazy Mapping without materializing every Chunk. Each repository passed 17 new tests; the internal StandardTools suite passed 18 and both existing mmap-corpus suites passed four. Version and ambiguity boundaries remain enforced.
+- The first Linux CI run exposed a Windows-only path fixture. It now uses a temporary directory; four focused CLI tests and the subsequent CI run passed. The PR CI runs the final combined regression set.
 
 ## Internal fixes
 

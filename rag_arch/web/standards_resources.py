@@ -125,7 +125,10 @@ class StandardsResources:
     to one process, not performed while holding this resource lock.
     """
 
-    def __init__(self, root=ROOT, *, corpus=None, pdf_backend=None):
+    def __init__(self, root=ROOT, *, corpus=None, pdf_backend=None,
+                 recover_pdf_after_confirmed_abort: bool = False):
+        if type(recover_pdf_after_confirmed_abort) is not bool:
+            raise ValueError("recover_pdf_after_confirmed_abort须为布尔值。")
         self.root = Path(root)
         self._lock = RLock()
         self._corpus = corpus
@@ -136,6 +139,7 @@ class StandardsResources:
         self._page_services = {}
         self._pdf_backend = pdf_backend
         self._owns_pdf_backend = pdf_backend is None
+        self._recover_pdf_after_confirmed_abort = recover_pdf_after_confirmed_abort
         self._catalog_settings = None
         self._catalog_warning = None
         self._prepared_index = None
@@ -334,7 +338,8 @@ class StandardsResources:
             raise RuntimeError("标准资源已关闭。")
         if self._pdf_backend is None:
             from ..pdf_backend import ProcessPdfBackend
-            self._pdf_backend = ProcessPdfBackend()
+            self._pdf_backend = ProcessPdfBackend(
+                reopen_after_confirmed_abort=self._recover_pdf_after_confirmed_abort)
         return self._pdf_backend
 
     def page_service(self, std_no=None):

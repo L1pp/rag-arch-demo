@@ -245,6 +245,21 @@ class EvidenceIndex:
                                 prepared_vectors=prepared_vectors,
                                 bm25_directory=bm25_directory)
 
+    def lookup_metadata(self, row: int) -> Mapping:
+        """Return lookup metadata without decoding a lazy Chunk body."""
+        if self._chunk_metadata is None:
+            return self.chunks[row].locator
+        projection = self._chunk_metadata[row]
+        kind = projection.get("evidence_kind")
+        sequence_name = {"clause": "clauses", "table": "tables"}.get(kind)
+        source_row = projection.get("source_row")
+        sequence = getattr(self.corpus, sequence_name, None) if sequence_name else None
+        source_metadata = getattr(sequence, "_metadata_rows", None)
+        if (isinstance(source_row, int) and 0 <= source_row < len(source_metadata or ())
+                and source_metadata is not None):
+            return {**projection, **source_metadata[source_row]}
+        return projection
+
     def _allowed_indices(self, filters):
         """Filter small metadata columns; never decode all mapped locators."""
         standards = filters.get("std_nos", [filters["std_no"]] if filters.get("std_no") else [])

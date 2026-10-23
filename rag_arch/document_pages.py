@@ -651,6 +651,7 @@ class DocumentPageService:
                         check_request_control()
                         main_stdout, main_stderr = main_process.communicate(
                             timeout=min(0.2, remaining))
+                        timeout_error = None
                         main_completed = True
                         if main_process.returncode:
                             primary_error = ValueError(
