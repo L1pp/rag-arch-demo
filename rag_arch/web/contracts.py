@@ -1,10 +1,51 @@
 """The small public contract shared by the web UI and task service."""
 from typing import Literal
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 AssistantId = Literal["chat", "standards", "plan"]
-TaskStatus = Literal["queued", "running", "cancelling", "completed", "failed", "cancelled"]
+TaskStatus = Literal["queued", "running", "cancelling", "recovering", "completed", "failed", "cancelled"]
+
+
+class Principal(BaseModel):
+    """Authenticated server-side identity; user_id is never accepted as an ownership claim."""
+
+    user_id: int = Field(gt=0)
+    username: str
+
+
+class AuthSession(BaseModel):
+    """Safe session view that never exposes the bearer cookie value."""
+
+    principal: Principal
+    expires_at: int
+
+
+class AuthLogin(BaseModel):
+    """Login credentials only; ownership always comes from the resolved server session."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    username: str = Field(min_length=1, max_length=64)
+    password: str = Field(min_length=1, max_length=1024, repr=False)
+
+
+class AuthSessionSnapshot(BaseModel):
+    """Public JSON view of the authenticated owner, without cookie/session secrets."""
+
+    authenticated: Literal[True]
+    owner_user_id: int = Field(gt=0)
+    username: str
+
+
+class AuthLogout(BaseModel):
+    """Public JSON acknowledgement after the current session has been revoked."""
+
+    authenticated: Literal[False]
+
+
+# Kept for existing internal consumers and tests while the JSON endpoint uses AuthLogin.
+LoginRequest = AuthLogin
 
 
 class TaskResult(BaseModel):
@@ -73,6 +114,7 @@ class AssistantSnapshot(BaseModel):
 
 class WorkspaceSnapshot(BaseModel):
     workspace_id: str
+    owner_user_id: int | None = None
     server_instance_id: str
     cursor: int
     mode: Literal["infrastructure_demo", "chat_preview"] = "infrastructure_demo"
@@ -85,6 +127,10 @@ class WorkspaceCommand(BaseModel):
 
 
 class SubmitTask(WorkspaceCommand, TaskInputs):
+    """Client task data; ownership is resolved from the authenticated server session."""
+
+    model_config = ConfigDict(extra="forbid")
+
     assistant_id: AssistantId
     request_id: str = Field(min_length=1, max_length=128)
     prompt: str = Field(min_length=1, max_length=20000)

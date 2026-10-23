@@ -94,6 +94,8 @@ class LocalReranker:
         return (self._identity or {}).get("batch_size")
 
     def _request(self, method, path, payload=None):
+        from .request_control import check_request_control
+        check_request_control()
         try:
             with httpx.Client(timeout=self.timeout, follow_redirects=False, trust_env=False) as client:
                 response = client.request(method, self.base_url + path, json=payload)
@@ -117,6 +119,37 @@ class LocalReranker:
             body, status = self._request("GET", "/health")
             if body.get("status") not in ("ok", "ready") or body.get("model") != self.model:
                 raise LocalRerankError("ModelMismatch", status, "本地服务未就绪或模型与配置不一致。")
+            self._identity = _identity(body)
+        return {"provider": self.provider, "model": self.model, **self._identity}
+
+    async def _arequest(self, method, path, payload=None):
+        from .request_control import check_request_control
+        check_request_control()
+        try:
+            async with httpx.AsyncClient(timeout=self.timeout, follow_redirects=False,
+                                         trust_env=False) as client:
+                response = await client.request(method, self.base_url + path, json=payload)
+        except httpx.TimeoutException:
+            raise LocalRerankError("Timeout") from None
+        except httpx.RequestError:
+            raise LocalRerankError("TransportError", detail="请确认本地服务已经启动。") from None
+        try:
+            body = response.json()
+        except ValueError:
+            raise LocalRerankError("InvalidResponse", response.status_code) from None
+        if not response.is_success:
+            raise LocalRerankError("LocalServiceError", response.status_code)
+        if not isinstance(body, dict) or body.get("error"):
+            raise LocalRerankError("InvalidResponse", response.status_code)
+        return body, response.status_code
+
+    async def aprepare(self) -> dict:
+        """Read the local service identity through a native async request."""
+        if self._identity is None:
+            body, status = await self._arequest("GET", "/health")
+            if body.get("status") not in ("ok", "ready") or body.get("model") != self.model:
+                raise LocalRerankError("ModelMismatch", status,
+                                       "本地服务未就绪或模型与配置不一致。")
             self._identity = _identity(body)
         return {"provider": self.provider, "model": self.model, **self._identity}
 
@@ -153,4 +186,41 @@ class LocalReranker:
         self.last_metadata = {**self._identity, "truncated_pairs": truncated,
                               "document_count": len(items)}
         # Preserve source indexes and make equal scores deterministic.
+        return sorted(results, key=lambda result: (-result.score, result.index))
+
+    async def arerank(self, query: str, documents: Sequence[str],
+                      top_n: int | None = None) -> list[RerankResult]:
+        """Rerank using HTTPX AsyncClient, preserving the sync payload contract."""
+        if not isinstance(query, str) or not query.strip():
+            raise ValueError("重排问题须为非空文本。")
+        if isinstance(documents, (str, bytes)) or not isinstance(documents, Sequence):
+            raise TypeError("重排文档须为文本序列。")
+        items = list(documents)
+        if any(not isinstance(item, str) or not item.strip() for item in items):
+            raise ValueError("重排文档须全部为非空文本。")
+        if len(items) > MAX_DOCUMENTS:
+            raise ValueError("每次最多重排500份文档，请在召回层限制候选数。")
+        if top_n is not None and (type(top_n) is not int or top_n < 1):
+            raise ValueError("top_n 须为正整数或 None。")
+        if not items:
+            return []
+        expected_count = len(items) if top_n is None else min(top_n, len(items))
+        await self.aprepare()
+        self.last_metadata = None
+        body, status = await self._arequest("POST", "/rerank", {
+            "model": self.model, "query": query, "documents": items, "top_n": expected_count})
+        metadata = body.get("metadata")
+        if body.get("model") != self.model or _identity(metadata) != self._identity:
+            raise LocalRerankError("IdentityChanged", status,
+                                   "服务模型或推理配置发生变化，请重新建立客户端并另开实验。")
+        truncated = metadata.get("truncated_pairs")
+        if type(truncated) is not int or not 0 <= truncated <= len(items):
+            raise LocalRerankError("InvalidResponse", status, "缺少有效的截断计数。")
+        try:
+            results = _parse_results(body, len(items), expected_count, status, compatible=True)
+        except RerankError:
+            raise LocalRerankError("InvalidResponse", status,
+                                   "重排结果数量、索引或分数无效。") from None
+        self.last_metadata = {**self._identity, "truncated_pairs": truncated,
+                              "document_count": len(items)}
         return sorted(results, key=lambda result: (-result.score, result.index))

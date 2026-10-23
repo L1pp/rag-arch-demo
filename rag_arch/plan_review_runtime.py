@@ -38,8 +38,10 @@ class PlanStandardTools(StandardTools):
                                 if fixed_search_mode is not None else "local_rag")
         index = index if index is not None else load_evidence_index(root / "data/corpus")
         corpus = index.corpus
-        registry = StandardStatusRegistry(root, getattr(corpus, "clauses", []),
-            catalog=getattr(corpus, "catalog", []), relations=getattr(corpus, "relations", []))
+        registry = StandardStatusRegistry(
+            root, catalog=getattr(corpus, "catalog", []),
+            relations=getattr(corpus, "relations", []), corpus=corpus,
+        )
         super().__init__(index, registry, default_mode=default_mode, top_k=top_k,
                          default_hybrid_fallback_to_rrf=default_hybrid_fallback_to_rrf)
         self._update_embedding_runtime_options()
@@ -57,7 +59,13 @@ class PlanStandardTools(StandardTools):
             return entries
         # Legacy injected corpora without a directory retain their prior names.
         from .standard_status import _key
-        loaded = {_key(row.get("std_no", "")) for row in self.index.corpus.clauses}
+        corpus = self.index.corpus
+        clauses = getattr(corpus, "clauses", None)
+        metadata = getattr(clauses, "metadata", None)
+        records = metadata if metadata is not None else clauses
+        if records is None:
+            records = getattr(corpus, "metadata", [])
+        loaded = {_key(row.get("std_no", "")) for row in records}
         return [{"std_no": row["std_no"], "title": row.get("title", "")}
                 for row in self.status_registry.standards if _key(row.get("std_no", "")) in loaded]
 

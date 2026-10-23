@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react'
-import { getStandardsPages, type StandardsPagesQuery } from './api'
+import { getProtectedBlob, getStandardsPages, type StandardsPagesQuery } from './api'
 import type { StandardsPageImage, StandardsPageSource, StandardsPagesResponse } from './types'
 
 interface ViewerQuery extends StandardsPagesQuery {
@@ -61,13 +61,36 @@ function sourceOptionsFor(data: StandardsPagesResponse): StandardsPageSource[] {
 
 function PageImage({ image, title, zoom }: { image: StandardsPageImage; title: string; zoom: number | 'fit' }) {
   const [failed, setFailed] = useState(false)
+  const [imageUrl, setImageUrl] = useState<string | null>(null)
   const scale = zoom === 'fit' ? '100%' : `${zoom}%`
   const documentPage = image.document_page == null ? '' : `，原文页 ${image.document_page}`
+  useEffect(() => {
+    const controller = new AbortController()
+    let createdUrl: string | null = null
+    setFailed(false)
+    setImageUrl(null)
+    if (image.image_url) {
+      void getProtectedBlob(image.image_url, controller.signal).then(blob => {
+        if (controller.signal.aborted) return
+        createdUrl = URL.createObjectURL(blob)
+        setImageUrl(createdUrl)
+      }).catch(() => {
+        if (!controller.signal.aborted) setFailed(true)
+      })
+    } else setFailed(true)
+    return () => {
+      controller.abort()
+      if (createdUrl) URL.revokeObjectURL(createdUrl)
+    }
+  }, [image.image_url])
   return <figure className="viewer-page-card">
     <div className="viewer-page-label">第 {image.page} 页{documentPage}</div>
-    {failed || !image.image_url
+    {failed
       ? <div className="viewer-image-error" role="img" aria-label={`${title} 第 ${image.page} 页暂不支持`}>当前页面暂不支持</div>
-      : <div className="viewer-image-wrap"><img src={image.image_url} alt={`${title} 第 ${image.page} 页`} style={{ width: scale }} onError={() => setFailed(true)} /></div>}
+      : imageUrl
+        ? <div className="viewer-image-wrap"><img src={imageUrl}
+          alt={`${title} 第 ${image.page} 页`} style={{ width: scale }} onError={() => setFailed(true)} /></div>
+        : <div className="viewer-image-error" role="status">正在加载页图…</div>}
   </figure>
 }
 

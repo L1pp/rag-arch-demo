@@ -1,5 +1,5 @@
 """Per-question local records. Never send audit history back to a model."""
-from contextlib import contextmanager
+from contextlib import asynccontextmanager, contextmanager
 from contextvars import ContextVar
 from dataclasses import asdict, is_dataclass
 from copy import deepcopy
@@ -7,12 +7,14 @@ from datetime import datetime, timezone
 import json
 import logging
 from pathlib import Path
+import re
 from threading import Lock
 from urllib.parse import urlsplit, urlunsplit
 from uuid import uuid4
 
 from .config import ROOT
 from .multimodal import decode_image_data_url, image_dimensions
+from .request_control import check_request_control
 
 AUDIT_ROOT = ROOT / "data/runtime/conversations"
 _current = ContextVar("rag_runtime_audit", default=None)
@@ -30,9 +32,64 @@ def _safe_url(value):
     return urlunsplit((parts.scheme, host, parts.path, "", ""))
 
 
+_SAFE_WORKSPACE_ID = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
+_SAFE_RUN_ID = re.compile(r"^[0-9]{8}_[0-9]{6}_[0-9a-f]{12}$")
+_SAFE_ATTEMPT = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+
+
+def _valid_attempt(value):
+    return ((isinstance(value, int) and not isinstance(value, bool) and value > 0)
+            or (isinstance(value, str) and bool(_SAFE_ATTEMPT.fullmatch(value))))
+
+
+def tenant_audit_metadata(request):
+    """Return trusted server-side identity fields for one Web audit run.
+
+    Existing local CLI callers may omit tenant fields and continue to use the
+    legacy audit directory. Once either tenant field is present, all identity
+    fields are required so a partially scoped Web run cannot fall back to the
+    shared legacy directory.
+    """
+    if not isinstance(request, dict):
+        raise ValueError("任务审计请求须为对象。")
+    task_id = request.get("task_id")
+    if task_id is not None and (not isinstance(task_id, str) or not task_id.strip()):
+        raise ValueError("任务审计缺少有效 task_id。")
+    user_id = request.get("user_id")
+    workspace_id = request.get("workspace_id")
+    if user_id is None and workspace_id is None:
+        return {"task_id": task_id} if task_id is not None else {}
+    if (isinstance(user_id, bool) or not isinstance(user_id, int) or user_id < 1
+            or not isinstance(workspace_id, str)
+            or not _SAFE_WORKSPACE_ID.fullmatch(workspace_id)
+            or task_id is None):
+        raise ValueError("租户审计身份不完整或无效。")
+    metadata = {"user_id": user_id, "workspace_id": workspace_id, "task_id": task_id}
+    attempt = request.get("attempt")
+    if attempt is not None:
+        if not _valid_attempt(attempt):
+            raise ValueError("任务审计 attempt 无效。")
+        metadata["attempt"] = attempt
+    return metadata
+
+
 class RunAudit:
-    def __init__(self, scope, settings, question, *, root=None, **metadata):
-        self.directory = Path(root or AUDIT_ROOT) / (datetime.now().strftime("%Y%m%d_%H%M%S") + "_" + uuid4().hex[:12])
+    def __init__(self, scope, settings, question, *, root=None, user_id=None,
+                 workspace_id=None, task_id=None, attempt=None, **metadata):
+        tenant_owned = user_id is not None or workspace_id is not None
+        if tenant_owned:
+            if (isinstance(user_id, bool) or not isinstance(user_id, int) or user_id < 1
+                    or not isinstance(workspace_id, str)
+                    or not _SAFE_WORKSPACE_ID.fullmatch(workspace_id)
+                    or not isinstance(task_id, str) or not task_id.strip()
+                    or (attempt is not None and not _valid_attempt(attempt))):
+                raise ValueError("租户审计身份不完整或无效。")
+        run_id = datetime.now().strftime("%Y%m%d_%H%M%S") + "_" + uuid4().hex[:12]
+        audit_root = Path(root or AUDIT_ROOT)
+        if tenant_owned:
+            self.directory = audit_root / "users" / str(user_id) / workspace_id / run_id
+        else:
+            self.directory = audit_root / run_id
         self.events = self.directory / "events.jsonl"
         self.result_path = self.directory / "result.json"
         self.secrets = tuple(str(value) for value in (
@@ -40,13 +97,29 @@ class RunAudit:
             getattr(settings, "reranker_api_key", "")) if value)
         self.lock, self.sequence, self.closed, self.result = Lock(), 0, False, None
         self._image_lock, self._image_refs = Lock(), {}
-        self.info = {"run_id": self.directory.name, "directory": str(self.directory), "error": None}
+        self.info = {"run_id": run_id, "error": None}
+        if tenant_owned:
+            # Do not expose a server filesystem path through task results.
+            self.info.update(user_id=user_id, workspace_id=workspace_id, task_id=task_id)
+            if attempt is not None:
+                self.info["attempt"] = attempt
+        else:
+            # Preserve the established path for local CLI and legacy tests.
+            self.info["directory"] = str(self.directory)
+        started_metadata = dict(metadata)
+        if tenant_owned:
+            started_metadata.update(user_id=user_id, workspace_id=workspace_id,
+                                    task_id=task_id, run_id=run_id)
+            if attempt is not None:
+                started_metadata["attempt"] = attempt
+        elif task_id is not None:
+            started_metadata["task_id"] = task_id
         try:
             self.directory.mkdir(parents=True, exist_ok=False)
         except OSError as exc:
             self._failed(exc)
         self.write("run_started", scope=scope, question=question, model=settings.chat_model,
-                   endpoint=_safe_url(settings.chat_base_url), **metadata)
+                   endpoint=_safe_url(settings.chat_base_url), **started_metadata)
 
     def _failed(self, exc):
         self.info["error"] = type(exc).__name__
@@ -139,8 +212,10 @@ class RunAudit:
 
 
 @contextmanager
-def record_run(scope, settings, question, *, root=None, **metadata):
-    audit = RunAudit(scope, settings, question, root=root, **metadata)
+def record_run(scope, settings, question, *, root=None, user_id=None,
+                workspace_id=None, task_id=None, attempt=None, **metadata):
+    audit = RunAudit(scope, settings, question, root=root, user_id=user_id,
+                     workspace_id=workspace_id, task_id=task_id, attempt=attempt, **metadata)
     token = _current.set(audit)
     error = None
     try:
@@ -155,6 +230,37 @@ def record_run(scope, settings, question, *, root=None, **metadata):
         _current.reset(token)
 
 
+def _record_async_run_exception(audit, exc):
+    from .generation_experiments import safe_error
+    audit.write("run_exception", error_type=type(exc).__name__,
+                error=safe_error(exc, component="runtime"))
+
+
+@asynccontextmanager
+async def arecord_run(scope, settings, question, *, root=None, user_id=None,
+                      workspace_id=None, task_id=None, attempt=None, **metadata):
+    """Async-run audit scope; construction and persistence stay off the loop."""
+    from .async_support import run_local
+    audit = await run_local(RunAudit, scope, settings, question, root=root,
+        user_id=user_id, workspace_id=workspace_id, task_id=task_id,
+        attempt=attempt, **metadata)
+    # ContextVar lifetime must match this async task, not the executor thread
+    # used for local audit I/O.
+    token = _current.set(audit)
+    error = None
+    try:
+        yield audit
+    except BaseException as exc:
+        error = type(exc).__name__
+        await run_local(_record_async_run_exception, audit, exc)
+        raise
+    finally:
+        try:
+            await run_local(audit.finish, error)
+        finally:
+            _current.reset(token)
+
+
 def record_event(kind, **fields):
     audit = _current.get()
     if audit is not None:
@@ -162,6 +268,9 @@ def record_event(kind, **fields):
 
 
 def _request_hook(request):
+    # This is the last cancellable boundary before an SDK or httpx transport
+    # sends bytes. It applies even when a run is not being audited.
+    check_request_control()
     audit = _current.get()
     if audit is None or audit.closed:
         return
@@ -175,6 +284,16 @@ def _request_hook(request):
         payload = {"unparsed_text": request.content.decode("utf-8", errors="replace")}
     audit.write("model_http_request", call_id=call_id, method=request.method,
                 url=_safe_url(request.url), body=payload)
+
+
+async def _async_request_hook(request):
+    """Run request audit serialization and file I/O outside the async loop."""
+    from .async_support import run_local
+    await run_local(_request_hook, request)
+
+
+_async_request_hook._rag_async_audit_hook = True
+_async_request_hook._rag_audit_hook = True
 
 
 def _response_hook(response):
@@ -201,34 +320,160 @@ def _response_hook(response):
     audit.write("model_http_response", call_id=call_id, body=payload, **headers)
 
 
-def attach_chat_audit(model):
-    """Observe the existing sync HTTP client; preserve its transport and auth."""
-    audit = _current.get()
-    if audit is None:
-        return model
+async def _async_response_hook(response):
+    """Read async SDK responses without blocking or losing request ownership."""
+    owner = response.request.extensions.get("rag_audit_owner")
+    if owner is None:
+        return
+    audit, call_id = owner
+    headers = {"http_status": response.status_code,
+               "request_id": response.headers.get("x-request-id"),
+               "content_type": response.headers.get("content-type")}
+    from .async_support import run_local
+    await run_local(audit.write, "model_http_headers", call_id=call_id, **headers)
     try:
-        client = model.root_client._client
-    except AttributeError as exc:
-        audit._failed(exc)
-        return model
-    for event, hook in (("request", _request_hook), ("response", _response_hook)):
-        hook._rag_audit_hook = True
-        client.event_hooks[event] = [h for h in client.event_hooks[event]
-                                    if not getattr(h, "_rag_audit_hook", False)] + [hook]
+        await response.aread()
+    except Exception as exc:
+        await run_local(audit.write, "model_http_response_error", call_id=call_id,
+                         error_type=type(exc).__name__, **headers)
+        raise
+    await run_local(record_async_response, response, include_headers=False)
+
+
+_async_response_hook._rag_async_audit_hook = True
+_async_response_hook._rag_audit_hook = True
+
+
+def record_async_response(response, *, include_headers=True):
+    """Record a fully received async response using its request-bound owner."""
+    owner = response.request.extensions.get("rag_audit_owner")
+    if owner is None:
+        return
+    audit, call_id = owner
+    headers = {"http_status": response.status_code,
+               "request_id": response.headers.get("x-request-id"),
+               "content_type": response.headers.get("content-type")}
+    if include_headers:
+        audit.write("model_http_headers", call_id=call_id, **headers)
+    try:
+        payload = response.json()
+    except ValueError:
+        payload = {"unparsed_text": response.text}
+    audit.write("model_http_response", call_id=call_id, body=payload, **headers)
+
+
+async def arecord_async_response(response):
+    """Serialize and persist a fully read async response off the event loop."""
+    from .async_support import run_local
+    await run_local(record_async_response, response)
+
+
+async def arecord_event(kind, **fields):
+    """Persist one async-run event without blocking its event loop."""
+    from .async_support import run_local
+    await run_local(record_event, kind, **fields)
+
+
+def ensure_async_request_audit(client):
+    """Install one context-aware request hook on a shared AsyncClient.
+
+    The hook binds the active audit to this request's extensions; it never
+    closes over a tenant's recorder, so concurrent tasks cannot cross owners.
+    Responses streaming uses this request-only hook and records its body while
+    consuming SSE itself.
+    """
+    hook = _async_request_hook
+    hooks = client.event_hooks["request"]
+    hooks[:] = [item for item in hooks
+                if not getattr(item, "_rag_audit_hook", False)
+                or getattr(item, "_rag_async_audit_hook", False)]
+    if not any(getattr(item, "_rag_async_audit_hook", False) for item in hooks):
+        hooks.append(hook)
+    return client
+
+
+def attach_chat_audit(model):
+    """Observe sync and async SDK clients; preserve their transport and auth."""
+    audit = _current.get()
+    for root_name, request_hook, response_hook in (("root_client", _request_hook, _response_hook),
+                                     ("root_async_client", _async_request_hook, _async_response_hook)):
+        try:
+            client = getattr(model, root_name)._client
+        except AttributeError as exc:
+            if audit is not None and root_name == "root_client":
+                audit._failed(exc)
+            continue
+        request_hooks = client.event_hooks["request"]
+        request_hook._rag_audit_hook = True
+        if root_name == "root_async_client":
+            request_hook._rag_async_audit_hook = True
+        request_hooks[:] = [hook for hook in request_hooks
+                            if not getattr(hook, "_rag_audit_hook", False)
+                            or bool(getattr(hook, "_rag_async_audit_hook", False)) ==
+                            bool(getattr(request_hook, "_rag_async_audit_hook", False))]
+        if not any(getattr(hook, "_rag_audit_hook", False) for hook in request_hooks):
+            request_hooks.append(request_hook)
+        response_hook._rag_audit_hook = True
+        if root_name == "root_async_client":
+            response_hook._rag_async_audit_hook = True
+        response_hooks = client.event_hooks["response"]
+        response_hooks[:] = [hook for hook in response_hooks
+                             if not getattr(hook, "_rag_audit_hook", False)
+                             or bool(getattr(hook, "_rag_async_audit_hook", False)) ==
+                             bool(getattr(response_hook, "_rag_async_audit_hook", False))]
+        if not any(getattr(hook, "_rag_audit_hook", False) for hook in response_hooks):
+            response_hooks.append(response_hook)
     return model
 
 
-def debug_result_json(result):
-    """Reuse the existing result download, adding this run's local call log."""
+def debug_result_json(result, *, user_id=None, workspace_id=None, root=None):
+    """Add a run's local call log, enforcing tenant ownership when present.
+
+    Tenant-owned records are resolved from their opaque run ID under the
+    current audit root; their absolute filesystem paths never come from the
+    result payload. Ownerless records retain the legacy local CLI behavior.
+    """
+    audit_root = Path(root or AUDIT_ROOT).resolve()
     row = result.to_dict() if hasattr(result, "to_dict") else deepcopy(result)
-    info = row.get("runtime", {}).get("audit_log")
+    runtime = row.get("runtime")
+    info = runtime.get("audit_log") if isinstance(runtime, dict) else None
+    if not info:
+        info = row.get("audit_log")
     if info:
-        directory = Path(info["directory"]).resolve()
-        if not directory.is_relative_to(AUDIT_ROOT.resolve()):
-            raise ValueError("调用记录路径不在本项目记录目录内。")
+        if not isinstance(info, dict):
+            raise ValueError("调用记录元数据无效。")
+        tenant_owned = "user_id" in info or "workspace_id" in info
+        if tenant_owned:
+            stored_user = info.get("user_id")
+            stored_workspace = info.get("workspace_id")
+            run_id = info.get("run_id")
+            if (user_id is None or workspace_id is None
+                    or user_id != stored_user or workspace_id != stored_workspace):
+                raise ValueError("当前用户无权下载这份调用记录。")
+            if (isinstance(user_id, bool) or not isinstance(user_id, int) or user_id < 1
+                    or not isinstance(workspace_id, str)
+                    or not _SAFE_WORKSPACE_ID.fullmatch(workspace_id)
+                    or not isinstance(run_id, str) or not _SAFE_RUN_ID.fullmatch(run_id)):
+                raise ValueError("调用记录身份无效。")
+            users_root = (audit_root / "users").resolve()
+            directory = (users_root / str(user_id) / workspace_id / run_id).resolve()
+            if not directory.is_relative_to(users_root):
+                raise ValueError("调用记录路径不在当前用户目录内。")
+            if not directory.is_dir():
+                raise FileNotFoundError("本次调用记录目录不存在。")
+        else:
+            if user_id is not None or workspace_id is not None:
+                # A legacy shared audit has no trustworthy owner. It may still
+                # be opened by local CLI callers that omit identity arguments.
+                raise ValueError("旧调用记录没有用户归属，不能通过多用户接口下载。")
+            directory = Path(info["directory"]).resolve()
+            if not directory.is_relative_to(audit_root):
+                raise ValueError("调用记录路径不在本项目记录目录内。")
         saved = directory / "result.json"
         if saved.is_file():
             row = json.loads(saved.read_text(encoding="utf-8"))
+        elif tenant_owned:
+            raise FileNotFoundError("本次调用结果记录不存在。")
         events = directory / "events.jsonl"
         row["call_audit"] = {
             "note": "供调试用；请求与响应文字完整记录，图片按 image_ref 保存于本次记录目录，重复图片只存一份；鉴权头不记录，已配置密钥已脱敏。",

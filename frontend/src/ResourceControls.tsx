@@ -121,7 +121,7 @@ export default function ResourceControls({ id, busy }: { id: AssistantId; busy: 
         <label className="plan-source-field" htmlFor="registered-plan"><span>已登记方案</span>
           <select id="registered-plan" value={assistant.draft.registered_plan_id ?? ''} disabled={busy || state.resourcesLoading}
             onChange={event => dispatch({ type: 'draft', id, patch: { registered_plan_id: event.target.value || null, attachment_ids: [] } })}>
-            <option value="">选择 DEMO-PLAN-01 / DEMO-PLAN-02…</option>
+            <option value="">选择 P01 / P02 / R01…</option>
             {state.plans.map(plan => <option value={plan.plan_id} key={plan.plan_id}>{plan.label} · {plan.filename}</option>)}
           </select>
         </label>

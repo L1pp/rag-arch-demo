@@ -192,11 +192,86 @@ class BailianReranker:
                        "input": {"query": query, "documents": items},
                        "parameters": parameters}
         started = perf_counter()
+        from .request_control import check_request_control
+        check_request_control()
         try:
             with httpx.Client(timeout=self.timeout, follow_redirects=False) as client:
                 response = client.post(self._resolved_endpoint, json=payload,
                                        headers={"Authorization": f"Bearer {self.api_key}",
                                                 "Content-Type": "application/json"})
+        except httpx.TimeoutException:
+            raise RerankError("Timeout") from None
+        except httpx.RequestError:
+            raise RerankError("TransportError") from None
+        try:
+            body = response.json()
+        except ValueError:
+            code = "InvalidResponse" if response.is_success else "RemoteError"
+            raise RerankError(code, response.status_code, "服务未返回有效 JSON。") from None
+        if not response.is_success or (isinstance(body, dict) and (body.get("code") or body.get("error"))):
+            raise RerankError(_service_code(body, self.api_key), response.status_code)
+        results = _parse_results(body, len(items), expected_count, response.status_code,
+                                 compatible=compatible)
+        request_id = body.get("request_id") or body.get("id") if isinstance(body, dict) else None
+        usage = (body.get("usage") or {}).get("total_tokens") if isinstance(body, dict) else None
+        if compatible and (not isinstance(request_id, str) or not request_id
+                           or not isinstance(usage, int) or usage <= 0):
+            raise RerankError("InvalidResponse", response.status_code,
+                              "qwen3响应缺少request_id或usage.total_tokens。")
+        latency_ms = round((perf_counter() - started) * 1000, 3)
+        self.last_metadata = {
+            "provider": "bailian",
+            "model": self.model,
+            "request_id": request_id if isinstance(request_id, str) and request_id else None,
+            "usage_total_tokens": usage if isinstance(usage, int) and usage > 0 else None,
+            "latency_ms": latency_ms,
+            "actual_cost_cny": (round(usage / 2_000_000, 9)
+                                if self.model == QWEN3_RERANK and isinstance(usage, int) and usage > 0
+                                else None),
+            "document_count": len(items),
+            "top_n": expected_count,
+        }
+        return results
+
+    async def arerank(self, query: str, documents: Sequence[str],
+                      top_n: int | None = None) -> list[RerankResult]:
+        """Run the same protocol through HTTPX's native asynchronous client."""
+        self.last_metadata = None
+        if not isinstance(query, str) or not query.strip():
+            raise ValueError("重排问题须为非空文本。")
+        if isinstance(documents, (str, bytes)) or not isinstance(documents, Sequence):
+            raise TypeError("重排文档须为文本序列。")
+        items = list(documents)
+        if any(not isinstance(item, str) or not item.strip() for item in items):
+            raise ValueError("重排文档须全部为非空文本。")
+        document_limit = _MODEL_DOCUMENT_LIMITS[self.model]
+        if len(items) > document_limit:
+            raise ValueError(f"{self.model} 每次最多重排 {document_limit} 份文档；请在召回层限制候选数。")
+        if top_n is not None and (isinstance(top_n, bool) or not isinstance(top_n, int) or top_n < 1):
+            raise ValueError("top_n 须为正整数或 None。")
+        if not items:
+            return []
+        expected_count = len(items) if top_n is None else min(top_n, len(items))
+        compatible = self.model == QWEN3_RERANK
+        if compatible:
+            payload = {"model": self.model, "query": query,
+                       "documents": items, "top_n": expected_count}
+        else:
+            parameters = {"top_n": expected_count}
+            if self.model in {GTE_RERANK_V2, QWEN3_VL_RERANK}:
+                parameters["return_documents"] = False
+            payload = {"model": self.model,
+                       "input": {"query": query, "documents": items},
+                       "parameters": parameters}
+        started = perf_counter()
+        from .request_control import check_request_control
+        check_request_control()
+        try:
+            async with httpx.AsyncClient(timeout=self.timeout, follow_redirects=False) as client:
+                response = await client.post(
+                    self._resolved_endpoint, json=payload,
+                    headers={"Authorization": f"Bearer {self.api_key}",
+                             "Content-Type": "application/json"})
         except httpx.TimeoutException:
             raise RerankError("Timeout") from None
         except httpx.RequestError:

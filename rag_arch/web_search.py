@@ -207,8 +207,11 @@ def _responses_search_result(payload, query):
 class NativeWebSearchProvider:
     """One Responses request per search; no hidden retries or document upload."""
 
-    def __init__(self, settings, client=None, *, timeout_seconds=90, max_output_tokens=1500):
+    def __init__(self, settings, client=None, *, async_client=None,
+                 timeout_seconds=90, max_output_tokens=1500):
         self.settings, self.client = settings, client
+        self.async_client = async_client
+        self._owns_async_client = False
         self.timeout_seconds = min(90, max(1, timeout_seconds))
         self.max_output_tokens = max(16, max_output_tokens)
         self.status = native_web_search_status(settings)
@@ -231,6 +234,8 @@ class NativeWebSearchProvider:
             if hook not in client.event_hooks[event]:
                 client.event_hooks[event].append(hook)
         try:
+            from .request_control import check_request_control
+            check_request_control()
             response = client.post(self.settings.chat_base_url.rstrip("/") + "/responses",
                 headers={"Authorization": "Bearer " + self.settings.chat_api_key}, json=body,
                 timeout=self.timeout_seconds)
@@ -248,9 +253,47 @@ class NativeWebSearchProvider:
                      result=result, independent_provider_call=True)
         return result
 
+    def _get_async_client(self):
+        if self.async_client is None:
+            self.async_client = httpx.AsyncClient(timeout=self.timeout_seconds, follow_redirects=False)
+            self._owns_async_client = True
+        from .runtime_audit import ensure_async_request_audit
+        return ensure_async_request_audit(self.async_client)
+
+    async def asearch(self, query: str) -> dict:
+        """Perform the same Responses search through a native AsyncClient path."""
+        from .runtime_audit import arecord_async_response, arecord_event
+        base = {"ok": False, "performed": False, "query": query, "summary": "", "sources": [], "search_calls": 0}
+        if not isinstance(query, str) or not query.strip() or len(query) > 2000:
+            return {**base, "error": "query须为1至2000字符的公开搜索问题。"}
+        if not self.available:
+            return {**base, "error": self.status["reason"]}
+        body = {"model": self.settings.chat_model, "input": query.strip(),
+                "tools": [{"type": "web_search"}], "tool_choice": "auto", "store": False,
+                "max_output_tokens": self.max_output_tokens, "reasoning": {"effort": "low"}}
+        try:
+            from .request_control import check_request_control
+            check_request_control()
+            client = self._get_async_client()
+            response = await client.post(self.settings.chat_base_url.rstrip("/") + "/responses",
+                headers={"Authorization": "Bearer " + self.settings.chat_api_key}, json=body,
+                timeout=self.timeout_seconds)
+            await arecord_async_response(response)
+            if not response.is_success:
+                result = {**base, "error": f"native_search_http_{response.status_code}",
+                          "http_status": response.status_code}
+            else:
+                result = _responses_search_result(response.json(), query)
+        except (httpx.HTTPError, ValueError, TypeError) as exc:
+            result = {**base, "error": type(exc).__name__}
+        await arecord_event("native_web_search_result", component="native_web_search", query=query,
+                            result=result, independent_provider_call=True)
+        return result
+
     def as_langchain_tool(self):
         from langchain_core.tools import StructuredTool
-        return StructuredTool.from_function(self.search, name="search_web", description=(
+        return StructuredTool.from_function(self.search, coroutine=self.asearch,
+            name="search_web", description=(
             "按需通过模型服务原生搜索公开网页。query仅写独立公开查询，不传本地文件或完整历史。"
             "返回真实搜索事件与外部网页来源；网页内容不自动成为已核实的本地规范证据。"))
 
@@ -283,7 +326,7 @@ def main_native_tools(settings):
 
 
 def create_responses_chat(settings, *, max_tokens, thinking_budget=None, http_client=None,
-                          json_output=False, stream_responses=False):
+                          http_async_client=None, json_output=False, stream_responses=False):
     from .responses_chat import ResponsesChat
     effort = None
     if thinking_budget is not None:
@@ -296,4 +339,5 @@ def create_responses_chat(settings, *, max_tokens, thinking_budget=None, http_cl
         base_url=settings.chat_base_url, timeout_seconds=settings.effective_chat_timeout_seconds,
         max_tokens=max_tokens, reasoning_effort=effort, native_tools=main_native_tools(settings),
         extra_body={"thinking_budget": thinking_budget} if thinking_budget is not None else {},
-        http_client=http_client, json_output=json_output, stream_responses=bool(stream_responses))
+        http_client=http_client, http_async_client=http_async_client,
+        json_output=json_output, stream_responses=bool(stream_responses))

@@ -12,7 +12,9 @@ import {
   type WorkspaceSnapshot,
 } from './types'
 
+/** Legacy shared key: retained only as a name for migration tests; it is never restored or written. */
 export const STORAGE_KEY = 'rag-arch-demo-ui-v1'
+const TENANT_STORAGE_PREFIX = 'rag-arch-demo-ui-v2'
 export const MAX_PROMPT_CHARS = 20000
 export const DEFAULT_PLAN_DEFAULTS: PlanDefaults = { max_steps: 50, max_tool_calls: 150 }
 export const titles: Record<AssistantId, string> = {
@@ -40,6 +42,7 @@ export interface AssistantState extends AssistantSnapshot {
   resetSeq: number
 }
 export interface WorkspaceState {
+  ownerUserId: number | null
   workspaceId: string | null
   instanceId: string | null
   mode: WorkspaceSnapshot["mode"]
@@ -62,6 +65,7 @@ export interface WorkspaceState {
   uploadingAssistant: AssistantId | null
 }
 interface SavedUi {
+  owner_user_id?: number
   workspace_id?: string
   server_instance_id?: string
   selected_assistant?: AssistantId
@@ -84,6 +88,40 @@ export interface SubmissionOverrides {
   use_embeddings?: boolean
   max_steps?: number
   max_tool_calls?: number
+}
+export function tenantStorageKey(ownerUserId: number, workspaceId: string): string {
+  return `${TENANT_STORAGE_PREFIX}:${encodeURIComponent(String(ownerUserId))}:${encodeURIComponent(workspaceId)}`
+}
+
+export function clearTenantUi(ownerUserId: number | null | undefined, workspaceId: string | null | undefined) {
+  if (typeof ownerUserId !== 'number' || !Number.isInteger(ownerUserId) || ownerUserId < 1 || !workspaceId) return
+  try { localStorage.removeItem(tenantStorageKey(ownerUserId, workspaceId)) }
+  catch { /* Storage may be unavailable; the active view is still cleared. */ }
+}
+
+export function clearTenantUiForOwner(ownerUserId: number | null | undefined) {
+  if (typeof ownerUserId !== 'number' || !Number.isInteger(ownerUserId) || ownerUserId < 1) return
+  const prefix = `${TENANT_STORAGE_PREFIX}:${encodeURIComponent(String(ownerUserId))}:`
+  try {
+    for (let index = localStorage.length - 1; index >= 0; index -= 1) {
+      const key = localStorage.key(index)
+      if (key?.startsWith(prefix)) localStorage.removeItem(key)
+    }
+  } catch { /* Storage may be unavailable; the active view is still cleared. */ }
+}
+
+/** Read a tenant's UI cache only after the server has confirmed both identity keys. */
+export function loadTenantUi(ownerUserId: number | null | undefined, workspaceId: string): SavedUi | undefined {
+  if (typeof ownerUserId !== 'number' || !Number.isInteger(ownerUserId) || ownerUserId < 1) return undefined
+  try {
+    const raw = localStorage.getItem(tenantStorageKey(ownerUserId, workspaceId))
+    if (!raw) return undefined
+    const saved = JSON.parse(raw) as SavedUi
+    if (saved.owner_user_id !== ownerUserId || saved.workspace_id !== workspaceId) return undefined
+    return saved
+  } catch {
+    return undefined
+  }
 }
 export const cursorSequence = (cursor: number | string): number => {
   const value = typeof cursor === 'number' ? cursor : Number(cursor.split(':').at(-1))
@@ -112,6 +150,7 @@ function emptyAssistant(id: AssistantId, draft?: Partial<Draft>): AssistantState
 }
 export function initialState(saved: SavedUi = {}): WorkspaceState {
   return {
+    ownerUserId: saved.owner_user_id ?? null,
     workspaceId: saved.workspace_id ?? null, instanceId: saved.server_instance_id ?? null,
     selected: assistantIds.includes(saved.selected_assistant!) ? saved.selected_assistant! : 'chat',
     // Keep text drafts, but never restore a previous test's slow/failing scenario.
@@ -135,11 +174,13 @@ export function initialState(saved: SavedUi = {}): WorkspaceState {
   }
 }
 export function loadInitialState(): WorkspaceState {
-  try { return initialState(JSON.parse(localStorage.getItem(STORAGE_KEY) || '{}') as SavedUi) }
-  catch { return initialState() }
+  // Authentication is resolved by the first workspace snapshot. Never restore
+  // the old unscoped v1 cache before the server identifies its owner.
+  return initialState()
 }
 export function persistableUi(state: WorkspaceState): SavedUi {
   return {
+    ...(state.ownerUserId ? { owner_user_id: state.ownerUserId } : {}),
     workspace_id: state.workspaceId ?? undefined,
     server_instance_id: state.instanceId ?? undefined,
       selected_assistant: state.selected,
@@ -257,7 +298,8 @@ export type Action =
   | { type: 'select'; id: AssistantId }
   | { type: 'draft'; id: AssistantId; patch: Partial<Draft> }
   | { type: 'loading' }
-  | { type: 'snapshot'; snapshot: WorkspaceSnapshot; now: number }
+  | { type: 'identityExpired' }
+  | { type: 'snapshot'; snapshot: WorkspaceSnapshot; now: number; savedUi?: SavedUi }
   | { type: 'bootstrapError'; message: string }
   | { type: 'connection'; value: WorkspaceState['connection'] }
   | { type: 'noticeDismissed' }
@@ -278,6 +320,8 @@ export function reducer(state: WorkspaceState, action: Action): WorkspaceState {
     ...state, assistants: { ...state.assistants, [id]: assistant },
   })
   switch (action.type) {
+    case 'identityExpired': return { ...initialState(), loading: false, resourcesLoading: false,
+      connection: 'offline', bootstrapError: '登录已失效，请重新登录。', connectionEpoch: state.connectionEpoch + 1 }
     case 'select': return { ...state, selected: action.id }
     case 'draft': return change(action.id, {
       ...state.assistants[action.id], draft: { ...state.assistants[action.id].draft, ...action.patch },
@@ -288,13 +332,20 @@ export function reducer(state: WorkspaceState, action: Action): WorkspaceState {
     case 'noticeDismissed': return { ...state, notice: null }
     case 'snapshot': {
       const snapshot = action.snapshot
-      const restarted = !!state.instanceId && state.instanceId !== snapshot.server_instance_id
-      const same = state.instanceId === snapshot.server_instance_id
+      const ownerUserId = snapshot.owner_user_id ?? null
+      // Authenticated workspaces are isolated by both stable keys. Legacy
+      // ownerless mode has only one user, so preserve its drafts on restarts.
+      const tenantChanged = state.ownerUserId !== ownerUserId
+        || (ownerUserId !== null && state.workspaceId !== snapshot.workspace_id)
+      const base = tenantChanged ? initialState(action.savedUi) : state
+      const sameWorkspace = base.workspaceId === snapshot.workspace_id
+      const restarted = !tenantChanged && !!base.instanceId && base.instanceId !== snapshot.server_instance_id
+      const same = !tenantChanged && sameWorkspace && base.instanceId === snapshot.server_instance_id
       const seq = cursorSequence(snapshot.cursor)
-      const receivedAt = same ? { ...state.receivedAt } : {}
-      const assistants = { ...state.assistants }
+      const receivedAt = same ? { ...base.receivedAt } : {}
+      const assistants = { ...base.assistants }
       for (const id of assistantIds) {
-        const previous = state.assistants[id]
+        const previous = base.assistants[id]
         const remote = snapshot.assistants.find(a => a.assistant_id === id)
         if (!remote) continue
         if (same && previous.resetSeq > seq) continue
@@ -320,12 +371,12 @@ export function reducer(state: WorkspaceState, action: Action): WorkspaceState {
         assistants[id] = acknowledge(assistant)
       }
       return {
-        ...state, workspaceId: snapshot.workspace_id, instanceId: snapshot.server_instance_id,
+        ...base, ownerUserId, workspaceId: snapshot.workspace_id, instanceId: snapshot.server_instance_id,
         mode: snapshot.mode, modelName: snapshot.model_name ?? null,
-        cursor: same ? Math.max(state.cursor, seq) : seq, assistants, receivedAt,
+        cursor: same ? Math.max(base.cursor, seq) : seq, assistants, receivedAt,
         loaded: true, loading: false, bootstrapError: null, connection: 'connecting',
-        notice: restarted ? '后台服务已重启，旧运行状态已清空。磁盘日志不会自动恢复为本次对话。' : state.notice,
-        connectionEpoch: state.connectionEpoch + 1,
+        notice: restarted ? '后台服务已重启，旧运行状态已清空。磁盘日志不会自动恢复为本次对话。' : base.notice,
+        connectionEpoch: base.connectionEpoch + 1,
       }
     }
     case 'task': {

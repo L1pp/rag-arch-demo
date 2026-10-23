@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
-import { createRerunSubmission, createSubmission, initialState, persistableUi, reducer } from './store'
-import { assistantIds, type AssistantId, type TaskSnapshot, type WorkspaceSnapshot } from './types'
+import { createRerunSubmission, createSubmission, initialState, loadInitialState, loadTenantUi, persistableUi, reducer, STORAGE_KEY, tenantStorageKey } from './store'
+import { assistantIds, isActive, type AssistantId, type TaskSnapshot, type WorkspaceSnapshot } from './types'
 
 const instance = 'server-one'
 const task = (overrides: Partial<TaskSnapshot> = {}): TaskSnapshot => ({
@@ -15,19 +15,28 @@ const snapshot = (
   tasks: Partial<Record<AssistantId, TaskSnapshot[]>> = {},
   serverInstance = instance,
   cursor = 4,
+  ownerUserId: number | null = null,
+  workspaceId = serverInstance === instance ? 'workspace-one' : 'workspace-two',
 ): WorkspaceSnapshot => ({
-  workspace_id: serverInstance === instance ? 'workspace-one' : 'workspace-two',
+  owner_user_id: ownerUserId,
+  workspace_id: workspaceId,
   server_instance_id: serverInstance, cursor, mode: 'infrastructure_demo',
   assistants: assistantIds.map(id => ({
     assistant_id: id, title: { chat: '聊天助手', standards: '规范库问答', plan: '方案辅助核查' }[id],
     tasks: tasks[id] ?? [],
-    active_task_id: tasks[id]?.find(t => ['queued', 'running', 'cancelling'].includes(t.status))?.task_id ?? null,
+    active_task_id: tasks[id]?.find(t => isActive(t))?.task_id ?? null,
   })),
 })
 const load = (workspace: WorkspaceSnapshot) =>
   reducer(initialState(), { type: 'snapshot', snapshot: workspace, now: 1000 })
 
 describe('workspace reducer', () => {
+  it('keeps a recovering task in its active assistant slot', () => {
+    const recovering = task({ status: 'recovering', stage: 'recovering' })
+    const state = load(snapshot({ chat: [recovering] }))
+    expect(isActive(recovering)).toBe(true)
+    expect(state.assistants.chat.active_task_id).toBe(recovering.task_id)
+  })
   it('ignores late HTTP task state and advances global cursor only from SSE', () => {
     let state = load(snapshot({ chat: [task()] }))
     state = reducer(state, {
@@ -150,16 +159,16 @@ describe('workspace reducer', () => {
     let state = load(workspace)
     state = reducer(state, { type: 'resources', uploads: [
       { asset_id: 'asset-1', filename: '方案.pdf', size_bytes: 1024 },
-    ], plans: [{ plan_id: 'DEMO-PLAN-01', label: 'DEMO-PLAN-01 自编方案', filename: 'DEMO-PLAN-01.pdf' }], defaults: { max_steps: 50, max_tool_calls: 150 } })
+    ], plans: [{ plan_id: 'P01', label: 'P01 主体方案', filename: 'P01.pdf' }], defaults: { max_steps: 50, max_tool_calls: 150 } })
     state = reducer(state, { type: 'draft', id: 'chat', patch: { prompt: '结合附件回答', attachment_ids: ['asset-1'], use_embeddings: true } })
     const chatRequest = createSubmission(state.assistants.chat, 'workspace-one', 'request-with-file')
     expect(chatRequest).toMatchObject({ attachment_ids: ['asset-1'], use_embeddings: false })
 
     state = reducer(state, { type: 'draft', id: 'plan', patch: {
-      prompt: '方案问题', registered_plan_id: 'DEMO-PLAN-01', plan_action: 'review', max_steps: 60, max_tool_calls: 180,
+      prompt: '方案问题', registered_plan_id: 'P01', plan_action: 'review', max_steps: 60, max_tool_calls: 180,
     } })
     const planRequest = createSubmission(state.assistants.plan, 'workspace-one', 'request-plan')
-    expect(planRequest).toMatchObject({ registered_plan_id: 'DEMO-PLAN-01', plan_action: 'review', max_steps: 60, max_tool_calls: 180 })
+    expect(planRequest).toMatchObject({ registered_plan_id: 'P01', plan_action: 'review', max_steps: 60, max_tool_calls: 180 })
     state = reducer(state, { type: 'submitStart', payload: chatRequest })
     state = reducer(state, { type: 'draft', id: 'chat', patch: { attachment_ids: [] } })
     expect(createSubmission(state.assistants.chat, 'workspace-one', 'new-request', true)).toEqual(chatRequest)
@@ -238,7 +247,7 @@ describe('workspace reducer', () => {
   it('removes invalid attachment and plan selections when refreshed resources change', () => {
     let state = load(snapshot({}, instance, 4))
     state = reducer(state, { type: 'draft', id: 'chat', patch: { attachment_ids: ['expired', 'kept'] } })
-    state = reducer(state, { type: 'draft', id: 'plan', patch: { registered_plan_id: 'DEMO-PLAN-01' } })
+    state = reducer(state, { type: 'draft', id: 'plan', patch: { registered_plan_id: 'P01' } })
     state = reducer(state, { type: 'resources', uploads: [{ asset_id: 'kept', filename: 'ok.txt', size_bytes: 10 }], plans: [], defaults: { max_steps: 50, max_tool_calls: 150 } })
     expect(state.assistants.chat.draft.attachment_ids).toEqual(['kept'])
     expect(state.assistants.plan.draft.registered_plan_id).toBeNull()
@@ -247,15 +256,73 @@ describe('workspace reducer', () => {
   it('builds a fresh rerun payload from the failed task snapshot instead of the current draft', () => {
     const failed = task({
       assistant_id: 'plan', status: 'failed', prompt: '原任务问题', request_id: 'old-request',
-      attachment_ids: ['asset-old'], registered_plan_id: 'DEMO-PLAN-02', plan_action: 'review',
+      attachment_ids: ['asset-old'], registered_plan_id: 'P02', plan_action: 'review',
       use_embeddings: true, max_steps: 42, max_tool_calls: 123,
     })
     const payload = createRerunSubmission(failed, 'workspace-one', 'new-rerun-request')
     expect(payload).toMatchObject({
       assistant_id: 'plan', request_id: 'new-rerun-request', prompt: '原任务问题', attachment_ids: ['asset-old'],
-      registered_plan_id: 'DEMO-PLAN-02', plan_action: 'review', use_embeddings: true, max_steps: 42, max_tool_calls: 123,
+      registered_plan_id: 'P02', plan_action: 'review', use_embeddings: true, max_steps: 42, max_tool_calls: 123,
     })
     expect(payload.request_id).not.toBe(failed.request_id)
+  })
+
+  it('does not restore the old unscoped cache before the server confirms a user', () => {
+    localStorage.setItem(STORAGE_KEY, JSON.stringify({ drafts: { chat: { prompt: '旧共享草稿' } } }))
+    expect(loadInitialState().assistants.chat.draft.prompt).toBe('')
+  })
+
+  it('uses owner and workspace in a separate cache key and validates both fields on read', () => {
+    expect(tenantStorageKey(21, 'workspace-a')).not.toBe(tenantStorageKey(22, 'workspace-a'))
+    expect(tenantStorageKey(21, 'workspace-a')).not.toBe(tenantStorageKey(21, 'workspace-b'))
+    const saved = {
+      owner_user_id: 21,
+      workspace_id: 'workspace-a',
+      selected_assistant: 'plan' as const,
+      drafts: { chat: { prompt: '只属于 A 的草稿', attachment_ids: ['asset-a'] } },
+    }
+    localStorage.setItem(tenantStorageKey(21, 'workspace-a'), JSON.stringify(saved))
+    expect(loadTenantUi(21, 'workspace-a')).toEqual(saved)
+    expect(loadTenantUi(22, 'workspace-a')).toBeUndefined()
+    expect(loadTenantUi(21, 'workspace-b')).toBeUndefined()
+    expect(loadTenantUi(null, 'workspace-a')).toBeUndefined()
+  })
+
+  it('hydrates a tenant cache only after the matching owner snapshot arrives', () => {
+    const savedUi = {
+      owner_user_id: 31,
+      workspace_id: 'workspace-31',
+      selected_assistant: 'plan' as const,
+      drafts: { chat: { prompt: '用户 31 的草稿', attachment_ids: ['asset-31'] } },
+    }
+    const beforeIdentity = initialState()
+    expect(beforeIdentity.assistants.chat.draft.prompt).toBe('')
+    const state = reducer(beforeIdentity, {
+      type: 'snapshot', snapshot: snapshot({}, instance, 4, 31, 'workspace-31'), savedUi, now: 1000,
+    })
+    expect(state.ownerUserId).toBe(31)
+    expect(state.workspaceId).toBe('workspace-31')
+    expect(state.selected).toBe('plan')
+    expect(state.assistants.chat.draft.prompt).toBe('用户 31 的草稿')
+    expect(state.assistants.chat.draft.attachment_ids).toEqual(['asset-31'])
+    expect(persistableUi(state)).toMatchObject({ owner_user_id: 31, workspace_id: 'workspace-31' })
+  })
+
+  it('clears the previous tenant memory before hydrating another owner, even on the same server instance', () => {
+    let state = reducer(initialState(), {
+      type: 'snapshot', snapshot: snapshot({ chat: [task()] }, instance, 4, 41, 'workspace-41'), now: 1000,
+    })
+    state = reducer(state, { type: 'draft', id: 'chat', patch: { prompt: '用户 41 的草稿', attachment_ids: ['asset-private-41'] } })
+    state = reducer(state, { type: 'snapshot', snapshot: snapshot({}, instance, 0, 42, 'workspace-42'),
+      savedUi: { owner_user_id: 42, workspace_id: 'workspace-42', drafts: { chat: { prompt: '用户 42 的草稿', attachment_ids: ['asset-private-42'] } } },
+      now: 2000 })
+    expect(state.ownerUserId).toBe(42)
+    expect(state.workspaceId).toBe('workspace-42')
+    expect(state.assistants.chat.tasks).toEqual([])
+    expect(state.assistants.chat.draft.prompt).toBe('用户 42 的草稿')
+    expect(state.assistants.chat.draft.attachment_ids).toEqual(['asset-private-42'])
+    expect(state.receivedAt).toEqual({})
+    expect(state.uploads).toEqual([])
   })
 
 })

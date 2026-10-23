@@ -1,0 +1,42 @@
+.login-page,
+.auth-gate {
+  min-height: 100dvh;
+  display: grid;
+  place-items: center;
+  padding: 24px;
+  background: radial-gradient(ellipse at 50% 0%, #e7f1e9 0, transparent 58%), #f5f7f6;
+}
+.login-card {
+  width: min(100%, 440px);
+  padding: clamp(26px, 6vw, 42px);
+  border: 1px solid #e2e9e3;
+  border-radius: 20px;
+  background: #fff;
+  box-shadow: 0 22px 65px #244d3512;
+}
+.login-brand { display: flex; align-items: center; gap: 11px; }
+.login-brand .brand-symbol { width: 40px; height: 40px; }
+.login-brand strong { color: #2c4034; font-size: 15px; letter-spacing: .02em; }
+.login-brand div > span { display: block; margin-top: 5px; color: #89948b; font-size: 10px; }
+.login-copy { margin-top: 42px; }
+.login-copy .eyebrow { color: #6d9278; font-size: 10px; letter-spacing: .12em; }
+.login-copy h1 { margin: 10px 0 8px; color: #263a30; font-size: clamp(23px, 5vw, 29px); font-weight: 600; }
+.login-copy p { margin: 0; color: #849087; font-size: 12px; line-height: 1.8; }
+.login-form { display: flex; flex-direction: column; gap: 9px; margin-top: 28px; }
+.login-form label { margin-top: 7px; color: #596d5f; font-size: 11px; }
+.login-form input {
+  width: 100%; min-height: 43px; padding: 10px 12px;
+  border: 1px solid #dfe8e0; border-radius: 8px; background: #fbfdfb; color: #2e4035;
+}
+.login-form input:focus { border-color: #81ad8b; }
+.login-form button {
+  min-height: 44px; margin-top: 12px; border: 0; border-radius: 8px;
+  background: #34785a; color: white; font-size: 12px; font-weight: 600;
+}
+.login-form button:hover:not(:disabled) { background: #286447; }
+.login-error { padding: 9px 10px; border: 1px solid #f0d6d1; border-radius: 7px; background: #fff8f6; color: #a85d51; font-size: 11px; line-height: 1.6; }
+.login-footnote { margin: 20px 0 0; color: #a0aaa1; font-size: 10px; line-height: 1.7; }
+.auth-gate { align-content: center; gap: 12px; color: #718176; font-size: 13px; text-align: center; }
+.auth-gate p { max-width: 520px; line-height: 1.8; }
+.auth-gate button { min-height: 38px; padding: 0 18px; border: 1px solid #dce7dd; border-radius: 7px; background: white; color: #47775a; }
+.download-error { display: block; color: #a85d51; font-size: 10px; line-height: 1.5; }

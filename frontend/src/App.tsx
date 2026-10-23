@@ -1,9 +1,10 @@
 import { useEffect, useLayoutEffect, useRef, useState, type FormEvent } from 'react'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
-import { getStandardCandidates, getStandardsCatalog, taskDownloadUrl } from './api'
+import { ApiError, downloadTask, getStandardCandidates, getStandardsCatalog, logout as logoutApi, redirectToLogin, taskDownloadUrl } from './api'
+import { publishAuthInvalidation } from './authLifecycle'
 import ResourceControls, { formatBytes } from './ResourceControls'
-import { currentTask, MAX_PROMPT_CHARS, type AssistantState } from './store'
+import { clearTenantUi, currentTask, MAX_PROMPT_CHARS, type AssistantState } from './store'
 import {
   assistantIds,
   isActive,
@@ -38,7 +39,7 @@ function Icon({ name, size = 20 }: { name: IconName; size?: number }) {
   return <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">{paths[name]}</svg>
 }
 const statusLabels: Record<TaskStatus, string> = {
-  queued: '等待执行', running: '运行中', cancelling: '正在停止',
+  queued: '等待执行', running: '运行中', cancelling: '正在停止', recovering: '确认执行状态中',
   completed: '已完成', failed: '失败', cancelled: '已停止',
 }
 const stageLabels: Record<string, string> = {
@@ -113,7 +114,7 @@ function EmptyState({ id }: { id: AssistantId }) {
   if (!state.loaded) return <div className="empty-state"><p>正在连接工作区…</p></div>
   const model = state.assistants[id].execution_mode === 'model'
   const text = model ? id === 'standards'
-    ? ['从一条规范问题开始', '查阅规范条文、版本信息和原页，回答附有来源。', 'DEMO-STD-01 中施工荷载有哪些要求？']
+    ? ['从一条规范问题开始', '查阅规范条文、版本信息和原页，回答附有来源。', 'GB 55023-2022 中支撑脚手架施工荷载有哪些要求？']
     : id === 'plan'
       ? ['从一份方案开始核查', '核查方案文字内容，并可在追问中按需读取原页。', '请先选择方案，再提出需要核查的问题。']
       : ['今天想聊些什么？', '可以直接聊天，也可以添加文件后提问。', '你好，请简单介绍一下你能帮我做什么。'] : {
@@ -425,6 +426,30 @@ function TaskFiles({ task }: { task: TaskSnapshot }) {
   </section>
 }
 
+function TaskDownloadLink({ taskId, workspaceId, format, children }: {
+  taskId: string
+  workspaceId: string
+  format: 'json' | 'md' | 'debug'
+  children: React.ReactNode
+}) {
+  const [error, setError] = useState<string | null>(null)
+  const controller = useRef<AbortController | null>(null)
+  useEffect(() => () => controller.current?.abort(), [])
+  return <>
+    <a href={taskDownloadUrl(taskId, workspaceId, format)} download onClick={event => {
+      event.preventDefault()
+      controller.current?.abort()
+      controller.current = new AbortController()
+      const signal = controller.current.signal
+      setError(null)
+      void downloadTask(taskId, workspaceId, format, signal).catch(reason => {
+        if (!signal.aborted) setError(reason instanceof Error ? reason.message : '下载失败，请稍后重试。')
+      })
+    }}>{children}</a>
+    {error && <span className="download-error" role="alert">{error}</span>}
+  </>
+}
+
 function TaskReadMode({ task }: { task: TaskSnapshot }) {
   const result = task.result as AppTaskResult | null | undefined
   const usesEmbeddings = result?.uses_embeddings ?? (task as TaskSnapshotSubmission).use_embeddings ?? false
@@ -439,7 +464,7 @@ function TaskReadMode({ task }: { task: TaskSnapshot }) {
 type StandardQaNotice = { title: string; message: string }
 function standardQaNotice(task: TaskSnapshot): StandardQaNotice | null {
   if (task.assistant_id !== 'standards' || task.simulation !== false || task.status !== 'completed') return null
-  const result = task.result as StandardTaskResult | null | undefined
+  const result = task.result as (StandardTaskResult & { termination_reason?: unknown }) | null | undefined
   if (!result) return null
   const reason = typeof result.termination_reason === 'string' ? result.termination_reason.trim().toLowerCase() : ''
   const status = typeof result.status === 'string' ? result.status.trim().toLowerCase() : ''
@@ -469,6 +494,7 @@ function standardQaNotice(task: TaskSnapshot): StandardQaNotice | null {
   }
   return null
 }
+
 function TaskMessages({ task, assistant, onInspect }: { task: TaskSnapshot; assistant: AssistantState; onInspect: () => void }) {
   const { state, dispatch, rerun } = useWorkspace()
   const active = isActive(task)
@@ -501,7 +527,7 @@ function TaskMessages({ task, assistant, onInspect }: { task: TaskSnapshot; assi
           {(['failed', 'cancelled'] as TaskStatus[]).includes(task.status) && <button className="text-button" disabled={assistantBusy}
             onClick={() => void rerun(task.assistant_id, task)}>重新运行此任务</button>}
           <button className="text-button" onClick={() => { dispatch({ type: 'inspect', id: task.assistant_id, taskId: task.task_id }); onInspect() }}>查看详情 <span>↗</span></button>
-          {!active && state.workspaceId && <a href={taskDownloadUrl(task.task_id, state.workspaceId, 'md')} download>{simulated ? '下载演示记录' : '下载对话记录'}</a>}
+          {!active && state.workspaceId && <TaskDownloadLink taskId={task.task_id} workspaceId={state.workspaceId} format="md">{simulated ? '下载演示记录' : '下载对话记录'}</TaskDownloadLink>}
         </div>
       </div>
     </div>
@@ -526,9 +552,9 @@ function Inspector({ assistant }: { assistant: AssistantState }) {
           onClick={() => void rerun(assistant.assistant_id, task)}>重新运行此任务</button>}
         <div className="task-id" title={task.task_id}>任务 <code>{task.task_id.slice(0, 8)}</code><span>更新 #{task.updated_seq}</span></div>
         {!isActive(task) && state.workspaceId && <div className="downloads"><span>{task.simulation === false ? '下载对话记录' : '下载演示记录'}</span><div>
-          <a href={taskDownloadUrl(task.task_id, state.workspaceId, 'md')} download><Icon name="download" size={14}/>Markdown</a>
-          <a href={taskDownloadUrl(task.task_id, state.workspaceId, 'json')} download>JSON</a>
-          {Boolean(task.result?.audit_log) && <a href={taskDownloadUrl(task.task_id, state.workspaceId, 'debug')} download>调试JSON</a>}</div></div>}
+          <TaskDownloadLink taskId={task.task_id} workspaceId={state.workspaceId} format="md"><Icon name="download" size={14}/>Markdown</TaskDownloadLink>
+          <TaskDownloadLink taskId={task.task_id} workspaceId={state.workspaceId} format="json">JSON</TaskDownloadLink>
+          {Boolean(task.result?.audit_log) && <TaskDownloadLink taskId={task.task_id} workspaceId={state.workspaceId} format="debug">调试JSON</TaskDownloadLink>}</div></div>}
       </> : <div className="no-task"><Icon name="clock" size={28}/><strong>还没有任务</strong><p>发送后，当前阶段与实际耗时会显示在这里。</p></div>}
     </div>
     {!model && <details className="demo-settings">
@@ -552,6 +578,8 @@ function Inspector({ assistant }: { assistant: AssistantState }) {
 }
 export default function App() {
   const { state, dispatch, refresh, send, reset } = useWorkspace()
+  const [loggingOut, setLoggingOut] = useState(false)
+  const [logoutError, setLogoutError] = useState<string | null>(null)
   const id = state.selected
   const assistant = state.assistants[id]
   const model = !state.loaded || assistant.execution_mode === 'model'
@@ -576,6 +604,21 @@ export default function App() {
     event.preventDefault()
     if (canSend) void send(id)
   }
+  const signOut = async () => {
+    if (loggingOut) return
+    setLoggingOut(true)
+    setLogoutError(null)
+    try {
+      await logoutApi()
+      clearTenantUi(state.ownerUserId, state.workspaceId)
+      publishAuthInvalidation()
+      redirectToLogin()
+    } catch (reason) {
+      if (reason instanceof ApiError && reason.status === 401) return
+      setLogoutError(reason instanceof Error ? reason.message : '退出登录未完成，请重试。')
+      setLoggingOut(false)
+    }
+  }
   const headingSubtitle = !state.loaded ? '正在连接服务…' : model
     ? id === 'standards' ? '查阅规范条文与版本信息' : id === 'plan' ? '文字核查与方案追问' : attachmentCount ? `${attachmentCount} 个附件` : '直接聊天，支持可选附件'
     : '模拟任务 · 资料尚未接入'
@@ -587,8 +630,11 @@ export default function App() {
       <header className="workspace-header"><div className="heading-group"><Avatar id={id}/><div><h2>{assistant.title}</h2><p>{headingSubtitle}</p></div></div>
         <div className="header-actions"><button className="reset-button" aria-expanded={inspectorOpen} onClick={() => setInspectorOpen(value => !value)}>{inspectorOpen ? '收起详情' : '任务详情'}</button>
         <button className="reset-button" onClick={() => void reset(id)} disabled={!state.loaded || busy || !assistant.tasks.length}><Icon name="reset" size={15}/>{assistant.resetting ? '正在重置…' : '重置此助手'}</button>
-        <form action="/logout" method="post" style={{ margin: 0 }}><button className="reset-button" type="submit">退出</button></form></div>
+        <button className="reset-button" type="button" onClick={() => void signOut()} disabled={loggingOut}>
+          {loggingOut ? '正在退出…' : '退出'}
+        </button></div>
       </header>
+      {logoutError && <div className="submit-error" role="alert">{logoutError}</div>}
       <div className="workspace-body">
         <div className="chat-column">
           {id === 'standards' && <StandardsCatalogPanel/>}

@@ -2,38 +2,52 @@
 
 [English](architecture_en.md) | [简体中文](architecture.md) | [Web setup](web_setup_en.md)
 
-The repository now presents the React + FastAPI workbench as its primary entry. The full standards corpus, original source documents, runtime database, and model credentials are not included. The interface source can be inspected, while real document Q&A and source-page viewing require compatible resources supplied by the user.
+The current public implementation separates the React frontend, FastAPI API, PostgreSQL state, and AI workers. Users operate one deployment with account-scoped data. The repository does not include the internal corpus, original documents, database, model credentials, or generated index packages.
 
 ~~~~mermaid
 flowchart LR
-    U[Browser / React] --> A[FastAPI pages and authentication]
-    A --> B[Workspace, task, SSE, cancel, download APIs]
-    B --> C[TaskService / assistant runner]
-    C --> D[Standards Q&A, document chat, plan-review runners]
-    D --> E[BM25 + vector retrieval]
-    E --> F[RRF fusion / reranking]
-    F --> G[Evidence tools and Agent]
-    G --> H[Source and plan-quotation validation]
-    H --> I[Markdown / JSON reports]
-    J[User-provided corpus, metadata, originals] --> D
+    U[Browser / React] --> G[HTTPS gateway or Vite dev server]
+    G --> A[FastAPI API processes]
+    A --> D[(PostgreSQL users, sessions, tasks, events, limits, audit)]
+    D --> W[Independent AI workers]
+    W --> M[Async model, search, embedding, reranking calls]
+    W --> L[Bounded local processing and supervised child processes]
+    U --> E[Resumable task event stream]
+    A --> E
+    W --> E
+    C[User-provided corpus and source files] --> W
 ~~~~
 
-| Stage | Main source files | What to inspect |
+## Request and task lifecycle
+
+FastAPI handles authentication, account-scoped API requests, task submission, upload and download boundaries, and event streaming. It does not execute the durable AI task in the request process. PostgreSQL stores task state and ordered events; one or more workers claim queued work and persist progress and terminal state. A client reconnects with its event cursor to resume delivery. Per-account assistant slots and the deployment-wide execution cap are enforced through shared database state, so adding API or worker processes does not bypass those limits.
+
+Each account's tasks, attachments, history, and audit records are scoped to that account. The deployment operator still administers the database and host; this code does not claim to provide a hosted multi-tenant service or a managed identity platform.
+
+The worker keeps the application workflows and retrieval code in the same project. Network calls to chat, web search, embeddings, and reranking are orchestrated asynchronously. Synchronous CPU, file, and document-conversion work stays behind bounded local execution resources or supervised child processes. The offline CLI remains a separate synchronous sample.
+
+## Shared retrieval data
+
+The retrieval path combines BM25 and dense-vector candidates with RRF, then applies configured reranking and evidence expansion. Public corpus records, BM25 statistics, and dense vectors support immutable read-only memory-mapped packages. Processes can share operating-system file pages instead of each constructing a separate full Python copy; full corpus records and location details are decoded on demand. This keeps the existing retrieval behavior visible while changing how shared data is loaded.
+
+The mmap code is included, but the corpus and packages are not. Users prepare data in the expected format and build packages from their own corpus and compatible embedding cache. Source updates require rebuilding matching corpus and index packages before restarting the worker. The web setup guide describes the public commands and data boundaries.
+
+## Source map
+
+| Layer | Main files | What to inspect |
 |---|---|---|
-| React UI | frontend/src/App.tsx, api.ts, store.ts, WorkspaceContext.tsx | Workspace state, assistant tasks, event subscription, report display, and request boundaries |
-| FastAPI entry | rag_arch/web/app.py, contracts.py | Pages and static assets, login, workspace/task APIs, SSE, cancellation, and downloads |
-| Tasks and events | rag_arch/web/task_service.py | Single-process task lifecycle, progress events, cancellation, and current workspace snapshot |
-| Upload and source pages | rag_arch/web/document_routes.py, documents.py, standards_routes.py | Uploaded file handling, source-page viewing, document catalog, and status routes |
-| History | rag_arch/web/history.py | Local history pages and record-reading routes |
-| Backend workflows | rag_arch/web/chat_runner.py, standards_runner.py, plan_runner.py | How requests enter chat, standards Q&A, and plan review |
-| Document processing | rag_arch/loaders.py, splitting.py, plan_documents.py | TXT/MD/PDF/DOCX reading, line/page locations, scanned-page gaps, and splitting |
-| Retrieval and reranking | rag_arch/retrieval.py, evidence_index.py, reranking.py, providers.py | Chinese and numeric tokenization, BM25, vector normalization, RRF candidates, and reranking services |
-| Evidence and Q&A | rag_arch/standard_tools.py, graph_agent.py, page_qa.py | Search/read evidence tools, LangGraph tool loop, and final citation constraints |
-| Plan review | rag_arch/plan_review_agent.py, plan_review_context.py, plan_review_evidence.py | Full-text-first review, batching, plan quotation location, evidence assembly, and coverage |
-| Validation and output | rag_arch/plan_output.py, plan_review_report.py, model_input_view.py | Separating citation checks from engineering judgments, source traceability, and Markdown/JSON reports |
+| React frontend | frontend/src/ | Login boundary, workspace state, task requests, event reconnection, results and downloads |
+| API and authentication | rag_arch/web/app.py, auth.py, contracts.py | API-only startup, sessions, authorization, request validation, health/readiness |
+| PostgreSQL state | rag_arch/web/db.py, task_repository.py, persistent_tasks.py | Explicit schema migration, ownership-scoped queries, durable task transitions |
+| Events and workers | rag_arch/web/events.py, task_worker.py, worker_process.py | Ordered events, cursor resume, leasing, execution and recovery |
+| Attachments and resources | rag_arch/web/documents.py, document_routes.py, standards_resources.py | Per-account attachment ownership and shared read-only corpus resources |
+| Async provider boundary | rag_arch/async_support.py, providers.py, web_search.py | Async network calls and bounded local work |
+| Retrieval and evidence | rag_arch/retrieval.py, binary_bm25.py, binary_vectors.py, binary_corpus.py, evidence_index.py | Hybrid candidates, mmap packages, evidence lookup and on-demand decoding |
+| Agents and reports | rag_arch/standard_tools.py, graph_agent.py, plan_review_agent.py, plan_output.py | Evidence tool flow, plan quotation checks, citation checks, and report output |
+| Independent web UI | frontend/ | React development server and production build |
 
-At startup, FastAPI reads settings and creates the task service. It serves the built React files and API from the same origin. The API includes task state, SSE progress, cancellation, and file downloads. This code is a local workbench, not a hosted or multi-tenant service. See the [Web setup guide](web_setup_en.md) for build and launch steps.
+## Data and operating boundaries
 
-Standards Q&A requires at least user-provided data/corpus/clauses.jsonl and data/corpus/tables.jsonl in the project’s expected format. Add catalog summaries, catalog entries, version relations, and status records as needed. To navigate from evidence to an original page, provide the corresponding originals and source mappings expected by the code; records without originals cannot open a source page. Users also supply model, embedding, and reranking configuration. These resources are not included; the [Web setup guide](web_setup_en.md) describes the minimum setup.
+A working deployment needs PostgreSQL, model settings supplied by the operator, a corpus in the expected format, and source documents for source-page viewing. Users can prepare data/corpus/clauses.jsonl and data/corpus/tables.jsonl plus any catalog, status, and source mappings their workflows require. API credentials and runtime files stay local.
 
-demo/ and examples/ retain the authored offline CLI sample. The Streamlit page is now a separate no-key sample. Offline stand-ins cover only topics designed into the examples; they do not demonstrate review of arbitrary engineering plans. Existing screenshots show the initial Streamlit page, not the current React workbench.
+Screenshots in the README were captured on 2026-10-13 with fictional offline results. They show an earlier React interface and do not illustrate the current account isolation, durable PostgreSQL tasks, or worker lifecycle. They are visual examples, not deployment evidence.

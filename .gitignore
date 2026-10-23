@@ -7,7 +7,6 @@ __pycache__/
 *.py[cod]
 *.egg-info/
 .pytest_cache/
-.streamlit/secrets.toml
 output/
 data/runtime/
 .cache/
@@ -30,3 +29,6 @@ frontend/dist/
 build/
 *.tsbuildinfo
 requirements*.local.txt
+artifacts/
+frontend/public/viewer/history/
+frontend/openapi.local.json

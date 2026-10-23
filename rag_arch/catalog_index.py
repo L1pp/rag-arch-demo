@@ -1,14 +1,17 @@
 """Candidate directory discovery; no clause, model or embedding evidence is created."""
 from __future__ import annotations
 
+import asyncio
 from copy import deepcopy
+from contextvars import ContextVar
 import math
 from pathlib import Path
 import re
-from threading import RLock, local
+from threading import Condition, RLock
 import unicodedata
 
 from .models import Chunk
+from .async_support import run_local
 from .retrieval import LocalIndex, tokenize
 from .standard_identifiers import parse_standard_references
 
@@ -40,9 +43,16 @@ class CatalogIndex:
         self.records = deepcopy(catalog)
         self.embeddings = embeddings
         self._embedding_lock = RLock()
+        self._embedding_condition = Condition(self._embedding_lock)
+        self._embedding_generation = 0
+        self._metadata_initializing = False
         self._metadata_index = None
         self._metadata_embedding_attempted = False
-        self._candidate_local = local()
+        self._async_embedding_lock = None
+        self._candidate_async_override = ContextVar(
+            f"catalog_async_hits_{id(self)}", default=None)
+        self._candidate_diagnostics = ContextVar(
+            f"catalog_candidate_diagnostics_{id(self)}", default=None)
         self._identities, self._exact_identities, self._tokens = [], [], []
         self._identifier_refs = []
         self._metadata_texts = []
@@ -89,11 +99,15 @@ class CatalogIndex:
                                  *_strings(record.get("history_search_texts"))])
             self._metadata_texts.append(metadata)
 
+    def _new_candidate_state(self):
+        state = {"warnings": [], "semantic_used": False, "diagnostic": None}
+        self._candidate_diagnostics.set(state)
+        return state
+
     def _candidate_state(self):
-        state = getattr(self._candidate_local, "state", None)
+        state = self._candidate_diagnostics.get()
         if state is None:
-            state = {"warnings": [], "semantic_used": False, "diagnostic": None}
-            self._candidate_local.state = state
+            state = self._new_candidate_state()
         return state
 
     @property
@@ -109,7 +123,7 @@ class CatalogIndex:
 
     @property
     def last_diagnostics(self):
-        """Diagnostics for the most recent candidates() call in this thread."""
+        """Diagnostics for the latest candidates() call in this request context."""
         state = self._candidate_state()
         result = {"warnings": list(dict.fromkeys(state["warnings"])),
                   "semantic_used": bool(state["semantic_used"])}
@@ -121,6 +135,7 @@ class CatalogIndex:
         """Replace the optional metadata provider and drop only its lazy index."""
         with self._embedding_lock:
             self.embeddings = embeddings
+            self._embedding_generation += 1
             self._metadata_index = None
             self._metadata_embedding_attempted = False
         return self
@@ -265,49 +280,177 @@ class CatalogIndex:
         return best
 
     def _metadata_index_for_candidates(self):
-        if self.embeddings is None:
-            return None
-        with self._embedding_lock:
-            if self._metadata_embedding_attempted:
-                return self._metadata_index
-            chunks = [Chunk(record["std_id"], record.get("code", record.get("std_no", "")),
-                            f"catalog:{record['std_id']}", text, {}, "catalog", "catalog")
-                      for record, text in zip(self.records, self._metadata_texts)]
+        while True:
+            with self._embedding_condition:
+                while self._metadata_initializing:
+                    self._embedding_condition.wait()
+                if self.embeddings is None:
+                    return None
+                if self._metadata_embedding_attempted:
+                    return self._metadata_index
+                embeddings = self.embeddings
+                generation = self._embedding_generation
+                self._metadata_initializing = True
+
+            # LocalIndex asks for prepared metadata vectors here. Build it
+            # outside the shared lock so configuration and query requests can
+            # continue while initialization performs cache or provider work.
             try:
-                index = LocalIndex(chunks, self.embeddings)
+                chunks = [Chunk(record["std_id"], record.get("code", record.get("std_no", "")),
+                                f"catalog:{record['std_id']}", text, {}, "catalog", "catalog")
+                          for record, text in zip(self.records, self._metadata_texts)]
+                index = LocalIndex(chunks, embeddings)
             except BaseException as exc:
-                self._metadata_embedding_attempted = False
+                with self._embedding_condition:
+                    self._metadata_initializing = False
+                    if generation == self._embedding_generation and isinstance(exc, Exception):
+                        self._metadata_index = None
+                        self._metadata_embedding_attempted = False
+                        self.last_candidate_diagnostic = {
+                            "stage": "metadata_embedding_initialization",
+                            "error_type": type(exc).__name__,
+                            "message": f"目录元数据向量初始化失败（{type(exc).__name__}）。",
+                        }
+                    self._embedding_condition.notify_all()
                 if not isinstance(exc, Exception):
                     raise
-                self._metadata_index = None
-                self.last_candidate_diagnostic = {
-                    "stage": "metadata_embedding_initialization",
-                    "error_type": type(exc).__name__,
-                    "message": f"目录元数据向量初始化失败（{type(exc).__name__}）。",
-                }
                 return None
-            self._metadata_index = index
-            self._metadata_embedding_attempted = True
-            return self._metadata_index
+
+            with self._embedding_condition:
+                self._metadata_initializing = False
+                if (generation == self._embedding_generation
+                        and embeddings is self.embeddings):
+                    self._metadata_index = index
+                    self._metadata_embedding_attempted = True
+                    self._embedding_condition.notify_all()
+                    return index
+                self._embedding_condition.notify_all()
 
     def _metadata_embedding_hits(self, query, limit):
+        override = self._candidate_async_override.get()
+        if override is not None:
+            hits, semantic_used, diagnostic = override
+            self._candidate_state()["semantic_used"] = bool(semantic_used)
+            if diagnostic is not None:
+                self.last_candidate_diagnostic = diagnostic
+            return hits
         if self.embeddings is None:
             return {}
-        with self._embedding_lock:
-            index = self._metadata_index_for_candidates()
-            if index is None:
-                return {}
-            self._candidate_state()["semantic_used"] = True
-            try:
-                hits = index.search(query, top_k=min(len(self.records), max(20, limit * 4)))
-            except Exception as exc:
-                self.last_candidate_diagnostic = {
-                    "stage": "metadata_embedding_query",
-                    "error_type": type(exc).__name__,
-                    "message": f"目录元数据向量查询失败（{type(exc).__name__}）。",
-                }
-                return {}
+        index = self._metadata_index_for_candidates()
+        if index is None:
+            return {}
+        self._candidate_state()["semantic_used"] = True
+        try:
+            # Query embedding may wait on a remote provider. Do not hold the
+            # metadata-index lock across that call; the index is immutable.
+            hits = index.search(query, top_k=min(len(self.records), max(20, limit * 4)))
+        except Exception as exc:
+            self.last_candidate_diagnostic = {
+                "stage": "metadata_embedding_query",
+                "error_type": type(exc).__name__,
+                "message": f"目录元数据向量查询失败（{type(exc).__name__}）。",
+            }
+            return {}
         return {hit.chunk.doc_id: float(hit.score) for hit in hits}
+
+    async def _ametadata_index_for_candidates(self):
+        if self._async_embedding_lock is None:
+            with self._embedding_lock:
+                if self._async_embedding_lock is None:
+                    self._async_embedding_lock = asyncio.Lock()
+        async with self._async_embedding_lock:
+            while True:
+                with self._embedding_lock:
+                    if self.embeddings is None:
+                        return None
+                    if self._metadata_embedding_attempted:
+                        return self._metadata_index
+                    embeddings = self.embeddings
+                    generation = self._embedding_generation
+                chunks = await run_local(lambda: [
+                    Chunk(record["std_id"], record.get("code", record.get("std_no", "")),
+                          f"catalog:{record['std_id']}", text, {}, "catalog", "catalog")
+                    for record, text in zip(self.records, self._metadata_texts)])
+                try:
+                    index = await LocalIndex.acreate(chunks, embeddings)
+                except Exception as exc:
+                    with self._embedding_lock:
+                        if generation == self._embedding_generation and embeddings is self.embeddings:
+                            self._metadata_index = None
+                            self._metadata_embedding_attempted = False
+                            self.last_candidate_diagnostic = {
+                                "stage": "metadata_embedding_initialization",
+                                "error_type": type(exc).__name__,
+                                "message": f"目录元数据向量初始化失败（{type(exc).__name__}）。",
+                            }
+                            return None
+                    continue
+                with self._embedding_lock:
+                    if generation == self._embedding_generation and embeddings is self.embeddings:
+                        self._metadata_index = index
+                        self._metadata_embedding_attempted = True
+                        return index
+
+    async def _ametadata_embedding_hits(self, query, limit):
+        if self.embeddings is None:
+            return {}, False, None
+        index = await self._ametadata_index_for_candidates()
+        if index is None:
+            return {}, False, self.last_candidate_diagnostic
+        try:
+            hits = await index.asearch(query, top_k=min(len(self.records), max(20, limit * 4)))
+        except Exception as exc:
+            diagnostic = {
+                "stage": "metadata_embedding_query",
+                "error_type": type(exc).__name__,
+                "message": f"目录元数据向量查询失败（{type(exc).__name__}）。",
+            }
+            self.last_candidate_diagnostic = diagnostic
+            return {}, True, diagnostic
+        return {hit.chunk.doc_id: float(hit.score) for hit in hits}, True, None
+
+    async def asearch(self, query, limit=10, library_class=None):
+        """Async lexical catalog search; it does not need a provider call."""
+        return await run_local(self.search, query, limit, library_class)
+
+    async def acandidates(self, query, limit=5, library_class=None):
+        """Async candidate lookup using async metadata embedding providers."""
+        if not isinstance(query, str) or not query.strip():
+            self._new_candidate_state()
+            return []
+        if type(limit) is not int or limit < 1:
+            raise ValueError("limit须为正整数。")
+        if library_class not in {None, "A", "B", "C"}:
+            raise ValueError("library_class只能是A/B/C或null。")
+        query = query.strip()
+        self._new_candidate_state()
+
+        def semantic_is_needed():
+            requested = parse_standard_references(query)
+            exact_found = False
+            identifier_candidate_found = False
+            for requested_item in requested:
+                for index in range(len(self.records)):
+                    relation = self._identifier_match(requested_item, index)
+                    if relation is not None:
+                        identifier_candidate_found = True
+                        exact_found = exact_found or not relation["candidate_only"]
+            return (self.embeddings is not None and not exact_found
+                    and (not requested or not identifier_candidate_found))
+
+        need_semantic = await run_local(semantic_is_needed)
+        override = ({}, False, None)
+        if need_semantic:
+            override = await self._ametadata_embedding_hits(query, limit)
+        token = self._candidate_async_override.set(override)
+        try:
+            rows, state = await run_local(
+                lambda: (self.candidates(query, limit, library_class),
+                         deepcopy(self._candidate_state())))
+        finally:
+            self._candidate_async_override.reset(token)
+        self._candidate_diagnostics.set(state)
+        return rows
 
     def candidates(self, query, limit=5, library_class=None):
         """Return public directory candidates without promoting identity.
@@ -316,8 +459,7 @@ class CatalogIndex:
         embedding matches.  Only public directory fields feed the optional
         metadata vector index; no clause or body text is added.
         """
-        state = self._candidate_state()
-        state.update(warnings=[], semantic_used=False, diagnostic=None)
+        state = self._new_candidate_state()
         if not isinstance(query, str) or not query.strip():
             return []
         if type(limit) is not int or limit < 1:

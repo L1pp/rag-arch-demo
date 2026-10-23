@@ -75,6 +75,7 @@ class DeepSeekToolChat(ReasoningContentChat):
 
 def create_tool_chat_model(settings, *, max_tokens: int | None = None,
                            thinking_budget: int | None = None, http_client=None,
+                           http_async_client=None,
                            json_output: bool = False, response_schema: dict | None = None,
                            output_method: str = "json", native_web_search: bool = False,
                            stream_responses: bool = False):
@@ -112,6 +113,7 @@ def create_tool_chat_model(settings, *, max_tokens: int | None = None,
     if select_chat_protocol(settings) == "responses":
         model = create_responses_chat(settings, max_tokens=resolved_max_tokens,
             thinking_budget=resolved_thinking_budget, http_client=http_client,
+            http_async_client=http_async_client,
             json_output=json_output and response_schema is None,
             stream_responses=stream_responses)
         if response_schema is not None:
@@ -127,6 +129,8 @@ def create_tool_chat_model(settings, *, max_tokens: int | None = None,
               "streaming": False, "disable_streaming": True}
     if http_client is not None:
         kwargs["http_client"] = http_client
+    if http_async_client is not None:
+        kwargs["http_async_client"] = http_async_client
     kwargs["max_tokens"] = resolved_max_tokens
     extra_body = web_search_extra_body(settings) if native_web_search else {}
     if resolved_thinking_budget is not None:
@@ -163,4 +167,47 @@ def create_tool_chat_model(settings, *, max_tokens: int | None = None,
     if output_method == "terminal_tool":
         from .terminal_output import TerminalOutputChat
         return TerminalOutputChat(model, response_schema)
+    return model
+
+
+def create_async_tool_chat_model(settings, *, max_tokens: int | None = None,
+                                 thinking_budget: int | None = None, http_client=None,
+                                 http_async_client=None, json_output: bool = False,
+                                 response_schema: dict | None = None, output_method: str = "json",
+                                 native_web_search: bool = False, stream_responses: bool = False):
+    """Construct a tool-capable model with an owned per-model async transport."""
+    if not settings.chat_ready:
+        return None
+    if type(json_output) is not bool:
+        raise ValueError("json_output须为布尔值。")
+    if type(stream_responses) is not bool:
+        raise ValueError("stream_responses须为布尔值。")
+    if output_method not in {"json", "terminal_tool", "text"}:
+        raise ValueError("output_method仅支持json、terminal_tool或text。")
+    if response_schema is not None and not isinstance(response_schema, dict):
+        raise ValueError("response_schema须为对象或None。")
+    if output_method == "text":
+        response_schema = None
+    if output_method == "terminal_tool" and response_schema is None:
+        raise ValueError("terminal_tool必须提供response_schema。")
+    resolve_chat_budgets(settings, max_tokens=max_tokens, thinking_budget=thinking_budget)
+    select_chat_protocol(settings)
+    owns_client = http_async_client is None
+    if owns_client:
+        from .providers import (_dispose_unattached_async_client,
+                               _mark_owned_async_http_client,
+                               _new_owned_async_http_client)
+        http_async_client = _new_owned_async_http_client(settings.effective_chat_timeout_seconds)
+    try:
+        model = create_tool_chat_model(settings, max_tokens=max_tokens,
+            thinking_budget=thinking_budget, http_client=http_client,
+            http_async_client=http_async_client, json_output=json_output,
+            response_schema=response_schema, output_method=output_method,
+            native_web_search=native_web_search, stream_responses=stream_responses)
+        if owns_client:
+            _mark_owned_async_http_client(model, http_async_client)
+    except BaseException:
+        if owns_client:
+            _dispose_unattached_async_client(http_async_client)
+        raise
     return model

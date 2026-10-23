@@ -1,6 +1,7 @@
 """Bind page-reading to the sources already selected for the current question."""
 from __future__ import annotations
 from copy import deepcopy
+from itertools import chain
 from pathlib import Path
 from .config import ROOT
 from .document_pages import DocumentPageService, SUPPORTED_SUFFIXES
@@ -191,7 +192,15 @@ def add_standard_sources(service, corpus, selected=None):
         spans = [{**source, "source_path": source.get("path", source.get("source_path", ""))}
                  for source in entry.get("source_files", []) if isinstance(source, dict)]
         catalog_originals.append({"std_no": visible["std_no"], "source_spans": spans})
-    for record in corpus.clauses + corpus.tables + catalog_originals:
+    iter_source_records = getattr(corpus, "iter_source_records", None)
+    if callable(iter_source_records):
+        corpus_records = iter_source_records(selected=selected or None)
+    else:
+        # Compatibility for injected/legacy corpora without a source-only
+        # projection. BinaryCorpusStore exposes the method above so normal
+        # mmap-backed page registration never decodes clause/table bodies.
+        corpus_records = corpus.clauses + corpus.tables
+    for record in chain(corpus_records, catalog_originals):
         std_no = record["std_no"]
         if selected and std_no not in selected:
             continue

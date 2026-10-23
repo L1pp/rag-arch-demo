@@ -3,15 +3,73 @@ import json
 import re
 
 from .models import Answer, Chunk, ConversationTurn, SearchHit
-from .catalog_runtime import catalog_answer, catalog_metadata_query
+from .async_support import run_local
+from .catalog_runtime import adiscover_catalog, catalog_answer, catalog_metadata_query
 from .retrieval import LocalIndex
 from .runtime_audit import record_event
 from .config import DEFAULT_CHAT_MAX_TOKENS, DEFAULT_CHAT_CONTEXT_BUDGET
 from .plan_review_context import ContextBudgetError, estimate_messages
-from .page_qa import (enabled_web_provider, invoke_with_pages, page_collection_id, page_context_tokens,
+from .page_qa import (ainvoke_with_pages, enabled_web_provider, invoke_with_pages, page_collection_id, page_context_tokens,
                       native_tool_names, registered_sources, without_native_tools)
 from .reply_text import readable_reply
 from .web_evidence import native_web_observation, resolve_web_citations
+
+
+async def _arewrite_question(question: str, history, chat_model, input_budget):
+    messages, chosen = await run_local(
+        _messages_with_history, _REWRITE_PROMPT, f"当前问题：{question}", history, input_budget)
+    if not chosen:
+        return question, False
+    try:
+        record_event("model_call_started", phase="query_rewrite")
+        response = await without_native_tools(chat_model).ainvoke(messages)
+    except Exception as exc:
+        raise RuntimeError("追问检索问题整理失败；本轮未检索或生成答案，请检查聊天服务后重试。") from exc
+    rewritten = await run_local(_response_text, response)
+    if not rewritten:
+        raise ValueError("模型返回的独立检索问题为空。")
+    if len(rewritten) > MAX_REWRITE_CHARS:
+        raise ValueError("模型返回的独立检索问题过长，未使用或截断该问题。")
+    if _CITATION.search(rewritten) or _PAGE_CITATION.search(rewritten) or _WEB_CITATION.search(rewritten):
+        raise ValueError("独立检索问题仍含旧引用编号，未使用该问题。")
+    return rewritten, True
+
+
+async def _adiscover(index, query, limit):
+    discover = getattr(index, "adiscover", None)
+    if callable(discover):
+        return await discover(query, limit=limit)
+    catalog_index = getattr(index, "catalog_index", None)
+    if catalog_index is not None:
+        return await adiscover_catalog(
+            catalog_index, query, getattr(index, "filters", None), limit)
+    candidates = getattr(index, "acandidates", None)
+    if callable(candidates):
+        return await adiscover_catalog(index, query, limit=limit)
+    if callable(getattr(index, "discover", None)):
+        raise TypeError("目录索引未提供异步发现接口。")
+    return []
+
+
+async def _asearch(index, query, top_k):
+    search = getattr(index, "asearch", None)
+    if callable(search):
+        hits = await search(query, top_k=top_k)
+    else:
+        retrieve = getattr(index, "aretrieve", None)
+        if callable(retrieve):
+            options = {"top_k": top_k}
+            for name in ("mode", "filters", "use_reranker"):
+                value = getattr(index, name, None)
+                if value is not None:
+                    options[name] = value
+            result = await retrieve(query, **options)
+            hits = getattr(result, "context_hits", result)
+        else:
+            raise TypeError("检索索引未提供异步检索接口。")
+    if hasattr(hits, "context_hits"):
+        hits = hits.context_hits
+    return list(hits)
 
 
 SYSTEM_PROMPT = """你是用户上传文件的资料问答助手。
@@ -449,3 +507,227 @@ def answer_question(question: str, index: LocalIndex | None, chat_model=None, to
     # Preserve readable partial-source discussion, but never mark a known gap
     # as a passed evidence check or reuse that answer as follow-up context.
     return Answer(text, hits, warnings, not incomplete, citation_check, page_sources=page_sources, web_sources=web_sources, **native_data)
+
+
+async def aanswer_question(question: str, index: LocalIndex | None, chat_model=None, top_k: int = 5,
+                           history: list[ConversationTurn] | None = None,
+                           direct_chunks: list[Chunk] | None = None,
+                           system_prompt: str | None = None,
+                           context_budget_tokens: int = DEFAULT_CHAT_CONTEXT_BUDGET,
+                           output_budget_tokens: int | None = None,
+                           page_service=None, max_page_tool_calls: int = 8, web_provider=None) -> Answer:
+    """Async question answering with the same evidence and citation rules as answer_question."""
+    if not isinstance(question, str) or not question.strip():
+        return Answer("请输入要查询的问题。", [], [], False)
+    question = question.strip()
+    direct = direct_chunks is not None
+    if page_service is not None and not await run_local(registered_sources, page_service):
+        page_service = None
+    web_provider = enabled_web_provider(web_provider, chat_model)
+    native_enabled = bool(native_tool_names(chat_model))
+    tools_enabled = page_service is not None or web_provider is not None or native_enabled
+    plain_chat = not direct and index is None and page_service is None
+    recent_history = await run_local(
+        _history_rows, history, index, direct_chunks, page_service, web_provider)
+    input_budget = _input_budget(chat_model, context_budget_tokens, output_budget_tokens)
+    if plain_chat and web_provider is None and not native_enabled:
+        if chat_model is None:
+            return Answer("当前没有加入文件，也未配置聊天模型，暂时不能回答。", [],
+                          ["当前为普通聊天模式；请配置聊天模型，或加入文件后再进行资料问答。"], False)
+        messages, chosen = await run_local(
+            _messages_with_history, CHAT_ONLY_SYSTEM_PROMPT, "用户问题：" + question,
+            recent_history, input_budget)
+        try:
+            record_event("model_call_started", phase="plain_chat")
+            response = await chat_model.ainvoke(messages)
+        except Exception as exc:
+            raise RuntimeError("聊天模型调用失败；未使用其他模型代答，请检查聊天服务。") from exc
+        native_payload, native_sources = await run_local(native_web_observation, response)
+        native_data = {"native_tool_observations": native_payload.get("native_tool_observations", []),
+                       "native_tool_usage": native_payload.get("native_tool_usage", {})}
+        text = await run_local(_response_text, response)
+        if not text:
+            return Answer("模型未返回可读回答，请重试。", [], ["普通聊天模型返回内容为空。"], False,
+                          web_sources=native_sources, **native_data)
+        return Answer(text, [], _history_limit_note(recent_history, chosen), False,
+                      web_sources=native_sources, **native_data)
+
+    query = question
+    history_warnings = []
+    rewritten = False
+    if recent_history and not direct and index is not None:
+        if chat_model is not None:
+            try:
+                query, rewritten = await _arewrite_question(
+                    question, recent_history, chat_model, input_budget)
+            except ContextBudgetError:
+                raise
+            except ValueError as exc:
+                return Answer("未能形成有效的追问检索问题，本轮尚未检索或生成答案。请补全问题后重试。",
+                              [], [str(exc)], False)
+            if rewritten:
+                history_warnings.append("本轮已结合历史理解追问并重新检索；历史回答不作为事实依据。")
+        else:
+            _, chosen = await run_local(
+                _messages_with_history, _REWRITE_PROMPT, "当前问题：" + question,
+                recent_history, input_budget)
+            query = "\n".join([item["question"] for item in chosen] + [question])
+            history_warnings.append("未调用模型解析追问；仅合并最近问题辅助检索，复杂指代可能无法理解。")
+
+    catalog = (await _adiscover(index, query, top_k)
+               if not direct and (callable(getattr(index, "discover", None))
+                                  or callable(getattr(index, "adiscover", None))
+                                  or callable(getattr(index, "acandidates", None))) else [])
+    if catalog and await run_local(catalog_metadata_query, question):
+        return catalog_answer(catalog, history_warnings)
+    from .catalog_runtime import explicit_standard_requests
+    explicit_requests = await run_local(explicit_standard_requests, query)
+    if catalog and explicit_requests and any(not row.get("text_available") for row in catalog):
+        return catalog_answer(catalog, history_warnings, missing_text=True)
+    if direct:
+        hits = [SearchHit(chunk, 1.0) for chunk in direct_chunks]
+    elif index is not None:
+        hits = await _asearch(index, query, top_k)
+    else:
+        hits = []
+    if not hits and catalog:
+        return catalog_answer(catalog, history_warnings, missing_text=True)
+    if not hits and (not tools_enabled or chat_model is None):
+        if direct:
+            return Answer("当前资料没有可读正文，暂不能回答。", [], ["未提取到可用正文。"], False)
+        return Answer("未在当前资料中检索到可用依据，暂不能根据这些资料回答。",
+                      [], history_warnings + ["没有可用检索片段。"], False)
+    evidence = await run_local(_evidence, hits)
+    if chat_model is None:
+        if direct:
+            return Answer("全文预览（未调用生成模型，不是问答结论）\n\n" + evidence,
+                          hits, ["当前展示全部已读取文字；尚未生成或核验答案。"], False)
+        return Answer("检索片段预览（未调用生成模型，不是问答结论）\n\n" + evidence,
+                      hits, history_warnings + ["当前仅展示检索结果；尚未生成或核验答案。"], False)
+
+    query_note = f"\n独立检索问题：{query}" if rewritten else ""
+    system_prompt = system_prompt or (CHAT_ONLY_SYSTEM_PROMPT if plain_chat else SYSTEM_PROMPT)
+    if page_service is not None:
+        system_prompt = system_prompt.replace("只根据本次给出的检索片段回答问题",
+            "只根据本次给出的检索片段及工具实际读取的原页回答问题").replace(
+            "只有本轮列出的片段才是本轮来源", "只有本轮提供的文字或工具实际读取的原页才是本轮来源").replace(
+            "每项来自资料的事实结论须就近引用片段编号，例如 [S1]；只能使用实际提供的编号。",
+            "每项来自资料的事实结论须就近引用本轮来源编号：文字片段使用 [S1]，工具原页使用 [P1]；只能使用实际提供的编号。")
+    if web_provider is not None or native_enabled:
+        system_prompt = system_prompt.replace("只根据本次给出的检索片段回答问题",
+            "只根据本次给出的检索片段及工具实际取得的网页参考回答问题").replace(
+            "只根据本次给出的检索片段及工具实际读取的原页回答问题",
+            "只根据本次给出的检索片段、工具实际读取的原页及网页参考回答问题").replace(
+            "只有本轮列出的片段才是本轮来源", "只有本轮实际提供的资料才是本轮来源").replace(
+            "只有本轮提供的文字或工具实际读取的原页才是本轮来源", "只有本轮实际提供的资料才是本轮来源")
+        system_prompt += "\n网页参考使用工具提供的[W编号]或服务端返回的实际URL；网页来源是外部参考，不是本地已核规范。"
+    source_label = "本轮检索片段"
+    if direct:
+        system_prompt = system_prompt.replace("检索片段", "全部已读取正文").replace(
+            "不能代替本轮检索", "不能代替本轮正文依据")
+        source_label = "本次文件的全部已读取正文（带来源，未检索或截断）"
+    context_tokens = (await run_local(
+        page_context_tokens, page_service, web_provider, native_tools=native_enabled)
+        if tools_enabled else 0)
+    messages, chosen = await run_local(
+        _messages_with_history, system_prompt,
+        f"用户问题：{question}{query_note}\n\n{source_label}：\n{evidence}",
+        recent_history, input_budget - context_tokens)
+    history_warnings.extend(_history_limit_note(recent_history, chosen))
+    page_sources, web_sources = [], []
+    native_data = {"native_tool_observations": [], "native_tool_usage": {}}
+    native_reference_metadata = False
+    try:
+        record_event("model_call_started", phase="grounded_answer")
+        if not tools_enabled:
+            response = await chat_model.ainvoke(messages)
+        else:
+            result = await ainvoke_with_pages(
+                chat_model, messages, page_service, budget_tokens=input_budget,
+                max_tool_calls=max_page_tool_calls, web_provider=web_provider)
+            response, page_sources = result.response, result.page_sources
+            native_data = {"native_tool_observations": result.native_tool_observations,
+                           "native_tool_usage": result.native_tool_usage,
+                           "tool_calls": result.tool_calls}
+            native_reference_metadata = result.native_reference_metadata
+            chunks = direct_chunks if direct_chunks is not None else getattr(index, "chunks", [])
+            collection_ids = {chunk.collection_id for chunk in chunks}
+            scope = (next(iter(collection_ids)) if len(collection_ids) == 1 else
+                     await run_local(page_collection_id, page_service)
+                     if page_service is not None else None)
+            web_sources = [dict(source, collection_id=scope) for source in result.web_sources]
+            history_warnings.extend(result.warnings)
+    except ContextBudgetError:
+        raise
+    except Exception as exc:
+        raise RuntimeError("问答模型调用失败；未使用其他模型代答，请检查聊天服务配置。") from exc
+    text = await run_local(_response_text, response)
+    if not text:
+        return Answer("模型未返回可读回答，请重试或查看检索片段。", hits,
+                      history_warnings + ["模型返回内容为空或不含可读文字。"], False,
+                      page_sources=page_sources, web_sources=web_sources, **native_data)
+
+    references = _CITATION.findall(text)
+    page_references = _PAGE_CITATION.findall(text)
+    web_references = _WEB_CITATION.findall(text) if web_provider is not None or web_sources else []
+    cited_web_ids = resolve_web_citations([source["url"] for source in web_sources
+                                           if source["url"] in text], web_sources)
+    citation_limit = (_CITATION_LIMIT if not tools_enabled else
+        "仅检查引用编号是否属于本轮已提供的文字、原页或网页参考，尚未验证模型理解和来源内容是否正确。")
+    invalid_source = [ref for ref in references if not re.fullmatch(r"[0-9]{1,9}", ref.strip())
+                      or not 1 <= int(ref.strip()) <= len(hits)]
+    invalid_page = [ref for ref in page_references if not re.fullmatch(r"[0-9]{1,9}", ref.strip())
+                    or not 1 <= int(ref.strip()) <= len(page_sources)]
+    invalid_web = [ref for ref in web_references if not re.fullmatch(r"[0-9]{1,9}", ref.strip())
+                   or not 1 <= int(ref.strip()) <= len(web_sources)]
+    if invalid_source or invalid_page or invalid_web:
+        citation_check = _citation_failure_check(
+            references, page_references, web_references,
+            invalid_source, invalid_page, invalid_web,
+            hits, page_sources, web_sources, cited_web_ids,
+            page_service=page_service,
+            web_context=web_provider is not None or native_enabled or bool(web_sources),
+            native_reference_metadata=native_reference_metadata,
+            reason="invalid_or_out_of_range_reference")
+        return Answer(text, hits, history_warnings + [
+            "已保留模型原文，但其中包含不存在或格式错误的引用；引用检查未通过。",
+            citation_limit], False, citation_check,
+            page_sources=page_sources, web_sources=web_sources, **native_data)
+    if not references and not page_references and not web_references and not cited_web_ids and not native_reference_metadata:
+        if plain_chat:
+            warnings = history_warnings + (["本轮取得网页参考，但回答未使用W编号引用。"] if web_sources else [])
+            return Answer(text, [], warnings, False, web_sources=web_sources, **native_data)
+        citation_check = _citation_failure_check(
+            references, page_references, web_references,
+            [], [], [], hits, page_sources, web_sources, cited_web_ids,
+            page_service=page_service,
+            web_context=web_provider is not None or native_enabled or bool(web_sources),
+            native_reference_metadata=native_reference_metadata,
+            reason="missing_reference")
+        return Answer(text, hits, history_warnings + [
+            "已保留模型原文，但回答缺少可核对的资料引用；引用检查未通过。",
+            citation_limit], False, citation_check,
+            page_sources=page_sources, web_sources=web_sources, **native_data)
+    cited_numbers = sorted({int(ref.strip()) for ref in references})
+    incomplete = [number for number in cited_numbers
+                  if hits[number - 1].chunk.source_kind == "standard"
+                  and hits[number - 1].chunk.locator.get("content_complete") is not True]
+    citation_check = {"passed": True, "source_numbers_valid": True, "cited_numbers": cited_numbers,
+                      "cited_incomplete_numbers": incomplete,
+                      "cited_incomplete_ids": [hits[n - 1].chunk.chunk_id for n in incomplete],
+                      "semantic_support_checked": False}
+    if page_service is not None:
+        citation_check["cited_page_numbers"] = sorted({int(ref.strip()) for ref in page_references})
+    if web_provider is not None or native_enabled or web_sources:
+        citation_check["cited_web_numbers"] = sorted({int(ref.strip()) for ref in web_references}
+            | {int(value.split(":", 1)[1]) for value in cited_web_ids if value.startswith("WEB:")})
+        citation_check["web_sources_verified"] = False
+        citation_check["native_reference_metadata"] = native_reference_metadata
+    warnings = history_warnings + [citation_limit]
+    if web_references or cited_web_ids or native_reference_metadata:
+        warnings.append("引用的网页仅为外部参考，不代表本地规范库已有正文或已核验其现行状态。")
+    if incomplete:
+        labels = "、".join(f"[S{number}]" for number in incomplete)
+        warnings.insert(0, f"回答引用的 {labels} 有未读取或未核准内容，未通过完整证据检查；其数值和判断尚不可采用。可读文字仍可与下方原文核对。")
+    return Answer(text, hits, warnings, not incomplete, citation_check,
+                  page_sources=page_sources, web_sources=web_sources, **native_data)

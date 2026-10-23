@@ -2,12 +2,14 @@
 
 [English](validation_en.md) | [简体中文](validation.md)
 
-日期：2026-10-12。本页记录初始提交 `403cb3d` 的验证，未运行新的公共基准、真实方案评测或在线模型调用。后续变化见[回归修复记录](review_fixes_20261012.md)。
+日期：2026-10-12。本页记录初始提交 403cb3d 的验证，未运行新的公共基准、真实方案评测或在线模型调用。后续变化见[回归修复记录](review_fixes_20261012.md)。
 
-- 新建独立 Python 3.12.10 虚拟环境，按 README 安装 `requirements.txt` 与本项目；`pip check` 无依赖冲突。
+历史范围说明（2026-10-23 更新）：本页验证的小型网页样例使用当时的 Streamlit 入口，该入口现已退役并移除。以下结果不代表当前 React/FastAPI 架构已通过验证。请看[本次迁移验证记录](web_validation_20261023.md)。
+
+- 新建独立 Python 3.12.10 虚拟环境，按 README 安装依赖与本项目；pip check 无依赖冲突。
 - 5 项有限离线测试通过：真实工具取证与引用、编辑输入改变报告、缺失证据不制造引用、默认不构造远端客户端、CLI 三件套输出。
-- `python -m demo --output output` 成功生成报告与 JSON，输出记录为 offline、network_model_calls=0。
-- Playwright 实际打开本地页面，运行问答与方案演示；3 张截图经过人工画面检查，仅含自编素材。
+- python -m demo --output output 成功生成报告与 JSON，输出记录为 offline、network_model_calls=0。
+- Playwright 实际打开当时的 Streamlit 样例页面，运行问答与方案演示；3 张截图经过人工画面检查，仅含自编素材。
 - README 与文档的本地链接和图片路径存在。
 - 核心清单中的 58 份源码与选取时来源文件逐字节一致，没有移入原 Git 对象或历史。
 - 待发布树与 Git 暂存内容经过公开文件检查；暂存区回归验证确认，先暂存后清理工作树的模拟凭据仍能被发现。

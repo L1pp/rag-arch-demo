@@ -7,7 +7,7 @@ import getpass
 from pathlib import Path
 import sys
 
-from .auth import AuthStore, default_auth_db_path
+from .auth import create_auth_store
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -15,7 +15,7 @@ ROOT = Path(__file__).resolve().parents[2]
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="管理建筑资料助手 Web 登录账号。")
-    parser.add_argument("--db", help="认证 SQLite 文件；默认读取 RAG_ARCH_AUTH_DB 或 data/runtime/auth.sqlite3")
+    parser.add_argument("--db", help="显式使用指定的 SQLite 认证文件，优先于 RAG_ARCH_DATABASE_URL")
     commands = parser.add_subparsers(dest="command", required=True)
     add = commands.add_parser("add", help="添加一个登录账号")
     add.add_argument("username")
@@ -37,7 +37,7 @@ def _read_new_password() -> str:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
-    store = AuthStore(default_auth_db_path(ROOT, args.db))
+    store = create_auth_store(ROOT, args.db)
     try:
         if args.command == "add":
             password = _read_new_password()

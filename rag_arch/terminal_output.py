@@ -231,6 +231,9 @@ class TerminalOutputChat:
     def invoke(self, messages, **kwargs):
         return self._invoke(messages, [], kwargs)
 
+    async def ainvoke(self, messages, config=None, **kwargs):
+        return await self._ainvoke(messages, [], kwargs, config=config)
+
     def _prepare_messages(self, messages, *, terminal_only: bool = False):
         prepared = list(messages)
         suffix = TERMINAL_SYSTEM_SUFFIX + (TERMINAL_ONLY_SYSTEM_SUFFIX if terminal_only else "")
@@ -267,6 +270,24 @@ class TerminalOutputChat:
             options["native_tools_enabled"] = False
         bound = self._model.bind_tools(request_tools)
         response = bound.invoke(self._prepare_messages(messages, terminal_only=terminal_only), **options)
+        if not isinstance(response, AIMessage):
+            raise TypeError("聊天模型响应不是AIMessage。")
+        return self._adapt(response, terminal_only=terminal_only)
+
+    async def _ainvoke(self, messages, ordinary_tools: list[Any], invoke_kwargs: dict, *, config=None):
+        options = dict(invoke_kwargs)
+        caller_choice = options.pop("tool_choice", None)
+        if (isinstance(caller_choice, dict) or caller_choice is True
+                or (isinstance(caller_choice, str) and caller_choice in {"required", "any"})):
+            raise ValueError("terminal_tool不支持required或强制工具选择；请使用tool_choice=none收尾。")
+        terminal_only = caller_choice == "none"
+        request_tools = [self._terminal_tool] if terminal_only else list(ordinary_tools) + [self._terminal_tool]
+        options["tool_choice"] = "auto"
+        if terminal_only and getattr(self._model, "api_protocol", None) == "responses":
+            options["native_tools_enabled"] = False
+        bound = self._model.bind_tools(request_tools)
+        response = await bound.ainvoke(self._prepare_messages(messages, terminal_only=terminal_only),
+                                       config=config, **options)
         if not isinstance(response, AIMessage):
             raise TypeError("聊天模型响应不是AIMessage。")
         return self._adapt(response, terminal_only=terminal_only)
@@ -430,3 +451,6 @@ class _TerminalOutputBound:
 
     def invoke(self, messages, **kwargs):
         return self._owner._invoke(messages, self._tools, kwargs)
+
+    async def ainvoke(self, messages, config=None, **kwargs):
+        return await self._owner._ainvoke(messages, self._tools, kwargs, config=config)

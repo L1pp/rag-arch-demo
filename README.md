@@ -2,73 +2,52 @@
 
 [English](README.md) | [简体中文](README_CN.md)
 
-This repository is a code showcase for a building-document assistant. Its primary web entry is a React single-page app served by a FastAPI backend. Follow the implementation from document upload and retrieval through evidence citations, plan review, task progress, cancellation, source-page viewing, and report export.
+This repository presents the current React + FastAPI implementation of a building-document assistant. The React frontend, FastAPI API, PostgreSQL task store, and AI workers run as separate components. The code shows how account-scoped tasks move through document processing, hybrid retrieval, evidence citations, plan review, resumable progress events, and report export.
 
-The public tree contains selected application code and fictional examples. It does not include the private standards corpus, original source files, credentials, or runtime database. The web workbench is therefore not a turnkey public service: users must provide compatible model settings and their own corpus and source materials for the workflows they want to run. See the [web setup guide](docs/web_setup_en.md).
+The public tree contains application code and authored fictional examples. It does not include the complete standards corpus, original source documents, API credentials, database, or generated corpus/vector packages. Users provide PostgreSQL, model settings, their own corpus, and any originals needed for source-page viewing. The web workbench is an engineering showcase, not a turnkey hosted service. See the [setup guide](docs/web_setup_en.md).
 
-## Main web workbench
+## Current web architecture
 
-The React interface calls FastAPI routes for workspace state, assistant tasks, server-sent progress events, task cancellation, document upload, source pages, history, and report downloads. The backend connects those requests to the retained retrieval and agent code. The repository keeps the real application flow visible while omitting proprietary source material.
+Each account has its own task, attachment, history, and audit records within a deployment. PostgreSQL persists authentication and task/event state; independent API processes accept requests while AI workers claim and execute durable tasks. Clients can reconnect to task events and continue from a cursor. The database enforces per-account assistant slots and the deployment-wide execution limit.
 
-The login feature manages local accounts, but accounts share the same local workspace and runtime data; it does not provide per-account data isolation. The included launch instructions bind to localhost for local review.
+The workers retain the retrieval and agent flows. Dense vectors, BM25 indexes, and corpus records can be shared through read-only memory-mapped packages, with full corpus records decoded as needed. Model, search, embedding, and reranking network orchestration runs asynchronously in the worker; bounded local processing remains under process and resource supervision. The [architecture guide](docs/architecture_en.md) maps these paths to source files.
 
-<a id="run-the-demo"></a>
+## Run the local workbench
 
-## Separate sample paths
+Use the [step-by-step setup guide](docs/web_setup_en.md). It covers Python and frontend dependencies, explicit PostgreSQL migrations, account creation, and starting the API, worker, and React development server. The interface requires user-provided model settings and materials for real document workflows.
 
-The small, authored offline CLI sample is still available:
+The authored offline CLI remains available for a small, deterministic example:
 
 ~~~~bash
 python -m demo --output output
 ~~~~
 
-It writes a Markdown report and JSON results under output/. Deterministic offline stand-ins replace model, embedding, and reranking calls. They demonstrate the flow for the authored examples only; they do not review arbitrary plans.
+It writes Markdown and JSON results under output/. The stand-ins demonstrate only the authored examples and do not review arbitrary plans.
 
-The separate no-key Streamlit sample remains available as streamlit_demo.py:
+## Contribution and scope
 
-~~~~bash
-python -m pip install -r requirements-demo.txt
-python -m streamlit run streamlit_demo.py --server.address 127.0.0.1 --server.port 8501
-~~~~
+I led the implementation of the building-document assistant and am authorized to publish the selected code in this repository. The source includes document loading and source locations, BM25 and vector retrieval, RRF fusion, reranking, evidence tools, agent tool use, plan quotation checks, citation validation, and report generation. Course-derived design notes and third-party component information remain in the [notices](THIRD_PARTY_NOTICES.md).
 
-This is a small standalone sample, not the primary React/FastAPI workbench. Historical screenshots of this standalone Streamlit sample are linked below.
+The public sample data is fictional. The complete internal corpus, customer materials, runtime state, private evaluation inputs, and derived packages tied to those materials are not included. Public historical evaluation figures are summarized in the [evaluation notes](docs/evaluation_en.md); the original inputs and reports are not published.
 
-## Core implementation and contribution
+## Earlier React UI illustration
 
-I led the implementation of the building-document assistant and am authorized to publish the selected code in this repository. The source shows document loading and source locations, BM25 and vector retrieval, RRF fusion, reranking, evidence tools, the agent tool loop, plan quotation checks, citation validation, and report delivery. Course-derived design notes and third-party component information remain in the [notices](THIRD_PARTY_NOTICES.md).
+These screenshots were captured on 2026-10-13 using a fictional offline fixture. They illustrate an earlier React interface and do not show the current account, PostgreSQL task, or worker flows. They are not evidence of live model or production validation.
 
-The [architecture guide](docs/architecture_en.md) maps the web and retrieval paths to source files. The [web setup guide](docs/web_setup_en.md) explains the user-provided configuration and data expected by the web app.
-
-## React + FastAPI screenshots
-
-Captured in an isolated temporary screenshot environment, these images show the current React interface with offline sample results wired into the pages. The data is authored and fictional. The regular workbench still requires users to provide API settings, a corpus, and source documents; these screenshots do not verify an online model service or production deployment.
-
-![Current React workbench with authored fictional data](docs/screenshots/react-01-workbench.png)
-![Current evidence view with offline demo results](docs/screenshots/react-02-evidence.png)
-![Current plan review view with offline demo results](docs/screenshots/react-03-plan-review.png)
-
-The initial Streamlit screenshots remain available: [materials](docs/screenshots/01-library.png), [retrieval and citations](docs/screenshots/02-qa.png), and [plan review](docs/screenshots/03-review.png).
-
-## Existing results and limitations
-
-In a historical 60-question retrieval regression, adding reranking to the same RRF candidate pool raised Recall@8 from 0.8444 to 0.8722 and increased complete evidence matches from 44/60 to 47/60. At Top-4, complete evidence matches fell from 40/60 to 39/60. On a fixed 240-question AECBench QA set, accuracy on decodable answer choices rose from 146/240 to 184/240.
-
-The five-plan whole-plan evaluation used 59 fixed development reference items. These results measure reference coverage, not full-report accuracy; they do not establish that RAG consistently improves technical findings across whole plans. The [evaluation notes](docs/evaluation_en.md) describe the scope, native-review comparison, unfavorable results, and changes that cannot be attributed to RAG. The public examples do not reproduce those results.
-
-Citation checks can verify sources and quoted text. They cannot automatically establish engineering applicability, correctness of conclusions, or completeness of issue discovery. Text extraction gaps, charts, and complex calculations still require manual review.
+![Earlier React workbench illustration](docs/screenshots/react-01-workbench.png)
+![Earlier evidence view with authored offline results](docs/screenshots/react-02-evidence.png)
+![Earlier plan review view with authored offline results](docs/screenshots/react-03-plan-review.png)
 
 ## Repository guide
 
-- frontend/: React application and build configuration.
-- rag_arch/web/: FastAPI app, authentication, tasks, upload, source, and history routes.
-- rag_arch/: retrieval, evidence, agents, plan review, and report implementation.
-- demo/, examples/: offline CLI sample and authored fictional inputs.
-- streamlit_demo.py: independent small Streamlit sample.
-- docs/: setup, architecture, evaluation, publication scope, current React screenshots, and historical Streamlit screenshots.
+- frontend/: React application.
+- rag_arch/web/: FastAPI API, authentication, persistence, tasks, events, uploads, and downloads.
+- rag_arch/: document processing, retrieval, evidence, agents, plan review, and reports.
+- scripts/: explicit database migrations and local corpus/index preparation.
+- demo/, examples/: authored offline CLI sample and fictional inputs.
+- docs/: architecture, setup, evaluation boundaries, publication scope, historical UI screenshots, and validation records.
 
-The [initial validation record](docs/validation_en.md) refers to the original Streamlit sample; it is not a validation report for the current React/FastAPI workbench. The [publication notes](docs/publication_en.md) describe the scope of the public source selection.
-
-[Web migration validation](docs/web_validation_20261013_en.md) records the bounded checks for this source update.
+Read the [architecture guide](docs/architecture_en.md), [setup guide](docs/web_setup_en.md), and [publication notes](docs/publication_en.md). The 2026-10-12 and 2026-10-13 validation pages are historical records for earlier code paths. The current migration validation record is [here](docs/web_validation_20261023_en.md) and will be completed from the final test and review evidence before release.
 
 ## License
 

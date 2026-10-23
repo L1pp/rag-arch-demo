@@ -139,7 +139,7 @@ class StandardStatusRegistry:
 
     def __init__(self, project_root: str | Path = DEFAULT_PROJECT_ROOT,
                  clauses: list[dict] | None = None, *, catalog=None, relations=None, corpus_dir=None,
-                 as_of_date=None):
+                 as_of_date=None, corpus=None):
         self.root = Path(project_root)
         self.standards = _rows(self.root / "data/meta/standards.csv")
         self.sources = {r["source_id"]: r for r in _rows(self.root / "data/meta/sources.csv")}
@@ -161,6 +161,13 @@ class StandardStatusRegistry:
                 self.sources.setdefault(source_id, observation)
         self.lifecycle = LifecycleRegistry(self.catalog, self.evidence,
             [edge for edge in self._version_edges if _confirmed_replacement_edge(edge)], as_of_date)
+        status_records = getattr(corpus, "status_records", None) if corpus is not None else None
+        if not callable(status_records):
+            status_records = getattr(clauses, "status_records", None)
+        if callable(status_records):
+            clauses = status_records()
+        elif clauses is None and corpus is not None:
+            clauses = getattr(corpus, "clauses", [])
         if clauses is None:
             clauses = []
             # Reviewed local stages are permitted as existence evidence. They
@@ -176,16 +183,28 @@ class StandardStatusRegistry:
                 "data/processed/jgj130_v0/clauses.jsonl", "data/processed/concrete_scoped_v0/clauses.jsonl",
             )):
                 clauses.extend(_read_jsonl(self.root / relative))
-        self.clause_keys = {(_key(c["std_no"]), _key(c["clause_no"])) for c in clauses
-                            if c.get("document_part", "body") == "body"
-                            or c.get("import_origin") == "manifest_v1" and c.get("document_part") != "commentary"}
+        self.clause_keys = set()
         self._clause_mandatory_metadata = {}
         for clause in clauses:
+            document_part = clause.get("document_part", "body")
+            if (document_part == "body"
+                    or clause.get("import_origin") == "manifest_v1" and document_part != "commentary"):
+                clause_key = (_key(clause["std_no"]), _key(clause["clause_no"]))
+                self.clause_keys.add(clause_key)
             # Commentary and mere clause-number matches are not publication proof.
-            if clause.get("document_part", "body") != "body":
+            if document_part != "body":
                 continue
-            key = (_key(clause["std_no"]), _key(clause["clause_no"]))
-            self._clause_mandatory_metadata.setdefault(key, []).append(clause)
+            clause_key = (_key(clause["std_no"]), _key(clause["clause_no"]))
+            # Ordinary dict-backed corpora retain only fields used by status
+            # reasoning. Lazy record mappings are already lightweight views;
+            # preserving them lets original_mandatory_evidence decode only
+            # when a matching status query needs it.
+            if isinstance(clause, dict):
+                clause = {field: clause[field] for field in (
+                    "std_no", "clause_no", "document_part", "import_origin",
+                    "original_mandatory", "original_mandatory_evidence",
+                ) if field in clause}
+            self._clause_mandatory_metadata.setdefault(clause_key, []).append(clause)
 
     def _original_nonmandatory_sources(self, std_key, clause):
         """Accept an explicit False only with a reviewed complete edition list.
