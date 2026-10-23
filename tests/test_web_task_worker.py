@@ -759,19 +759,20 @@ class WorkerProcessCliTests(unittest.TestCase):
     def test_simulation_run_does_not_load_settings_and_accepts_temporary_root(self):
         from rag_arch.web import worker_process
         runtime = unittest.mock.Mock()
+        temporary_root = Path(self.enterContext(TemporaryDirectory())) / "worker-root"
         with patch.object(worker_process, "_database", return_value=object()), \
              patch.object(worker_process, "_repository", return_value=object()), \
              patch.object(worker_process, "WorkerRuntime", return_value=runtime) as factory, \
              patch("rag_arch.config.load_settings", side_effect=AssertionError("must not load")):
             self.assertEqual(worker_process.main([
                 "run", "--simulation", "--database-url", "postgresql://test/isolated",
-                "--schema", "only_test", "--root", "D:/temporary-test-root",
+                "--schema", "only_test", "--root", str(temporary_root),
                 "--heartbeat-interval", "0.5", "--lease-seconds", "3", "--max-tasks", "1",
             ]), 0)
         kwargs = factory.call_args.kwargs
         self.assertTrue(kwargs["simulation"])
         self.assertIsNone(kwargs["settings"])
-        self.assertEqual(str(kwargs["root"]), "D:\\temporary-test-root")
+        self.assertEqual(kwargs["root"], temporary_root.resolve())
         runtime.run.assert_called_once_with(max_tasks=1)
 
     def test_recover_marks_stale_and_reports_model_tasks_kept(self):
