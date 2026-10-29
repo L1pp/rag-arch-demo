@@ -2,7 +2,7 @@
 
 [English](setup.md) | [简体中文](zh-CN/setup.md) | [Architecture](architecture.md)
 
-The public workbench runs a React frontend, FastAPI API, PostgreSQL database, and separate AI worker processes. It is a source showcase, not a packaged hosted service. You provide PostgreSQL, model credentials, a corpus, and source documents for any workflow that needs to open original pages.
+This public workbench is a selected snapshot of an evolving project. It shows the main React, FastAPI, PostgreSQL, and worker implementation, but is not a complete delivery. Users provide PostgreSQL, model credentials, a corpus and any source documents they need, and complete the required environment integrations.
 
 ## Requirements
 
@@ -11,6 +11,7 @@ The public workbench runs a React frontend, FastAPI API, PostgreSQL database, an
 - A PostgreSQL instance accessible from the API, worker, migration, and account-management processes.
 - Model settings and corpus files supplied by the operator.
 - A local browser.
+- On Linux, LibreOffice Writer for DOC conversion and Word page previews. Install `soffice` on `PATH` or set `RAG_ARCH_LIBREOFFICE_EXECUTABLE` in the process environment. On Windows, use DOCX; page previews require Microsoft Word.
 
 The application scripts do not create a PostgreSQL server or import a corpus. Keep database credentials and model keys out of Git and logs.
 
@@ -28,7 +29,19 @@ npm ci
 Pop-Location
 ~~~~
 
-For Linux or macOS, activate .venv-web with source .venv-web/bin/activate. The Python package, API, and worker use the same environment.
+On Linux, use the same environment and install the frontend dependencies from a POSIX shell:
+
+~~~~sh
+python -m venv .venv-web
+source .venv-web/bin/activate
+python -m pip install -r requirements/web.txt
+python -m pip install --no-deps -e .
+cd frontend
+npm ci
+cd ..
+~~~~
+
+The Python package, API, and worker use the same environment.
 
 ## Configure PostgreSQL and apply migrations
 
@@ -37,6 +50,14 @@ Set the database URL and schema in the process environment used by migration, ac
 ~~~~powershell
 $env:RAG_ARCH_DATABASE_URL = 'postgresql://<application-user>:<password>@<host>:5432/<database>'
 $env:RAG_ARCH_DATABASE_SCHEMA = 'rag_arch'
+python -m scripts.migrate_web schema
+~~~~
+
+On Linux, set the same values with `export` before the migration:
+
+~~~~sh
+export RAG_ARCH_DATABASE_URL='postgresql://<application-user>:<password>@<host>:5432/<database>'
+export RAG_ARCH_DATABASE_SCHEMA='rag_arch'
 python -m scripts.migrate_web schema
 ~~~~
 
@@ -69,11 +90,21 @@ The vector conversion command converts an existing compatible embedding cache; i
 python -m scripts.convert_core_vectors
 ~~~~
 
-Use the same source corpus and matching package versions for the API and every worker. If the source corpus changes, rebuild the derived packages and restart workers to load them. The full internal data and its packages are not included in this repository.
+Use the same source corpus and matching package versions for the API and every worker. Opening a corpus mmap package does not check whether its original source directory exists or still matches. A structurally valid stale package can load, so the operator must manage matching versions. After changing the source, rebuild the matching corpus, BM25, and vector packages and restart workers to load them. The full internal data and its packages are not included in this repository.
+
+## Optional page OCR and visual review
+
+Cloud OCR is disabled by default. To enable it, configure `RAG_ARCH_OCR_ENABLED=true`, `RAG_OCR_BASE_URL`, and `RAG_OCR_API_KEY` in the worker's environment or local `.env`. The current adapter uses the fixed `qwen-vl-ocr-2025-11-20` model and accepts Aliyun Beijing ordinary pay-as-you-go HTTPS endpoints; it does not use Token Plan. Blank OCR endpoint or key values fall back to the configured chat endpoint or key, which must also satisfy the OCR service requirements. `RAG_ARCH_OCR_TIMEOUT_SECONDS` controls the request timeout (default 120 seconds, range 1–300).
+
+Only a claimed worker task can submit candidate pages to OCR. `RAG_ARCH_OCR_MAX_PAGES_PER_TASK` is read from the worker process environment (default 100, range 1–500). Recognition remains unverified (`recognition_verified=false`) and the UI surfaces page warnings. Enabling OCR sends page images to the configured service and may incur provider charges.
+
+Visual plan review can deliver whole pages or selected regions to a compatible vision model with bounded image budgets. The result records whether an image was acquired, sent, returned, or cited; this does not guarantee correct visual interpretation. The `deepseek-v4.1-flash-1017` snapshot has provider-specific Responses parameter handling; configure a compatible provider and supply its credentials yourself.
+
+OCR caches also retain failed results; changing configuration does not automatically retry an existing asset. For an explicit new attempt, first verify the previous request state, correct settings, safely finish active work and restart the relevant workers, then upload a new asset and select it for a new task. The new request may incur charges. Do not automatically delete unknown-state markers to resend requests.
 
 ## Start the API, worker, and React frontend
 
-Open three terminals from the repository root. Set the database URL and schema in each terminal. For local HTTP development, configure the API origin and cookie settings, then start the API:
+On Windows, open three PowerShell terminals from the repository root. Set the database URL and schema in each terminal. For local HTTP development, configure the API origin and cookie settings, then start the API:
 
 ~~~~powershell
 $env:RAG_ARCH_DATABASE_URL = 'postgresql://<application-user>:<password>@<host>:5432/<database>'
@@ -96,7 +127,26 @@ Push-Location frontend
 npm run dev
 ~~~~
 
-Open http://127.0.0.1:5173 and sign in. The API listens on 127.0.0.1:8000. The Vite dev server forwards API requests to it. The database stores task state and events; API and worker processes must use the same schema. For production, build the frontend and put it behind an HTTPS gateway with the API; review cookie, origin, database-role, worker, and data-directory settings before deployment.
+On Linux, activate `.venv-web` and export the same database URL and schema in each terminal. Set the API origin and cookie variables as above using `export`, then start the API and worker in separate terminals:
+
+~~~~sh
+python -m uvicorn rag_arch.web.app:app --host 127.0.0.1 --port 8000 --workers 1 --proxy-headers --forwarded-allow-ips 127.0.0.1 --timeout-graceful-shutdown 5
+python -m rag_arch.web.worker_process run --concurrency 3
+~~~~
+
+In a third terminal run `npm run dev` from `frontend/`. Open http://127.0.0.1:5173 and sign in. The API listens on 127.0.0.1:8000; the Vite dev server forwards API requests to it. The database stores task state and events, and API and worker processes must use the same schema. For production, build the frontend and put it behind an HTTPS gateway with the API; review cookie, origin, database-role, worker, and data-directory settings before deployment.
+
+## Recover an interrupted task
+
+For a local worker that has exited, the operator can run the following one-time maintenance command on that worker's host with the database environment configured:
+
+~~~~sh
+python -m rag_arch.web.worker_process recover --isolate-interrupted
+~~~~
+
+`--cleanup-owned-resources` permits cleanup of some identity-verified child processes. LibreOffice process groups are only checked for confirmed exit; this command does not terminate them. If exit cannot be confirmed, their state and task slot remain reserved.
+
+The default cooldown is 120 seconds. The operation isolates an interrupted task only after verifying that the local worker and its registered child resources have exited. It does not automatically retry the task, and the status of any external work remains unknown.
 
 ## Offline CLI sample
 
