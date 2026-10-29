@@ -5,6 +5,7 @@ from fastapi import APIRouter, HTTPException, Query, Request
 from fastapi.responses import Response
 
 from ..standard_tools import StandardTools
+from .page_region_query import parse_region_query
 
 
 def create_standards_router():
@@ -75,12 +76,16 @@ def create_standards_router():
 
     @router.get("/pages")
     def pages(request: Request, std: str, evidence: str | None = None,
-              source_ref: str | None = None, page: int | None = Query(default=None, ge=1)):
-        return read(lambda: resources(request).page_view(std, evidence=evidence, source_ref=source_ref, page=page), page_view=True)
+              source_ref: str | None = None, page: int | None = Query(default=None, ge=1),
+              region: str | None = Query(default=None, max_length=200)):
+        return read(lambda: resources(request).page_view(std, evidence=evidence, source_ref=source_ref, page=page,
+                    **({"region": parse_region_query(region)} if region is not None else {})), page_view=True)
 
     @router.get("/page-image")
-    def page_image(request: Request, std: str, source_ref: str, page: int = Query(ge=1)):
-        image = read(lambda: resources(request).page_image(std, source_ref, page), page_view=True)
-        return Response(image, media_type="image/png", headers={"Cache-Control": "private, max-age=300"})
+    def page_image(request: Request, std: str, source_ref: str, page: int = Query(ge=1),
+                   region: str | None = Query(default=None, max_length=200)):
+        image = read(lambda: resources(request).page_image(std, source_ref, page,
+                    **({"region": parse_region_query(region)} if region is not None else {})), page_view=True)
+        return Response(image, media_type="image/png", headers={"Cache-Control": "private, no-store", "Vary": "Cookie"})
 
     return router

@@ -3,6 +3,7 @@
 These are source facts, not an engineering verdict. Legacy `complete` flags
 remain unchanged and must not be interpreted as a text-truncation flag.
 """
+from .page_regions import normalize_region
 
 
 def text_delivery_status(record):
@@ -19,10 +20,21 @@ def text_delivery_status(record):
 
 
 def source_checks(record, *, sent_pages=(), source_ref_for_path=None):
-    """Only an exact registered source + physical page confirms image delivery."""
-    provided = {(page.get("source_ref"), page.get("page")) for page in sent_pages
-                if page.get("sent_to_model") is True and page.get("source_kind") == "standard"
-                and page.get("source_ref")}
+    """A region confirms only its bounds, never delivery of the full parent page."""
+    provided, regions = set(), []
+    for page in sent_pages:
+        if (page.get("sent_to_model") is not True or page.get("source_kind") != "standard"
+                or not page.get("source_ref") or type(page.get("page")) is not int):
+            continue
+        try:
+            region = normalize_region(page.get("region"))
+        except ValueError:
+            continue
+        key = (page["source_ref"], page["page"])
+        if region is None or region == (0.0, 0.0, 1.0, 1.0):
+            provided.add(key)
+        else:
+            regions.append({"source_ref": key[0], "page": key[1], "region": list(region)})
     required, unlocated = set(), 0
     refs = record.get("image_refs") or record.get("asset_refs") or []
     for ref in refs:
@@ -47,11 +59,12 @@ def source_checks(record, *, sent_pages=(), source_ref_for_path=None):
             unlocated += 1
         required.update((source or "", number) for number in range(start, end + 1))
     received, pending = required & provided, required - provided
+    partial_regions = [region for region in regions if (region["source_ref"], region["page"]) in required]
     if not refs:
         image_state = "not_linked"
     elif not pending and not unlocated:
         image_state = "pages_provided"
-    elif received:
+    elif received or partial_regions:
         image_state = "partly_provided"
     else:
         image_state = "not_confirmed" if unlocated and provided else "not_provided"
@@ -63,6 +76,7 @@ def source_checks(record, *, sent_pages=(), source_ref_for_path=None):
             "proofreading_pending": review_pending, "review_status": record.get("review_status"),
             "related_images": {"status": image_state, "required_pages": page_rows(required),
                                "provided_pages": page_rows(received), "pending_pages": page_rows(pending),
+                               "provided_regions": partial_regions,
                                "unlocated_references": unlocated}}
 
 
@@ -85,13 +99,13 @@ def source_status_notice(record, checks, *, legacy_complete=False):
     if images["status"] != "not_linked":
         description = {
             "pages_provided": "关联规范附图原页已提供，图像识别未逐字核验",
-            "partly_provided": "关联规范附图仅部分原页已提供",
+            "partly_provided": "关联规范附图仅部分原页或局部区域已提供",
             "not_provided": "关联规范附图尚未读取",
             "not_confirmed": "关联规范附图的实际读取范围尚未确认",
         }[images["status"]]
         missing_numbers = sorted({page["page"] for page in images["pending_pages"]})
         if missing_numbers:
-            description += "（尚未提供物理第" + "、".join(map(str, missing_numbers)) + "页）"
+            description += "（尚未完整提供物理第" + "、".join(map(str, missing_numbers)) + "页）"
         pieces.append(description)
     if checks["proofreading_pending"]:
         pieces.append("文字校勘状态仍待确认；正文送达不代表OCR逐字无误")

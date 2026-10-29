@@ -9,12 +9,14 @@
     "binary_corpus",
     "binary_vectors"
   ],
-  "selection_note": "Independent public copy; source history and private resources are excluded.",
+  "selection_note": "Selected evolving implementation snapshot; source history, private resources, monitoring and backup automation are excluded.",
   "excluded_modules": [
     "conclusion_controls",
     "citation_recovery",
     "standard_relation_pilot",
-    "standard_business_validation"
+    "standard_business_validation",
+    "web.ops_monitor",
+    "web.local_backup"
   ],
   "files": [
     {
@@ -78,6 +80,12 @@
       "adapted": false
     },
     {
+      "path": "rag_arch/cloud_ocr.py",
+      "origin": "local-core/cloud_ocr.py",
+      "selection": "application-runtime-and-storage",
+      "adapted": true
+    },
+    {
       "path": "rag_arch/collection.py",
       "origin": "local-core/collection.py",
       "selection": "application-runtime-and-storage",
@@ -93,7 +101,7 @@
       "path": "rag_arch/document_pages.py",
       "origin": "local-core/document_pages.py",
       "selection": "application-runtime-and-storage",
-      "adapted": false
+      "adapted": true
     },
     {
       "path": "rag_arch/embedding_cache.py",
@@ -105,7 +113,7 @@
       "path": "rag_arch/evidence_index.py",
       "origin": "local-core/evidence_index.py",
       "selection": "application-runtime-and-storage",
-      "adapted": false
+      "adapted": true
     },
     {
       "path": "rag_arch/evidence_status.py",
@@ -129,7 +137,7 @@
       "path": "rag_arch/graph_agent.py",
       "origin": "local-core/graph_agent.py",
       "selection": "application-runtime-and-storage",
-      "adapted": false
+      "adapted": true
     },
     {
       "path": "rag_arch/json_output.py",
@@ -141,7 +149,7 @@
       "path": "rag_arch/loaders.py",
       "origin": "local-core/loaders.py",
       "selection": "application-runtime-and-storage",
-      "adapted": false
+      "adapted": true
     },
     {
       "path": "rag_arch/local_reranking.py",
@@ -153,7 +161,7 @@
       "path": "rag_arch/model_input_view.py",
       "origin": "local-core/model_input_view.py",
       "selection": "application-runtime-and-storage",
-      "adapted": false
+      "adapted": true
     },
     {
       "path": "rag_arch/models.py",
@@ -165,7 +173,19 @@
       "path": "rag_arch/multimodal.py",
       "origin": "local-core/multimodal.py",
       "selection": "application-runtime-and-storage",
+      "adapted": true
+    },
+    {
+      "path": "rag_arch/ocr_page_policy.py",
+      "origin": "local-core/ocr_page_policy.py",
+      "selection": "application-runtime-and-storage",
       "adapted": false
+    },
+    {
+      "path": "rag_arch/office_conversion.py",
+      "origin": "local-core/office_conversion.py",
+      "selection": "application-runtime-and-storage",
+      "adapted": true
     },
     {
       "path": "rag_arch/output_schemas.py",
@@ -186,10 +206,16 @@
       "adapted": false
     },
     {
+      "path": "rag_arch/page_regions.py",
+      "origin": "local-core/page_regions.py",
+      "selection": "application-runtime-and-storage",
+      "adapted": false
+    },
+    {
       "path": "rag_arch/page_sources.py",
       "origin": "local-core/page_sources.py",
       "selection": "application-runtime-and-storage",
-      "adapted": false
+      "adapted": true
     },
     {
       "path": "rag_arch/pdf_backend.py",
@@ -261,7 +287,7 @@
       "path": "rag_arch/plan_review_report.py",
       "origin": "local-core/plan_review_report.py",
       "selection": "application-runtime-and-storage",
-      "adapted": false
+      "adapted": true
     },
     {
       "path": "rag_arch/plan_review_runtime.py",
@@ -345,7 +371,7 @@
       "path": "rag_arch/runtime_audit.py",
       "origin": "local-core/runtime_audit.py",
       "selection": "application-runtime-and-storage",
-      "adapted": false
+      "adapted": true
     },
     {
       "path": "rag_arch/splitting.py",
@@ -381,7 +407,7 @@
       "path": "rag_arch/standard_tools.py",
       "origin": "local-core/standard_tools.py",
       "selection": "application-runtime-and-storage",
-      "adapted": false
+      "adapted": true
     },
     {
       "path": "rag_arch/standards.py",
@@ -420,6 +446,24 @@
       "adapted": false
     },
     {
+      "path": "rag_arch/visual_review_ledger.py",
+      "origin": "local-core/visual_review_ledger.py",
+      "selection": "application-runtime-and-storage",
+      "adapted": false
+    },
+    {
+      "path": "rag_arch/visual_review_policy.py",
+      "origin": "local-core/visual_review_policy.py",
+      "selection": "application-runtime-and-storage",
+      "adapted": false
+    },
+    {
+      "path": "rag_arch/visual_review_selection.py",
+      "origin": "local-core/visual_review_selection.py",
+      "selection": "application-runtime-and-storage",
+      "adapted": false
+    },
+    {
       "path": "rag_arch/web/__init__.py",
       "origin": "local-core/web/__init__.py",
       "selection": "application-runtime-and-storage",
@@ -429,7 +473,7 @@
       "path": "rag_arch/web/app.py",
       "origin": "local-core/web/app.py",
       "selection": "application-runtime-and-storage",
-      "adapted": false
+      "adapted": true
     },
     {
       "path": "rag_arch/web/auth.py",
@@ -459,7 +503,7 @@
       "path": "rag_arch/web/contracts.py",
       "origin": "local-core/web/contracts.py",
       "selection": "application-runtime-and-storage",
-      "adapted": false
+      "adapted": true
     },
     {
       "path": "rag_arch/web/db.py",
@@ -477,13 +521,13 @@
       "path": "rag_arch/web/document_routes.py",
       "origin": "local-core/web/document_routes.py",
       "selection": "application-runtime-and-storage",
-      "adapted": false
+      "adapted": true
     },
     {
       "path": "rag_arch/web/documents.py",
       "origin": "local-core/web/documents.py",
       "selection": "application-runtime-and-storage",
-      "adapted": false
+      "adapted": true
     },
     {
       "path": "rag_arch/web/events.py",
@@ -528,6 +572,18 @@
       "adapted": false
     },
     {
+      "path": "rag_arch/web/ocr_preparation.py",
+      "origin": "local-core/web/ocr_preparation.py",
+      "selection": "application-runtime-and-storage",
+      "adapted": true
+    },
+    {
+      "path": "rag_arch/web/page_region_query.py",
+      "origin": "local-core/web/page_region_query.py",
+      "selection": "application-runtime-and-storage",
+      "adapted": true
+    },
+    {
       "path": "rag_arch/web/persistent_tasks.py",
       "origin": "local-core/web/persistent_tasks.py",
       "selection": "application-runtime-and-storage",
@@ -537,7 +593,7 @@
       "path": "rag_arch/web/plan_runner.py",
       "origin": "local-core/web/plan_runner.py",
       "selection": "application-runtime-and-storage",
-      "adapted": false
+      "adapted": true
     },
     {
       "path": "rag_arch/web/readiness.py",
@@ -555,13 +611,13 @@
       "path": "rag_arch/web/standards_resources.py",
       "origin": "local-core/web/standards_resources.py",
       "selection": "application-runtime-and-storage",
-      "adapted": false
+      "adapted": true
     },
     {
       "path": "rag_arch/web/standards_routes.py",
       "origin": "local-core/web/standards_routes.py",
       "selection": "application-runtime-and-storage",
-      "adapted": false
+      "adapted": true
     },
     {
       "path": "rag_arch/web/standards_runner.py",

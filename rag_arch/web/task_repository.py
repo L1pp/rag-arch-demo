@@ -1331,6 +1331,142 @@ class TaskRepository:
             worker_instance, task_id, row["attempt_token"], proof,
         )
 
+    def recovery_tasks_for_worker(self, worker_instance: str) -> list[dict]:
+        """Return only execution identities needed by local recovery maintenance."""
+        worker_instance = _required_text(worker_instance, "worker_instance", 128)
+        with self.db.transaction() as connection:
+            rows = connection.execute(
+                "SELECT task_id, attempt_token, status FROM tasks WHERE worker_instance = %s "
+                "AND status IN ('running', 'cancelling', 'recovering') ORDER BY task_id",
+                (worker_instance,),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def isolate_confirmed_local_exit(self, worker_instance: str, task_id: str,
+                                    attempt_token: str, proof: dict, *,
+                                    cooldown_seconds: float = 120.0) -> bool:
+        """Fail an interrupted attempt after local exit, without claiming remote completion.
+
+        The caller must re-probe the exact local parent and children. The database
+        repeats all identity, resource, attempt and capacity checks atomically.
+        This is distinct from administrator resolution: remote work stays unknown,
+        no result is recovered, and no automatic retry is scheduled.
+        """
+        worker_instance = _required_text(worker_instance, "worker_instance", 128)
+        task_id = _required_text(task_id, "task_id", 128)
+        attempt_token = _required_text(attempt_token, "attempt_token", 128)
+        if (isinstance(cooldown_seconds, bool) or not isinstance(cooldown_seconds, (int, float))
+                or not math.isfinite(cooldown_seconds) or cooldown_seconds < 0):
+            raise ValueError("cooldown_seconds 必须是有限非负数。")
+        normalized, encoded = _json_normalize(proof)
+        keys = {"operator", "reason", "resolution_kind", "external_work_state",
+                "automatic_retry", "worker", "resources"}
+        if not isinstance(normalized, dict) or set(normalized) != keys:
+            raise ValueError("proof 字段不符合本机退出隔离契约。")
+        _required_text(normalized["operator"], "proof.operator", 255)
+        _required_text(normalized["reason"], "proof.reason", 2048)
+        if (normalized["resolution_kind"] != "local_exit_isolation"
+                or normalized["external_work_state"] != "unknown"
+                or normalized["automatic_retry"] is not False):
+            raise ValueError("本机退出隔离必须保留远端状态未知并禁用自动重试。")
+        parent = normalized["worker"]
+        if not isinstance(parent, dict) or set(parent) != {
+                "worker_instance", "host_id", "pid", "process_start_token"}:
+            raise ValueError("proof.worker 必须包含精确进程身份。")
+        if parent["worker_instance"] != worker_instance:
+            raise WorkerIdentityConflict("proof中的worker_instance与目标worker不匹配。")
+        _required_text(parent["host_id"], "proof.worker.host_id", 255)
+        _positive_int(parent["pid"], "proof.worker.pid")
+        _required_text(parent["process_start_token"], "proof.worker.process_start_token", 255)
+        if not isinstance(normalized["resources"], list):
+            raise ValueError("proof.resources 必须是数组。")
+        supplied_resources = {}
+        for resource in normalized["resources"]:
+            if not isinstance(resource, dict) or set(resource) != {
+                    "resource_id", "host_id", "pid", "process_start_token"}:
+                raise ValueError("proof.resources 必须包含精确资源身份。")
+            resource_id = _required_text(resource["resource_id"], "proof.resource_id", 128)
+            if resource_id in supplied_resources:
+                raise ValueError("proof.resources 存在重复resource_id。")
+            identity = (resource["host_id"], resource["pid"], resource["process_start_token"])
+            if identity != (None, None, None):
+                _required_text(resource["host_id"], "proof.resource.host_id", 255)
+                _positive_int(resource["pid"], "proof.resource.pid")
+                _required_text(resource["process_start_token"], "proof.resource.process_start_token", 255)
+            supplied_resources[resource_id] = identity
+
+        with self.db.transaction() as connection:
+            self._lock_scheduler(connection)
+            worker = self._lock_worker(connection, worker_instance)
+            metadata = connection.execute(
+                "SELECT user_id, workspace_id, assistant_id FROM tasks WHERE task_id = %s",
+                (task_id,),
+            ).fetchone()
+            if metadata is None:
+                return False
+            self._lock_workspace(connection, metadata["user_id"], metadata["workspace_id"])
+            slot = self._lock_slot(connection, metadata["user_id"], metadata["assistant_id"])
+            row = self._lock_task(connection, metadata["user_id"], task_id)
+            if (row is None or row["worker_instance"] != worker_instance
+                    or row["attempt_token"] != attempt_token):
+                return False
+            prior = connection.execute(
+                "SELECT proof FROM task_resolution_audit WHERE task_id = %s AND attempt_token = %s",
+                (task_id, attempt_token),
+            ).fetchone()
+            if row["status"] in TERMINAL_TASK_STATUSES:
+                return prior is not None and prior["proof"] == normalized
+            if row["status"] not in ACTIVE_EXECUTION_STATUSES or worker["state"] != "exited":
+                return False
+            expected_parent = (worker["host_id"], int(worker["pid"]), worker["process_start_token"])
+            if expected_parent != (parent["host_id"], parent["pid"], parent["process_start_token"]):
+                raise WorkerIdentityConflict("proof 中的worker身份与登记信息不匹配。")
+            now = _now()
+            if worker["exited_at"] is None or now < float(worker["exited_at"]) + cooldown_seconds:
+                return False
+            resources = connection.execute(
+                "SELECT resource_id, state, host_id, pid, process_start_token "
+                "FROM process_resources WHERE worker_instance = %s ORDER BY resource_id FOR UPDATE",
+                (worker_instance,),
+            ).fetchall()
+            if {item["resource_id"] for item in resources} != set(supplied_resources):
+                raise ResourceIdentityConflict("proof.resources 必须覆盖该worker的全部资源。")
+            for resource in resources:
+                if resource["state"] != "exited":
+                    return False
+                expected = (resource["host_id"], resource["pid"], resource["process_start_token"])
+                if expected != supplied_resources[resource["resource_id"]]:
+                    raise ResourceIdentityConflict("proof 中的资源身份与登记信息不匹配。")
+            if self._task_has_unconfirmed_recovery_resources(connection, task_id):
+                return False
+            if slot["active_task_id"] != task_id:
+                raise RuntimeError("恢复任务与 assistant_slots.active_task_id 不一致。")
+            status = "cancelled" if row["cancel_requested"] else "failed"
+            detail = "执行进程已退出，任务中断且不会自动重跑；远端调用结果未确认，排队名额已释放"
+            error = "任务执行中断，不会自动重跑；远端请求结果未确认，可能已产生 API 费用。请重新提交新任务。"
+            updated = connection.execute(
+                "UPDATE tasks SET status = %s, stage = %s, detail = %s, error = %s, result = NULL, "
+                "updated_at = %s, finished_at = %s, lease_until = NULL WHERE task_id = %s RETURNING *",
+                (status, status, detail, error, now, now, task_id),
+            ).fetchone()
+            connection.execute(
+                "UPDATE assistant_slots SET active_task_id = NULL, updated_at = %s "
+                "WHERE user_id = %s AND assistant_id = %s AND active_task_id = %s",
+                (now, metadata["user_id"], metadata["assistant_id"], task_id),
+            )
+            connection.execute(
+                "INSERT INTO task_resolution_audit(worker_instance, task_id, attempt_token, "
+                "terminal_status, proof, created_at) VALUES (%s, %s, %s, %s, %s::jsonb, %s)",
+                (worker_instance, task_id, attempt_token, status, encoded, now),
+            )
+            connection.execute(
+                "UPDATE process_resource_uses SET released_at = GREATEST(COALESCE(released_at, %s), acquired_at) "
+                "WHERE task_id = %s AND attempt_token = %s",
+                (now, task_id, attempt_token),
+            )
+            self._append_task_event(connection, updated)
+            return True
+
     def claim_next(self, worker_instance: str) -> dict | None:
         worker_instance = _required_text(worker_instance, "worker_instance", 128)
         with self.db.transaction() as connection:
@@ -1641,22 +1777,28 @@ class TaskRepository:
                     continue
                 inputs = row["inputs"] or {}
                 if inputs.get("simulation") is not True:
+                    detail = "worker 父进程已确认退出，但模型调用或子进程状态未核验，任务槽仍保留"
+                    if (row["status"] == "recovering" and row["detail"] == detail
+                            and row["lease_until"] is None):
+                        continue
                     now = _now()
                     updated = connection.execute(
                         "UPDATE tasks SET status = 'recovering', stage = 'recovering', detail = %s, "
                         "updated_at = %s, lease_until = NULL WHERE task_id = %s RETURNING *",
-                        ("worker 父进程已确认退出，但模型调用或子进程状态未核验，任务槽仍保留",
-                         now, row["task_id"]),
+                        (detail, now, row["task_id"]),
                     ).fetchone()
                     self._append_task_event(connection, updated)
                     continue
                 if self._task_has_unconfirmed_recovery_resources(connection, row["task_id"]):
+                    detail = "旧worker已退出，但该任务仍关联未确认退出的资源；任务槽仍保留"
+                    if (row["status"] == "recovering" and row["detail"] == detail
+                            and row["lease_until"] is None):
+                        continue
                     now = _now()
                     updated = connection.execute(
                         "UPDATE tasks SET status = 'recovering', stage = 'recovering', detail = %s, "
                         "updated_at = %s, lease_until = NULL WHERE task_id = %s RETURNING *",
-                        ("旧worker已退出，但该任务仍关联未确认退出的资源；任务槽仍保留",
-                         now, row["task_id"]),
+                        (detail, now, row["task_id"]),
                     ).fetchone()
                     self._append_task_event(connection, updated)
                     continue
@@ -1687,7 +1829,7 @@ class TaskRepository:
                 self._append_task_event(connection, updated)
                 recovered.append(row["task_id"])
             connection.execute(
-                "UPDATE worker_instances SET state = 'exited', exited_at = %s, stale_at = COALESCE(stale_at, %s) "
+                "UPDATE worker_instances SET state = 'exited', exited_at = COALESCE(exited_at, %s), stale_at = COALESCE(stale_at, %s) "
                 "WHERE worker_instance = %s",
                 (_now(), _now(), worker_instance),
             )

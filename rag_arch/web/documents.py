@@ -25,7 +25,7 @@ from ..collection import (DIRECT_TEXT_MAX_TOKENS, UploadCollection, build_collec
                           extracted_text_tokens)
 from ..config import ROOT
 from ..document_pages import SUPPORTED_SUFFIXES
-from ..loaders import load_document, validate_upload_sizes
+from ..loaders import _upload_name_kind, load_document, validate_upload_sizes
 from ..page_sources import PageSources, plan_page_sources
 from ..retrieval import LocalIndex
 from ..plan_documents import (
@@ -37,6 +37,29 @@ from ..plan_documents import (
 
 
 REGISTERED_PLAN_IDS = ("P01", "P02", "R01")
+
+
+def _document_cache_weight(document, original_bytes=0) -> int:
+    """Conservative text/object estimate, including OCR expansion of small PDFs."""
+    weight = 4096
+    for unit in getattr(document, "units", ()):
+        body = unit.get("text", "") if isinstance(unit, dict) else getattr(unit, "text", "")
+        locator = unit.get("locator", {}) if isinstance(unit, dict) else getattr(unit, "locator", {})
+        weight += len(body) * 4 + 4096
+        weight += len(json.dumps(locator, ensure_ascii=False, default=str)) * 4
+    weight += sum(len(str(note)) * 4 for note in getattr(document, "warnings", ()))
+    weight += len(json.dumps(getattr(document, "ocr_pages", []), ensure_ascii=False, default=str)) * 4
+    return max(1, original_bytes * 4, weight)
+
+
+def _chat_cache_weight(prepared, original_bytes=0) -> int:
+    collection = prepared.collection
+    weight = sum(_document_cache_weight(doc) for doc in getattr(collection, "documents", ()))
+    # Count retained retrieval chunks conservatively even if some strings share
+    # storage with source units. The LRU estimate is not a process RSS promise.
+    weight += sum(len(getattr(chunk, "text", "")) * 4 + 4096
+                  for chunk in getattr(collection, "chunks", ()))
+    return max(1, original_bytes * 8, weight)
 
 
 @dataclass
@@ -121,7 +144,8 @@ class DocumentStore:
                  pdf_backend=None, *, user_id: int | None = None, database=None,
                  direct_text_max_tokens: int = DIRECT_TEXT_MAX_TOKENS,
                  cache_max_entries: int = 64,
-                 cache_max_bytes: int = 64 * 1024 * 1024):
+                 cache_max_bytes: int = 64 * 1024 * 1024,
+                 ocr_client=None):
         if type(direct_text_max_tokens) is not int or direct_text_max_tokens < 0:
             raise ValueError("direct_text_max_tokens须为不小于0的整数。")
         if type(cache_max_entries) is not int or cache_max_entries < 1:
@@ -137,6 +161,9 @@ class DocumentStore:
         self.user_id = user_id
         self.database = database
         self.pdf_backend = pdf_backend
+        # Only the durable worker injects this capability. API/preview stores
+        # keep None even when the server OCR feature flag is enabled.
+        self.ocr_client = ocr_client
         self.direct_text_max_tokens = direct_text_max_tokens
         self.cache_max_entries = cache_max_entries
         self.cache_max_bytes = cache_max_bytes
@@ -422,8 +449,12 @@ class DocumentStore:
         validate_upload_sizes((len(payload),))
         if not payload:
             raise ValueError("文件为空，或上传内容不是字节数据。")
-        if Path(name).suffix.lower() not in {".pdf", ".docx", ".txt", ".md"}:
-            raise ValueError("目前支持 PDF、DOCX、TXT 和 MD 文字文件。")
+        if Path(name).suffix.lower() not in {".pdf", ".doc", ".docx", ".txt", ".md"}:
+            raise ValueError("目前支持 PDF、DOC、DOCX、TXT 和 MD 文字文件。")
+        if Path(name).suffix.lower() == ".doc":
+            # Reject a mislabeled file before persisting the original. The
+            # converter also validates the actual Word document on opening.
+            _upload_name_kind(name, payload)
 
         asset_id = uuid4().hex
         path = self._private_path(asset_id, name)
@@ -551,7 +582,23 @@ class DocumentStore:
         except OSError as exc:
             raise ValueError("上传文件已不可用，请重新上传。") from exc
 
+    def _normalized_docx(self, record: UploadAsset) -> Path:
+        """Share a legacy DOC's normalized file with its page service."""
+        from ..office_conversion import OfficeConverter
+        source = self._record_path(record)
+        target = source.with_name("normalized.docx")
+        OfficeConverter(self.root).ensure_docx(source, target)
+        return target
+
     def _parse_upload(self, record: UploadAsset, data: bytes):
+        if Path(record.filename).suffix.lower() == ".doc":
+            normalized = self._normalized_docx(record)
+            try:
+                converted = normalized.read_bytes()
+            except OSError as exc:
+                raise ValueError("DOC 转换后的文件暂不可读取。") from exc
+            return load_document(record.filename, data, pdf_backend=self.pdf_backend,
+                                 normalized_docx=converted)
         return load_document(record.filename, data, pdf_backend=self.pdf_backend)
 
     def load(self, asset_id: str):
@@ -559,10 +606,20 @@ class DocumentStore:
         record = self.get(asset_id)
         def build():
             data, _ = self._load_bytes(record)
-            return self._parse_upload(record, data)
+            loaded = self._parse_upload(record, data)
+            if self.ocr_client is not None and loaded.source_kind in {"pdf", "doc", "docx"}:
+                from .ocr_preparation import OCRDocumentUnreadable, supplement_document
+                pages = self.pages_for_asset(asset_id)
+                if pages is not None:
+                    loaded = supplement_document(
+                        loaded, pages, f"upload:{asset_id}", self.ocr_client,
+                        record.path.parent / "ocr")
+                    if not loaded.units and loaded.ocr_pages:
+                        raise OCRDocumentUnreadable(loaded.ocr_pages, source_kind=loaded.source_kind)
+            return loaded
 
         return self._memoized("loaded", asset_id, build,
-                              lambda _: max(1, record.size_bytes * 4))
+                              lambda value: _document_cache_weight(value, record.size_bytes))
 
     def _build_collection(self, records: list[UploadAsset], embeddings=None,
                           *, loaded_documents=None):
@@ -579,9 +636,11 @@ class DocumentStore:
         for record in records:
             if Path(record.filename).suffix.lower() not in SUPPORTED_SUFFIXES:
                 continue
+            normalized = (self._normalized_docx(record)
+                          if Path(record.filename).suffix.lower() == ".doc" else None)
             service.add(f"upload:{record.asset_id}", record.filename,
                         source_kind="upload", path=record.path,
-                        asset_id=record.asset_id)
+                        normalized_docx_path=normalized, asset_id=record.asset_id)
         return service
 
     def prepare_chat(self, attachment_ids: Iterable[str] | str,
@@ -632,7 +691,7 @@ class DocumentStore:
             return prepared
 
         return self._memoized("chat", key, build,
-                              lambda _: max(1, sum(record.size_bytes for record in records) * 8))
+                              lambda value: _chat_cache_weight(value, sum(record.size_bytes for record in records)))
 
     async def aprepare_chat(self, attachment_ids: Iterable[str] | str,
                             *, embeddings=None, embeddings_factory=None) -> PreparedChat:
@@ -688,7 +747,7 @@ class DocumentStore:
 
         return await self._amemoized(
             "chat", key, build,
-            lambda _: max(1, sum(record.size_bytes for record in records) * 8))
+            lambda value: _chat_cache_weight(value, sum(record.size_bytes for record in records)))
 
     def pages_for_asset(self, asset_id: str):
         """Return the cached single-upload page service, if it is pageable."""
@@ -699,8 +758,11 @@ class DocumentStore:
         def build():
             service = PageSources(self.root, collection_id=f"upload:{asset_id}",
                                   pdf_backend=self.pdf_backend)
+            normalized = (self._normalized_docx(record)
+                          if Path(record.filename).suffix.lower() == ".doc" else None)
             service.add(f"upload:{asset_id}", record.filename,
-                        source_kind="upload", path=record.path, asset_id=asset_id)
+                        source_kind="upload", path=record.path,
+                        normalized_docx_path=normalized, asset_id=asset_id)
             return service
 
         return self._memoized("asset_pages", asset_id, build,
@@ -753,7 +815,7 @@ class DocumentStore:
                 return PlanContext(document, asset, context_id)
 
             return self._memoized("plan", key, build_registered,
-                                  lambda _: 4096)
+                                  lambda value: _document_cache_weight(value.document))
         else:
             if len(ids) != 1:
                 raise ValueError("方案上传只支持一个附件。")
@@ -764,11 +826,13 @@ class DocumentStore:
             def build_uploaded():
                 asset = {"filename": record.filename, "path": str(record.path)}
                 document = self._uploaded_plan(asset_id, record)
+                if Path(record.filename).suffix.lower() == ".doc":
+                    asset["normalized_docx_path"] = str(self._normalized_docx(record))
                 context_id = f"plan:{document.document_id}:{document.source_revision}"
                 return PlanContext(document, asset, context_id)
 
             return self._memoized("plan", key, build_uploaded,
-                                  lambda _: max(1, record.size_bytes * 4))
+                                  lambda value: _document_cache_weight(value.document, record.size_bytes))
 
     def pages_for_plan(self, document: PlanDocument, asset: dict[str, Any], corpus=None):
         path = str(asset.get("path") or "")

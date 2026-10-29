@@ -74,7 +74,14 @@ jobs:
         working-directory: frontend
         run: npm run build
 
+      - name: Install Linux document renderer and CJK fonts
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libreoffice-writer fonts-noto-cjk
+
       - name: Test backend
+        env:
+          RAG_ARCH_TEST_LIBREOFFICE: "1"
         run: python -m unittest discover tests
 
       - name: Scan tracked public files

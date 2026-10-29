@@ -10,7 +10,6 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from datetime import datetime, timezone
-import hashlib
 import json
 import math
 import os
@@ -33,7 +32,6 @@ _CURRENT_RE = re.compile(r"^v1-[0-9a-f]{32}$")
 _SOURCE_KEYS = {"schema_version", "identity", "vector_dimensions", "documents", "queries"}
 _IDENTITY_KEYS = {"base_url", "model", "dimensions"}
 _GROUP_KEYS = {"documents", "queries"}
-_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 
 
 class BinaryVectorStoreError(ValueError):
@@ -131,18 +129,6 @@ def _is_symlink_or_junction(path: Path) -> bool:
     return path.is_symlink() or (callable(is_junction) and bool(is_junction()))
 
 
-def _sha256_file(path: Path) -> str:
-    """Checksum one derived binary package file with bounded memory."""
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        while True:
-            block = handle.read(1024 * 1024)
-            if not block:
-                break
-            digest.update(block)
-    return digest.hexdigest()
-
-
 def _fsync_directory(path: Path) -> None:
     # Directory fsync is available on POSIX; Windows does not expose a portable
     # equivalent through Python. Data files and CURRENT itself are fsynced on
@@ -161,17 +147,15 @@ def _fsync_directory(path: Path) -> None:
         os.close(descriptor)
 
 
-def _stat_snapshot(path: Path) -> dict[str, int]:
+def _check_source_file(path: Path) -> None:
     try:
-        stat = path.stat()
+        path.stat()
         regular_file = path.is_file()
         is_symlink = path.is_symlink()
     except OSError as exc:
         raise BinaryVectorStoreError("源embedding缓存缺失或无法读取stat信息。") from exc
     if not regular_file or is_symlink:
         raise BinaryVectorStoreError("源embedding缓存必须是普通文件，不可为符号链接。")
-    return {"device": int(stat.st_dev), "inode": int(stat.st_ino),
-            "size_bytes": int(stat.st_size), "mtime_ns": int(stat.st_mtime_ns)}
 
 
 def _current_version(output_root: Path) -> str:
@@ -463,7 +447,7 @@ def convert_core_vectors(source_json: str | Path, output_root: str | Path, *,
     numpy_dtype = np.dtype(dtype)
     source = Path(source_json)
     root = Path(output_root)
-    source_stat_before = _stat_snapshot(source)
+    _check_source_file(source)
     # Vector conversion is an explicit offline job. Keep its established
     # text->row lookup, while the runtime open path below remains lazy.
     rows = _effective_chunks(chunks, materialize_lazy=True)
@@ -529,16 +513,12 @@ def convert_core_vectors(source_json: str | Path, output_root: str | Path, *,
         if (written_metadata["actual_dimensions"] != actual_dimensions
                 or written_metadata["matched_texts"] != set(rows_by_text)):
             raise BinaryVectorStoreError("源缓存两次读取结果不一致，拒绝发布。")
-        source_stat_after = _stat_snapshot(source)
-        if source_stat_before != source_stat_after:
-            raise BinaryVectorStoreError("转换期间源embedding缓存被替换或修改，拒绝发布。")
         matrix.flush()
         matrix._mmap.close()
         del matrix
         matrix = None
         vectors_path = temporary / "vectors.npy"
         _fsync_file(vectors_path)
-        vectors_sha256 = _sha256_file(vectors_path)
 
         metadata_path = temporary / "metadata.jsonl"
         with metadata_path.open("x", encoding="utf-8", newline="\n") as handle:
@@ -563,8 +543,6 @@ def convert_core_vectors(source_json: str | Path, output_root: str | Path, *,
             "source_schema_version": _SOURCE_SCHEMA_VERSION,
             "source_name": source.name,
             "source_is_output_sibling": source.parent.resolve() == root.parent.resolve(),
-            "source_stat_before": source_stat_before,
-            "source_stat_after": source_stat_after,
             "source_vector_dimensions": written_metadata["declared_dimensions"],
             "source_document_records_scanned": written_metadata["document_records"],
             "source_query_records_scanned": written_metadata["query_records"],
@@ -572,7 +550,6 @@ def convert_core_vectors(source_json: str | Path, output_root: str | Path, *,
             "row_ids": row_ids,
             "vector_bytes": vector_bytes,
             "vectors_file_bytes": vectors_path.stat().st_size,
-            "vectors_sha256": vectors_sha256,
             "metadata_bytes": metadata_path.stat().st_size,
         }
         manifest_path = temporary / "manifest.json"
@@ -612,8 +589,19 @@ def convert_core_vectors(source_json: str | Path, output_root: str | Path, *,
             del matrix
         if temporary.exists():
             try:
-                shutil.rmtree(temporary)
-            except OSError:
+                # A build may have failed after the directory was redirected.
+                # Only remove the original direct child of the verified root.
+                if (not any(_is_symlink_or_junction(path)
+                            for path in (root, versions, temporary))
+                        and re.fullmatch(r"\.tmp-[0-9a-f]{32}", temporary.name)):
+                    current_root = root.resolve(strict=True)
+                    current_versions = versions.resolve(strict=True)
+                    resolved_temporary = temporary.resolve(strict=True)
+                    if (current_root == root_resolved
+                            and current_versions == versions_resolved
+                            and resolved_temporary.parent == versions_resolved):
+                        shutil.rmtree(temporary)
+            except (OSError, ValueError):
                 # An incomplete unpublished directory is harmless and is never
                 # selected by CURRENT. Do not touch any previous version.
                 pass
@@ -695,26 +683,17 @@ class BinaryVectorStore:
                 or manifest.get("source_schema_version") != _SOURCE_SCHEMA_VERSION):
             raise BinaryVectorStoreError("向量manifest格式、版本或embedding identity不匹配。")
         source_name = manifest.get("source_name")
-        source_before = manifest.get("source_stat_before")
-        source_after = manifest.get("source_stat_after")
         if (not isinstance(source_name, str) or not source_name
                 or Path(source_name).name != source_name
                 or "/" in source_name or "\\" in source_name or ":" in source_name
-                or not isinstance(source_before, dict) or not isinstance(source_after, dict)
-                or source_before != source_after
-                or type(manifest.get("source_is_output_sibling")) is not bool
-                or set(source_before) != {"device", "inode", "size_bytes", "mtime_ns"}
-                or any(type(value) is not int or value < 0 for value in source_before.values())):
-            raise BinaryVectorStoreError("manifest源缓存stat信息无效。")
+                or type(manifest.get("source_is_output_sibling")) is not bool):
+            raise BinaryVectorStoreError("manifest源缓存信息无效。")
         if manifest.get("source_is_output_sibling") is True:
             sibling_source = root.parent / source_name
             if sibling_source.exists() or _is_symlink_or_junction(sibling_source):
                 if _is_symlink_or_junction(sibling_source):
                     raise BinaryVectorStoreError("同目录源embedding缓存不得为符号链接。")
-                sibling_stat = _stat_snapshot(sibling_source)
-                if (sibling_stat["size_bytes"] != source_after["size_bytes"]
-                        or sibling_stat["mtime_ns"] != source_after["mtime_ns"]):
-                    raise BinaryVectorStoreError("同目录core_embeddings.json已变化；请重新转换二进制向量。")
+                _check_source_file(sibling_source)
         dtype_name = manifest.get("dtype")
         if dtype_name not in {"float64", "float32"}:
             raise BinaryVectorStoreError("向量manifest dtype无效。")
@@ -746,13 +725,10 @@ class BinaryVectorStore:
                 raise BinaryVectorStoreError("向量实际维度与当前embedding identity不匹配。")
             expected_bytes = len(rows) * dimensions * dtype.itemsize
             vectors_file_bytes = manifest.get("vectors_file_bytes")
-            vectors_sha256 = manifest.get("vectors_sha256")
             if (type(manifest.get("vector_bytes")) is not int
                     or manifest["vector_bytes"] != expected_bytes
                     or type(vectors_file_bytes) is not int
                     or vectors_file_bytes != vectors_path.stat().st_size
-                    or not isinstance(vectors_sha256, str)
-                    or not _SHA256_RE.fullmatch(vectors_sha256)
                     or vectors_path.stat().st_size < expected_bytes):
                 raise BinaryVectorStoreError("vectors.npy文件长度与manifest不匹配。")
             metadata_bytes = metadata_path.stat().st_size
@@ -790,17 +766,13 @@ class BinaryVectorStore:
                 raise BinaryVectorStoreError("vectors.npy header长度与文件长度不一致。")
             # Scan with a small bounded block so silent file corruption (NaN,
             # Inf, zero rows, or broken normalization) fails closed at startup.
-            # Hash the NPY header and each matrix block in this same pass.
             block_rows = 256
-            digest = hashlib.sha256()
             with vectors_path.open("rb") as vector_file:
                 header = vector_file.read(vectors.offset)
             if len(header) != vectors.offset:
                 raise BinaryVectorStoreError("vectors.npy header被截断。")
-            digest.update(header)
             for start in range(0, len(rows), block_rows):
                 block = np.asarray(vectors[start:start + block_rows])
-                digest.update(memoryview(block).cast("B"))
                 if not np.isfinite(block).all():
                     raise BinaryVectorStoreError("vectors.npy包含非有限值。")
                 with np.errstate(over="ignore", invalid="ignore"):
@@ -809,8 +781,6 @@ class BinaryVectorStore:
                 if (not np.isfinite(norms).all() or np.any(norms == 0)
                         or not np.allclose(norms, 1.0, rtol=tolerance, atol=tolerance)):
                     raise BinaryVectorStoreError("vectors.npy包含零向量或未归一化行。")
-            if digest.hexdigest() != vectors_sha256:
-                raise BinaryVectorStoreError("vectors.npy SHA256校验失败。")
             store = cls(version_dir, vectors, row_by_chunk_id, manifest)
             vectors = None  # ownership moved to the returned store
             return store

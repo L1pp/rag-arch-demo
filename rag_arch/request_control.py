@@ -10,6 +10,10 @@ from contextvars import ContextVar
 _request_control = ContextVar("rag_request_control", default=None)
 
 
+class RequestControlError(RuntimeError):
+    """A control-plane failure is a stop signal, never a read fallback."""
+
+
 @contextmanager
 def request_control_scope(callback):
     if not callable(callback):

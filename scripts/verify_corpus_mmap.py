@@ -11,7 +11,6 @@ import argparse
 from contextlib import contextmanager
 import copy
 import gc
-import hashlib
 import json
 import math
 import multiprocessing as mp
@@ -231,14 +230,6 @@ def _write_synthetic_corpus(corpus_dir: str | Path, *, filler_count: int = 128) 
     return directory
 
 
-def _source_snapshot(directory: Path) -> dict:
-    return {
-        name: (_bm25._source_snapshot(directory / name)
-               if (directory / name).is_file() else None)
-        for name in _SOURCE_NAMES
-    }
-
-
 def _iter_source_records(path: Path):
     with path.open("r", encoding="utf-8") as stream:
         for line_number, line in enumerate(stream, 1):
@@ -247,11 +238,6 @@ def _iter_source_records(path: Path):
                 if not isinstance(value, dict):
                     raise ValueError(f"{path.name}:{line_number} must contain JSON objects")
                 yield value
-
-
-def _canonical_json(value) -> bytes:
-    return json.dumps(value, ensure_ascii=False, allow_nan=False,
-                      sort_keys=True, separators=(",", ":")).encode("utf-8")
 
 
 def _chunk_payload(chunk) -> dict:
@@ -275,10 +261,6 @@ def _retrieval_payload(result) -> dict:
         "context_hits": [_hit_payload(hit) for hit in result.context_hits],
         "missing_evidence": copy.deepcopy(result.missing_evidence),
     }
-
-
-def _digest(value) -> str:
-    return hashlib.sha256(_canonical_json(value)).hexdigest()
 
 
 def _compare_records_and_chunks(source_dir: Path, store: BinaryCorpusStore) -> dict:
@@ -351,19 +333,19 @@ def _semantic_snapshot(index: EvidenceIndex, queries: list[str]) -> dict:
     for query in queries:
         key = _bm25._query_id(query)
         values = np.asarray(index.local._bm25_scores(query), dtype="<f8")
-        scores[key] = hashlib.sha256(values.tobytes()).hexdigest()
-        bm25_top30[key] = _digest(_retrieval_payload(index.retrieve(
-            query, mode="bm25", top_k=30)))
-        rrf_top8[key] = _digest(_retrieval_payload(index.retrieve(
-            query, mode="rrf", top_k=8)))
+        scores[key] = [float(value).hex() for value in values]
+        bm25_top30[key] = _retrieval_payload(index.retrieve(
+            query, mode="bm25", top_k=30))
+        rrf_top8[key] = _retrieval_payload(index.retrieve(
+            query, mode="rrf", top_k=8))
 
     for query in _BOUNDARY_QUERIES:
         key = _bm25._query_id(query)
         values = np.asarray(index.local._bm25_scores(query), dtype="<f8")
         boundaries[key] = {
-            "score_array_sha256": hashlib.sha256(values.tobytes()).hexdigest(),
-            "top30_result_sha256": _digest(_retrieval_payload(index.retrieve(
-                query, mode="bm25", top_k=30))),
+            "score_array": [float(value).hex() for value in values],
+            "top30_result": _retrieval_payload(index.retrieve(
+                query, mode="bm25", top_k=30)),
         }
 
     metadata = getattr(index.chunks, "metadata", None)
@@ -375,15 +357,15 @@ def _semantic_snapshot(index: EvidenceIndex, queries: list[str]) -> dict:
         {"document_part": "body"},
     ]
     for query in queries[:3]:
-        for filters in filter_cases:
-            case = f"{_bm25._query_id(query)}:{_digest(filters)[:12]}"
-            filtered[case] = _digest(_retrieval_payload(index.retrieve(
-                query, mode="rrf", top_k=8, filters=filters)))
+        for number, filters in enumerate(filter_cases, 1):
+            case = f"{_bm25._query_id(query)}:filter-{number}"
+            filtered[case] = _retrieval_payload(index.retrieve(
+                query, mode="rrf", top_k=8, filters=filters))
     return {
-        "bm25_score_array_sha256": scores,
-        "bm25_top30_full_hits_sha256": bm25_top30,
-        "rrf_top8_full_hits_sha256": rrf_top8,
-        "filtered_rrf_expansion_sha256": filtered,
+        "bm25_score_arrays": scores,
+        "bm25_top30_full_hits": bm25_top30,
+        "rrf_top8_full_hits": rrf_top8,
+        "filtered_rrf_expansion": filtered,
         "six_boundary_probes": boundaries,
     }
 
@@ -541,17 +523,13 @@ def _offline_network_scope():
 
 
 def _real_source_equivalence(args) -> dict:
-    before = _source_snapshot(args.corpus_dir)
     store = BinaryCorpusStore.open(
         args.core_corpus_dir, source_dir=args.corpus_dir,
         cache_bytes=args.corpus_cache_bytes)
     try:
         comparison = _compare_records_and_chunks(args.corpus_dir, store)
-        if _source_snapshot(args.corpus_dir) != before:
-            raise AssertionError("JSON source files changed while comparing corpus mmap")
         comparison.update({
             "stage": "corpus_equivalence",
-            "source_file_stats_unchanged": True,
             "comparison_strategy": (
                 "one source JSON record and one mapped record/chunk at a time; "
                 "no corpus-sized verification copy"),
@@ -645,7 +623,7 @@ def _semantic_backend(args, backend: str, queries: list[str],
 def _semantic_stage(args) -> dict:
     memory_budget = _bm25._check_memory_budget(
         1, args.memory_per_worker_gib, args.reserve_gib)
-    identity, query_vectors, cache_before = _bm25._load_full_queries(
+    identity, query_vectors = _bm25._load_full_queries(
         SimpleNamespace(embedding_cache=args.embedding_cache))
     if len(query_vectors) != _EXPECTED_CACHED_QUERY_COUNT:
         raise AssertionError(
@@ -653,12 +631,8 @@ def _semantic_stage(args) -> dict:
             f"found {len(query_vectors)}")
     queries = list(query_vectors)
     expected_requests = len(queries) + len(queries[:3]) * 3
-    source_before = _source_snapshot(args.corpus_dir)
     json_result = _semantic_backend(args, "json", queries, query_vectors, identity)
     mmap_result = _semantic_backend(args, "mmap", queries, query_vectors, identity)
-    if (_source_snapshot(args.corpus_dir) != source_before
-            or _bm25._source_snapshot(args.embedding_cache) != cache_before):
-        raise AssertionError("corpus or core embedding source stats changed during verification")
     if json_result["retrieval"] != mmap_result["retrieval"]:
         raise AssertionError("JSON and mmap corpus BM25/RRF/full-hit results differ")
     for result in (json_result, mmap_result):
@@ -678,21 +652,18 @@ def _semantic_stage(args) -> dict:
             "mmap": mmap_result["cached_query_vector_lookups"],
         },
         "boundary_probe_count": len(_BOUNDARY_QUERIES),
-        "source_file_stats_unchanged": True,
-        "embedding_cache_stats_unchanged": True,
         "query_vectors_streamed_only": True,
         "document_embedding_requests": 0,
         "real_model_requests": 0,
         "external_network_requests": 0,
         "full_hits_text_locator_and_expansion_equal": True,
         "bm25_score_arrays_top30_filters_and_rrf_top8_equal": True,
-        "comparison_sha256": _digest(json_result["retrieval"]),
         "mapped_corpus_runtime_stats": mmap_result["corpus_runtime_stats"],
     }
 
 
-def _result_digest(result) -> str:
-    return _digest(_retrieval_payload(result))
+def _result_snapshot(result) -> dict:
+    return _retrieval_payload(result)
 
 
 def _load_worker_corpus(backend: str, source_dir: str | Path,
@@ -713,9 +684,10 @@ def _corpus_worker_entry(connection, *, backend: str, source_dir: str,
                          core_corpus_dir: str, bm25_dir: str, vector_dir: str,
                          identity: dict, query_vectors: dict[str, list[float]],
                          queries: list[str], repeats: int, corpus_cache_bytes: int,
-                         expected: dict[str, str] | None) -> None:
+                         expected: dict[str, dict] | None) -> None:
     """Spawn target: wait for all peers before real EvidenceIndex retrieval."""
     _bm25._disable_external_network()
+    _bm25._set_query_ids(queries)
     store = vector_store = index = provider = None
     try:
         started = time.perf_counter()
@@ -767,7 +739,7 @@ def _corpus_worker_entry(connection, *, backend: str, source_dir: str,
             raise RuntimeError("parent did not release query barrier")
 
         query_started = time.perf_counter()
-        digests = {}
+        snapshots = {}
         query_latencies = {}
         mismatch_query_ids = []
         for _ in range(repeats):
@@ -775,11 +747,11 @@ def _corpus_worker_entry(connection, *, backend: str, source_dir: str,
                 call_started = time.perf_counter()
                 result = index.retrieve(query, mode="bm25", top_k=8)
                 query_id = _bm25._query_id(query)
-                digest = _result_digest(result)
+                snapshot = _result_snapshot(result)
                 query_latencies.setdefault(query_id, []).append(
                     time.perf_counter() - call_started)
-                digests.setdefault(query_id, []).append(digest)
-                if expected is not None and digest != expected.get(query_id):
+                snapshots.setdefault(query_id, []).append(snapshot)
+                if expected is not None and snapshot != expected.get(query_id):
                     mismatch_query_ids.append(query_id)
         query_seconds = time.perf_counter() - query_started
         cached_query_vector_lookups = provider.query_requests
@@ -802,7 +774,7 @@ def _corpus_worker_entry(connection, *, backend: str, source_dir: str,
             "query_count": len(queries) * repeats,
             "query_seconds": query_seconds,
             "query_latencies_seconds": query_latencies,
-            "result_digests": digests,
+            "result_snapshots": snapshots,
             "mismatch_query_ids": mismatch_query_ids,
             "cached_query_vector_lookups": cached_query_vector_lookups,
             "document_embedding_requests": document_embedding_requests,
@@ -943,18 +915,18 @@ def _run_corpus_group(args, *, backend, worker_count, queries,
         query_phase_seconds = time.perf_counter() - query_phase_started
         workers = [results[position] for position in range(worker_count)]
         expected_per_query = expected or {
-            query_id: digests[0]
-            for query_id, digests in workers[0]["result_digests"].items()
+            query_id: snapshots[0]
+            for query_id, snapshots in workers[0]["result_snapshots"].items()
         }
         mismatches = []
         for worker in workers:
             mismatches.extend(worker["mismatch_query_ids"])
-            for query_id, digests in worker["result_digests"].items():
-                if any(value != expected_per_query.get(query_id) for value in digests):
+            for query_id, snapshots in worker["result_snapshots"].items():
+                if any(value != expected_per_query.get(query_id) for value in snapshots):
                     mismatches.append(query_id)
         if mismatches:
             raise AssertionError(
-                "EvidenceIndex.retrieve JSON/mmap result digests differ for query IDs: "
+                "EvidenceIndex.retrieve JSON/mmap results differ for query IDs: "
                 + ",".join(sorted(set(mismatches)))
             )
         query_latency_values = []
@@ -974,6 +946,8 @@ def _run_corpus_group(args, *, backend, worker_count, queries,
                 "p95_seconds": float(np.percentile(values, 95)),
             }
 
+        for worker in workers:
+            worker.pop("result_snapshots", None)
         return {
             "backend": backend,
             "worker_count": worker_count,
@@ -995,7 +969,7 @@ def _run_corpus_group(args, *, backend, worker_count, queries,
                 worker["cached_query_vector_lookups"] for worker in workers),
             "real_model_requests": 0,
             "external_network_requests": 0,
-            "retrieve_plus_digest_latency_seconds": {
+            "retrieve_plus_snapshot_latency_seconds": {
                 **latency_summary(query_latency_values),
                 "per_query_id": {
                     query_id: latency_summary(values)
@@ -1003,6 +977,7 @@ def _run_corpus_group(args, *, backend, worker_count, queries,
                 },
             },
             "all_results_match_json_baseline": True,
+            "_reference_snapshots": expected_per_query if expected is None else None,
             "all_workers_exited_before_group_return": True,
             "barrier_released_after_all_workers_ready": True,
             "workers": workers,
@@ -1023,13 +998,12 @@ def _run_corpus_group(args, *, backend, worker_count, queries,
 
 def _concurrency_stage(args) -> dict:
     memory_preflights = []
-    identity, query_vectors, embedding_source_before = _bm25._load_full_queries(
+    identity, query_vectors = _bm25._load_full_queries(
         SimpleNamespace(embedding_cache=args.embedding_cache))
     if len(query_vectors) != _EXPECTED_CACHED_QUERY_COUNT:
         raise AssertionError(
             f"expected {_EXPECTED_CACHED_QUERY_COUNT} cached query vectors, "
             f"found {len(query_vectors)}")
-    source_before = _source_snapshot(args.corpus_dir)
     queries = list(query_vectors)
     groups = []
     baseline_by_query = None
@@ -1041,18 +1015,14 @@ def _concurrency_stage(args) -> dict:
             queries=queries, identity=identity, query_vectors=query_vectors,
             expected=baseline_by_query, repeats=args.repeats)
         if baseline_by_query is None:
-            baseline_by_query = {
-                query_id: digests[0]
-                for query_id, digests in json_group["workers"][0]["result_digests"].items()
-            }
+            baseline_by_query = json_group["_reference_snapshots"]
+        json_group.pop("_reference_snapshots", None)
         mapped_group = _run_corpus_group(
             args, backend="mmap", worker_count=worker_count,
             queries=queries, identity=identity, query_vectors=query_vectors,
             expected=baseline_by_query, repeats=args.repeats)
+        mapped_group.pop("_reference_snapshots", None)
         groups.extend([json_group, mapped_group])
-    if (_bm25._source_snapshot(args.embedding_cache) != embedding_source_before
-            or _source_snapshot(args.corpus_dir) != source_before):
-        raise AssertionError("corpus or cached query source stats changed during concurrency stage")
     return {
         "stage": "concurrency",
         "baseline": "JSON StandardCorpus + existing BM25 mmap",
@@ -1065,7 +1035,6 @@ def _concurrency_stage(args) -> dict:
         "query_rounds_per_worker": args.repeats,
         "memory_preflights": memory_preflights,
         "groups": groups,
-        "source_stats_unchanged": True,
         "memory_metric_note": (
             "USS is summed only for concurrently active workers; the query-phase "
             "peak is sampled, not a lifecycle peak; RSS is not summed"

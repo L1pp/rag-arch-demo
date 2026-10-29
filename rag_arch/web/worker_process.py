@@ -39,6 +39,16 @@ def _positive_float(raw: str) -> float:
     return value
 
 
+def _nonnegative_float(raw: str) -> float:
+    try:
+        value = float(raw)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be a number") from exc
+    if not math.isfinite(value) or value < 0:
+        raise argparse.ArgumentTypeError("must be finite and nonnegative")
+    return value
+
+
 def _database(database_url: str | None = None, schema: str | None = None):
     url = database_url or os.environ.get("RAG_ARCH_DATABASE_URL", "").strip()
     if not url:
@@ -138,20 +148,33 @@ def _run(args: argparse.Namespace) -> int:
 
 
 def _recover(args: argparse.Namespace) -> int:
-    from .resource_recovery import recover_resources
+    if args.cooldown_seconds is not None and not args.isolate_interrupted:
+        raise ValueError("--cooldown-seconds 需要同时指定 --isolate-interrupted。")
+    root = Path(args.root).resolve() if args.root else ROOT
     repository = _repository(_database(args.database_url, args.database_schema))
-    outcomes = recover_resources(
-        repository, cleanup_owned=args.cleanup_owned_resources,
-        root=Path(args.root).resolve() if args.root else ROOT)
+    if args.isolate_interrupted:
+        from .resource_recovery import maintain_recovery
+        cooldown = 120.0 if args.cooldown_seconds is None else args.cooldown_seconds
+        outcomes = maintain_recovery(
+            repository, cleanup_owned=args.cleanup_owned_resources, root=root,
+            cooldown_seconds=cooldown)
+        note = ("本机worker和登记资源确认退出并度过冷却期后才隔离中断任务；"
+                "远端调用结果仍未知，任务不会自动重试。")
+    else:
+        from .resource_recovery import recover_resources
+        outcomes = recover_resources(repository, cleanup_owned=args.cleanup_owned_resources, root=root)
+        note = ("只有simulation/run_demo任务会在确认本机worker进程退出后终结并释放槽；"
+                "真实模型任务继续recovering并占用用户槽和全局容量，等待资源及外部调用核验。")
     lease_check = next((row for row in outcomes if row.get("kind") == "lease_check"), {})
     report = {
         "marked_stale_workers": lease_check.get("marked_stale_workers", []),
         "local_worker_checks": lease_check.get("parent_checks", []),
         "local_resource_checks": outcomes,
         "cleanup_owned_resources": args.cleanup_owned_resources,
-        "note": ("只有simulation/run_demo任务会在确认本机worker进程退出后终结并释放槽；"
-                 "真实模型任务继续recovering并占用用户槽和全局容量，等待资源及外部调用核验。"),
+        "note": note,
     }
+    if args.isolate_interrupted:
+        report.update(isolate_interrupted=True, cooldown_seconds=cooldown)
     print(json.dumps(report, ensure_ascii=False, indent=2))
     return 0
 
@@ -232,7 +255,11 @@ def build_parser() -> argparse.ArgumentParser:
                                 help="数据库schema；默认读取RAG_ARCH_DATABASE_SCHEMA")
     recover_parser.add_argument("--root", help="资源身份描述符所属项目根目录")
     recover_parser.add_argument("--cleanup-owned-resources", action="store_true",
-                                help="仅在本机父worker已退出后终止身份精确匹配的自有子进程")
+                                help="本机父worker退出后允许清理部分身份已核实的自有子进程；LibreOffice进程组只核验退出，不由此命令终止")
+    recover_parser.add_argument("--isolate-interrupted", action="store_true",
+                                help="显式隔离已确认本机进程退出且冷却完成的中断任务；远端状态仍未知且不自动重试")
+    recover_parser.add_argument("--cooldown-seconds", type=_nonnegative_float,
+                                help="仅用于 --isolate-interrupted；冷却时间秒数（默认120）")
     recover_parser.set_defaults(handler=_recover)
 
     resolve_parser = subparsers.add_parser("resolve", help="凭本机退出证据和外部调用核验审计终结recovering任务")

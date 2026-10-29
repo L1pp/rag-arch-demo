@@ -21,6 +21,8 @@ from langchain_core.tools import StructuredTool
 
 from ..config import (DEFAULT_PLAN_MAX_STEPS, DEFAULT_PLAN_MAX_TOOL_CALLS,
                       DEFAULT_PLAN_CONTEXT_BUDGET)
+from ..models import ocr_evidence_warnings
+from .ocr_preparation import OCRDocumentUnreadable
 from ..generation_experiments import safe_error
 from ..graph_agent import _usage, _usage_total
 from ..plan_review_agent import (DEFAULT_REVIEW_TASK, PLAN_TIME_LIMITS_SECONDS,
@@ -32,6 +34,7 @@ from ..runtime_audit import (arecord_event, arecord_run, record_event, record_ru
                              tenant_audit_metadata)
 from ..tool_chat import create_tool_chat_model
 from ..async_support import TaskResourceCleanupError, run_local
+from .page_region_query import page_source_url
 
 
 _TECHNICAL_FAILURE_REASONS = frozenset({"model_error", "context_summary_failed"})
@@ -423,6 +426,39 @@ def _load_plan(documents, attachment_ids, registered_plan_id):
     return bundle
 
 
+def _require_plan_text(document, plan_action):
+    """Preserve OCR-specific failure detail without exposing raw warnings."""
+    if getattr(document, "units", None):
+        return
+    recorded = getattr(document, "ocr_pages", None)
+    ocr_pages = recorded if isinstance(recorded, list) else []
+    warnings = getattr(document, "warnings", None)
+    explicit_ocr_issue = any(
+        isinstance(note, str) and "OCR" in note.upper()
+        and any(marker in note for marker in ("未完成", "失败", "状态未确认", "未尝试", "检查"))
+        for note in warnings
+    ) if isinstance(warnings, (list, tuple)) else False
+    if ocr_pages or explicit_ocr_issue:
+        # Page numbers and statuses are the only fields needed for the safe
+        # user-facing exception. Never copy raw provider errors or warning text.
+        safe_pages = []
+        for row in ocr_pages:
+            if not isinstance(row, dict) or type(row.get("page")) is not int or row["page"] < 1:
+                continue
+            status = row.get("status")
+            if not isinstance(status, str) or status not in {"completed", "failed", "unknown", "not_attempted"}:
+                status = "unknown"
+            safe_pages.append({"page": row["page"], "status": status})
+        if explicit_ocr_issue and not safe_pages:
+            unread = getattr(document, "unread_pages", None)
+            if isinstance(unread, (list, tuple)):
+                safe_pages = [{"page": page, "status": "not_attempted"}
+                              for page in unread if type(page) is int and page > 0]
+        raise OCRDocumentUnreadable(safe_pages, source_kind=getattr(document, "source_kind", ""))
+    if plan_action == "review":
+        raise _PlanInputError("当前方案没有可读文字，整份核查已拒绝；这可能是扫描件或尚未完成OCR。")
+
+
 def _history_rows(rows, document=None):
     selected = []
     for row in rows or []:
@@ -463,10 +499,7 @@ def _citation_rows(result, resources, plan_page_url=None, plan_filename=None):
             is_plan_page = (row.get("source_kind") == "plan"
                             or str(page_source.get("source_ref", "")).startswith("plan:"))
             if is_plan_page:
-                page_url = plan_page_url
-                page = page_source.get("page")
-                if page_url and type(page) is int and page > 0:
-                    page_url += ("&" if "?" in page_url else "?") + urlencode({"page": page})
+                page_url = page_source_url(plan_page_url, page_source)
                 rows.append({"evidence_id": eid, "kind": "page_image",
                              "title": plan_filename or page_source.get("filename"),
                              "std_no": None, "clause_no": None,
@@ -501,8 +534,39 @@ def _citation_rows(result, resources, plan_page_url=None, plan_filename=None):
     return rows
 
 
+def _public_page_sources(output, resources, plan_page_url):
+    runtime = getattr(output, "runtime", {}) or {}
+    by_id = {row.get("evidence_id"): row for row in getattr(output, "evidence", [])
+             if isinstance(row, dict)}
+    cited = set(_selected_evidence_ids(output))
+
+    def plan_references(value):
+        if isinstance(value, dict):
+            for key in ("unit_id", "evidence_id"):
+                if isinstance(value.get(key), str):
+                    cited.add(value[key])
+            for nested in value.values():
+                plan_references(nested)
+        elif isinstance(value, list):
+            for nested in value:
+                plan_references(nested)
+
+    plan_references(getattr(output, "findings", []))
+    plan_references(runtime.get("answer_plan_evidence", []))
+    sources = deepcopy(runtime.get("page_sources", []))
+    for source in sources:
+        identifier = source.get("image_id") or source.get("evidence_id")
+        source["cited"] = source.get("cited") is True or identifier in cited
+        if (source.get("source_kind") == "plan" or str(source.get("source_ref", "")).startswith("plan:")):
+            source["page_url"] = page_source_url(plan_page_url, source)
+        elif identifier in by_id:
+            mapped = resources.citation(deepcopy(by_id[identifier]))
+            source["page_url"] = mapped.get("page_url") if isinstance(mapped, dict) else None
+    return sources
+
+
 def _document_page_url(document, asset, documents, request):
-    if Path(document.filename).suffix.lower() not in {".pdf", ".docx"}:
+    if Path(document.filename).suffix.lower() not in {".pdf", ".doc", ".docx"}:
         return None
     registered = request.get("registered_plan_id")
     if isinstance(registered, str) and registered.strip():
@@ -560,10 +624,14 @@ def _public_result(output, plan_action, settings, audit, request, report_text, c
         "report_history": history,
         "citations": _citation_rows(output, resources, page_url, document.filename),
         "files": files,
-        "page_sources": deepcopy(runtime.get("page_sources", [])),
+        "page_sources": _public_page_sources(output, resources, page_url),
+        "visual_review": deepcopy(runtime.get("visual_review")),
         "web_sources": deepcopy(runtime.get("web_sources", [])),
         "native_tool_usage": {"counts": deepcopy(runtime.get("native_tool_counts", {}))},
-        "warnings": deepcopy(output.limitations) + deepcopy(output.validation_notes),
+        "warnings": list(dict.fromkeys(deepcopy(output.limitations) + deepcopy(output.validation_notes)
+            + ocr_evidence_warnings(getattr(document, "ocr_pages", []),
+                                    source_kind=getattr(document, "source_kind", ""),
+                                    units=getattr(document, "units", [])))),
         "status": output.status,
         "stop_reason": output.stop_reason,
         "source_coverage": deepcopy(output.source_coverage),
@@ -635,8 +703,7 @@ def run_plan(request, progress, cancel_event, *, resources, documents,
     context_id = getattr(bundle, "context_id", None)
     if document is None:
         raise _PlanInputError("未找到可用方案文档。")
-    if plan_action == "review" and not getattr(document, "units", None):
-        raise _PlanInputError("当前方案没有可读文字，整份核查已拒绝；这可能是扫描件或尚未完成OCR。")
+    _require_plan_text(document, plan_action)
     try:
         with record_run("web_plan_review", settings, question,
                         **tenant_audit_metadata(request),
@@ -793,8 +860,7 @@ async def arun_plan(request, progress, cancel_event, *, resources, documents,
     context_id = getattr(bundle, "context_id", None)
     if document is None:
         raise _PlanInputError("未找到可用方案文档。")
-    if plan_action == "review" and not getattr(document, "units", None):
-        raise _PlanInputError("当前方案没有可读文字，整份核查已拒绝；这可能是扫描件或尚未完成OCR。")
+    _require_plan_text(document, plan_action)
 
     model = None
     owned_models = []

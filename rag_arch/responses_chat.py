@@ -372,6 +372,12 @@ def assemble_streamed_response(events):
     if isinstance(completed, dict) and (
             completed.get("output") is not None
             or completed.get("status") in {"completed", "incomplete"}):
+        # Some providers omit output from the terminal event even though they
+        # emitted completed output items. Preserve the terminal status/usage
+        # and recover those items only when output is absent, not when the
+        # provider explicitly returned an empty output list.
+        if completed.get("output") is None and items:
+            completed = {**completed, "output": items}
         return completed, items, None
     if items:
         return {"output": items, "status": "incomplete",
@@ -386,7 +392,10 @@ class ResponsesChat(BaseChatModel):
     timeout_seconds: float = DEFAULT_REQUEST_TIMEOUT_SECONDS
     max_tokens: int = 131072
     reasoning_effort: str | None = None
+    reasoning_configuration: dict | None = None
     native_tools: list[dict] = Field(default_factory=list)
+    # Compatibility metadata for Qwen's locally mapped thinking budget; this
+    # field is not merged into the Responses request body.
     extra_body: dict = Field(default_factory=dict)
     json_output: bool = False
     stream_responses: bool = False
@@ -443,6 +452,10 @@ class ResponsesChat(BaseChatModel):
     def _request_data(self, messages, stop=None, **kwargs):
         if stop:
             raise ValueError("当前Responses端点未列stop参数，不静默忽略。")
+        allowed_metadata = {"thinking_budget"} if self.model_name.lower().startswith("qwen3.8") else set()
+        unsupported_metadata = set(self.extra_body) - allowed_metadata
+        if unsupported_metadata:
+            raise ValueError("Responses extra_body不支持的参数：" + ", ".join(sorted(unsupported_metadata)))
         local = deepcopy(kwargs.pop("tools", []))
         choice = kwargs.pop("tool_choice", "auto")
         native_enabled = kwargs.pop("native_tools_enabled", True)
@@ -556,6 +569,7 @@ class ResponsesChat(BaseChatModel):
         idle_timeout = stream_timeout.read
         events = []
         heartbeat_count = 0
+        heartbeat_recorded = False
         first_event = None
         pending = None
         owned = client is None
@@ -564,11 +578,13 @@ class ResponsesChat(BaseChatModel):
         response = None
         call_id = None
         request_accepted = False
+        stream_stage = "connecting"
         deadline_scope = asyncio.timeout(stream_deadline)
         try:
             check_request_control()
             async with deadline_scope:
                 async with client.stream("POST", url, json=body, timeout=stream_timeout, headers=headers) as response:
+                    stream_stage = "connected"
                     owner = response.request.extensions.get("rag_audit_owner")
                     call_id = owner[1] if isinstance(owner, tuple) and len(owner) == 2 else None
                     await arecord_event("model_http_connected", call_id=call_id,
@@ -576,6 +592,7 @@ class ResponsesChat(BaseChatModel):
                                  request_id=response.headers.get("x-request-id"), stream=True,
                                  stream_deadline_seconds=stream_deadline, idle_timeout_seconds=idle_timeout)
                     if not response.is_success:
+                        stream_stage = "reading_error_response"
                         payload = await _read_error_payload_async(response)
                         raise ResponsesServiceError(response, payload)
 
@@ -599,6 +616,7 @@ class ResponsesChat(BaseChatModel):
                                      **({"timed_out": True} if timed_out else {}))
                         return {**payload, "request_accepted": request_accepted}
 
+                    stream_stage = "receiving_events"
                     async for event_type, data in iter_responses_sse(response):
                         if event_type == "comment" or (isinstance(data, dict) and data.get("type") == "sse_comment"):
                             heartbeat_count += 1
@@ -626,6 +644,8 @@ class ResponsesChat(BaseChatModel):
                                 continue
                             await _record_row(row, first=True)
                         elif _is_delta_event(data):
+                            if pending and pending.get("type") != row.get("type"):
+                                await _flush_pending()
                             pending = _merge_delta_audit(pending, row)
                             if pending.get("delta_count", 1) >= 20 or pending.get("delta_chars", 0) >= 400:
                                 await _flush_pending()
@@ -638,10 +658,12 @@ class ResponsesChat(BaseChatModel):
                             # A Responses terminal event completes this call even
                             # when the HTTP server leaves its SSE connection open.
                             break
+                    stream_stage = "assembling_response"
                     await _flush_pending()
                     if heartbeat_count:
                         await arecord_event("model_http_stream", call_id=call_id, type="sse_comment",
                                      heartbeat_count=heartbeat_count)
+                        heartbeat_recorded = True
                     payload, _, error = assemble_streamed_response(events)
                     if error:
                         raise ResponsesServiceError(response, error)
@@ -649,6 +671,7 @@ class ResponsesChat(BaseChatModel):
                         failure = RuntimeError("Responses流式结束但没有completed载荷。")
                         failure.request_accepted = request_accepted
                         raise failure
+                    stream_stage = "recording_response"
                     return await _finish(payload)
         except (TimeoutError, httpx.TimeoutException) as exc:
             timeout_kind = ("stream_deadline" if deadline_scope.expired() else
@@ -656,40 +679,79 @@ class ResponsesChat(BaseChatModel):
                             "connect" if isinstance(exc, httpx.ConnectTimeout) else
                             "write" if isinstance(exc, httpx.WriteTimeout) else
                             "pool" if isinstance(exc, httpx.PoolTimeout) else "transport_timeout")
+            audit_rows = []
             if pending:
-                await arecord_event("model_http_stream", call_id=call_id, **pending)
+                audit_rows.append(("model_http_stream", {"call_id": call_id, **pending}))
                 pending = None
-            if heartbeat_count:
-                await arecord_event("model_http_stream", call_id=call_id, type="sse_comment",
-                             heartbeat_count=heartbeat_count)
-            await arecord_event("model_http_stream_error", call_id=call_id, error_type="TimeoutException",
-                         heartbeat_count=heartbeat_count,
-                         timeout_kind=timeout_kind, stream_deadline_seconds=stream_deadline,
-                         idle_timeout_seconds=idle_timeout,
-                         request_accepted=request_accepted,
-                         elapsed_seconds=round(time.monotonic() - started, 3))
+            if heartbeat_count and not heartbeat_recorded:
+                audit_rows.append(("model_http_stream", {"call_id": call_id, "type": "sse_comment",
+                                                        "heartbeat_count": heartbeat_count}))
+            audit_rows.append(("model_http_stream_error", {
+                "call_id": call_id, "error_type": "TimeoutException", "heartbeat_count": heartbeat_count,
+                "timeout_kind": timeout_kind, "stream_deadline_seconds": stream_deadline,
+                "idle_timeout_seconds": idle_timeout, "request_accepted": request_accepted,
+                "elapsed_seconds": round(time.monotonic() - started, 3),
+            }))
+            audit_errors = []
+            for kind, fields in audit_rows:
+                if kind == "model_http_stream_error" and audit_errors:
+                    fields = {**fields, "audit_error_types": list(audit_errors)}
+                try:
+                    await arecord_event(kind, **fields)
+                except Exception as audit_exc:
+                    # An unavailable audit sink must not mask the timeout.
+                    audit_errors.append(type(audit_exc).__name__)
             payload, _, error = assemble_streamed_response(events)
             if error and response is not None:
                 raise ResponsesServiceError(response, error) from None
-            if isinstance(payload, dict) and payload.get("status") == "completed" and response is not None:
-                return await _finish(payload, timed_out=True)
             if isinstance(payload, dict) and response is not None:
                 payload = dict(payload)
-                payload["status"] = "incomplete"
-                payload["incomplete_reason"] = "stream_timeout"
-                return await _finish(payload, timed_out=True)
+                if payload.get("status") != "completed":
+                    payload["status"] = "incomplete"
+                    payload["incomplete_reason"] = "stream_timeout"
+                if audit_errors:
+                    payload["stream_audit_error_types"] = list(audit_errors)
+                try:
+                    return await _finish(payload, timed_out=True)
+                except Exception as audit_exc:
+                    # Retain the original timeout if recording the recovered
+                    # response fails, with the audit failure type available to
+                    # the caller without exposing provider-sensitive messages.
+                    audit_errors.append(type(audit_exc).__name__)
             if isinstance(exc, TimeoutError):
                 request = response.request if response is not None else httpx.Request("POST", url)
                 message = ("Responses stream exceeded wall-clock timeout" if deadline_scope.expired()
                            else "Responses stream transport timed out")
                 failure = httpx.ReadTimeout(message, request=request)
                 failure.request_accepted = request_accepted
+                if audit_errors:
+                    failure.audit_error_types = audit_errors
                 raise failure from exc
             exc.request_accepted = request_accepted
+            if audit_errors:
+                exc.audit_error_types = audit_errors
             raise
         except Exception as exc:
-            # Preserve confirmed input delivery for non-timeout disconnects too.
+            # Retain bounded previews and safe classification for disconnects.
+            # Never log the exception message: it may contain provider data.
             exc.request_accepted = request_accepted
+            rows = []
+            if pending:
+                rows.append(("model_http_stream", {"call_id": call_id, **pending}))
+            if heartbeat_count and not heartbeat_recorded:
+                rows.append(("model_http_stream", {"call_id": call_id, "type": "sse_comment",
+                                                    "heartbeat_count": heartbeat_count}))
+            rows.append(("model_http_stream_error", {
+                "call_id": call_id, "error_type": type(exc).__name__, "stage": stream_stage,
+                "heartbeat_count": heartbeat_count, "request_accepted": request_accepted,
+                "elapsed_seconds": round(time.monotonic() - started, 3),
+            }))
+            for kind, fields in rows:
+                try:
+                    await arecord_event(kind, **fields)
+                except Exception:
+                    # Audit failures must not replace the original transport error.
+                    pass
             raise
         finally:
             if owned:

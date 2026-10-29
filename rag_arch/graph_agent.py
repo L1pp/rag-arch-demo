@@ -9,6 +9,7 @@ created. Citation validation is acquisition/completeness, not entailment.
 from __future__ import annotations
 
 from copy import deepcopy
+from concurrent.futures import CancelledError as FutureCancelledError
 from dataclasses import dataclass, field
 import asyncio
 import inspect
@@ -30,6 +31,7 @@ from .web_evidence import (WEB_SEARCH_INSTRUCTION, NATIVE_TOOLS_INSTRUCTION, web
 from .terminal_completion import (TERMINAL_COMPLETION_POLICY, completion_window, append_completion_instruction)
 from .plan_review_context import ContextBudgetError, estimate_messages, prepare_messages
 from .async_support import run_local
+from .request_control import RequestControlError
 
 try:
     from .runtime_audit import record_event
@@ -572,6 +574,9 @@ class StandardAgent:
             return stopped.value
         try:
             response = self.model.invoke(request_messages, **invoke_options)
+        except (RequestControlError, FutureCancelledError):
+            steps.close()
+            raise
         except Exception as exc:
             response = exc
         try:
@@ -595,6 +600,9 @@ class StandardAgent:
         try:
             response = await self.model.ainvoke(request_messages, **invoke_options)
         except asyncio.CancelledError:
+            steps.close()
+            raise
+        except (RequestControlError, FutureCancelledError):
             steps.close()
             raise
         except Exception as exc:
@@ -624,11 +632,13 @@ class StandardAgent:
         window = completion_window(model_calls=state["model_calls"], max_model_calls=self.max_steps,
             tool_calls=state["tool_calls"], max_tool_calls=self.max_tool_calls,
             evidence_budget_exhausted=state["evidence_budget_exhausted"])
-        # Pending page images are in this actual request, including the final-only
-        # request. Delivery becomes confirmed only after invoke returns successfully.
-        request_pages = page_image_sources(state["messages"]) if self.page_service is not None else []
+        # Limit and retire old pixels before estimating or dispatching a request.
+        # Whole receipts remain and omitted page/region views retain pointers.
+        from .visual_review_policy import bounded_image_messages
+        retained_messages, visual_budget = bounded_image_messages(state["messages"])
+        request_pages = page_image_sources(retained_messages) if self.page_service is not None else []
         request_ids = set(state["complete_ids"]) | {p["evidence_id"] for p in request_pages}
-        messages = state["messages"]
+        messages = retained_messages
         if self.native_tool_names and state["web_sources"]:
             messages = messages + [SystemMessage(content="本轮实际返回的外部来源编号（仍未核验工程正确性）：\n"
                 + json.dumps([{k: row[k] for k in ("evidence_id", "url", "title") if k in row}
@@ -639,6 +649,8 @@ class StandardAgent:
                  "terminal_completion_policy": TERMINAL_COMPLETION_POLICY,
                  "completion_phase": window.phase,
                  "ordinary_tools_allowed": not final_only}
+        if visual_budget["image_count"] or visual_budget["omitted_image_ids"]:
+            trace["visual_budget"] = visual_budget
         if self.input_budget_tokens is not None:
             request_messages, context_info = prepare_messages(
                 request_messages, budget_tokens=self.input_budget_tokens,
@@ -652,12 +664,14 @@ class StandardAgent:
                 raise response
             if not isinstance(response, AIMessage):
                 raise TypeError("Expected AIMessage")
+        except (RequestControlError, FutureCancelledError):
+            raise
         except Exception:
             _record_runtime_event("model_call_error", step=step,
                                   error={"code": "model_error", "message": "模型调用失败，本轮未继续调用或更换模型。"})
             trace.update(status="error", error_code="model_error", latency_seconds=time.perf_counter() - start)
             return {**update, "traces": state["traces"] + [trace], "termination_reason": "model_error",
-                    "usage_samples": state["usage_samples"] + [None]}
+                    "usage_samples": state["usage_samples"] + [None], "messages": retained_messages}
         if request_pages:
             sent_pages = page_image_sources(request_messages, sent=True)
             sent_by_id = {p["evidence_id"]: p for p in state["page_sources"]}
@@ -730,7 +744,7 @@ class StandardAgent:
         elif final_only and calls:
             reason = ("evidence_limit" if state["evidence_budget_exhausted"]
                       else "step_limit" if step == self.max_steps else "tool_limit")
-        return {**update, "messages": state["messages"] + [response],
+        return {**update, "messages": retained_messages + [response],
                 "traces": state["traces"] + [trace] + native_traces,
                 "usage_samples": state["usage_samples"] + [usage], "draft": _message_text(response),
                 "seen_tool_call_ids": state["seen_tool_call_ids"] + [i for i in ids if isinstance(i, str)],
@@ -761,6 +775,8 @@ class StandardAgent:
             record = page_evidence_record(result, self.page_service)
             record["complete"] = False  # rendered, but not yet sent in a model request
             return metadata, messages[1:], [record], "page_image_available"
+        except (RequestControlError, FutureCancelledError):
+            raise
         except Exception as exc:
             return ({"ok": False, "status": "error", "error": {"code": "page_unavailable",
                      "message": str(exc) or "页面读取失败，未提供图像。"}}, [], [], "page_unavailable")
@@ -774,6 +790,9 @@ class StandardAgent:
         while True:
             try:
                 result = self.tools[name].invoke(deepcopy(args))
+            except (RequestControlError, FutureCancelledError):
+                steps.close()
+                raise
             except Exception as exc:
                 result = exc
             try:
@@ -804,6 +823,9 @@ class StandardAgent:
                 else:
                     result = await run_local(tool.invoke, deepcopy(args))
             except asyncio.CancelledError:
+                steps.close()
+                raise
+            except (RequestControlError, FutureCancelledError):
                 steps.close()
                 raise
             except Exception as exc:
@@ -860,6 +882,11 @@ class StandardAgent:
                 if name in PAGE_TOOL_NAMES:
                     result, images, records, observation = self._page_tool_reply(name, args, call_id, raw_result)
                     page_images.extend(images)
+                    from .visual_review_policy import bounded_image_messages
+                    page_images, visual_budget = bounded_image_messages(page_images)
+                    if visual_budget["omitted_image_ids"]:
+                        traces.append({"kind": "visual_budget", "step": step,
+                                       "phase": "tool_image_retention", **visual_budget})
                     model_result = result
                 else:
                     if isinstance(raw_result, Exception):
@@ -927,6 +954,8 @@ class StandardAgent:
                             else:
                                 body_tokens += added_tokens
                                 budget_texts = proposed_texts
+            except (RequestControlError, FutureCancelledError):
+                raise
             except Exception:
                 reason = "tool_error"
                 records, complete_ids = [], []
@@ -991,6 +1020,11 @@ class StandardAgent:
         # Every requested tool receives its ToolMessage before any image-bearing
         # HumanMessage, including parallel/sibling calls in the same model turn.
         messages.extend(page_images)
+        from .visual_review_policy import bounded_image_messages
+        messages, visual_budget = bounded_image_messages(messages)
+        if visual_budget["omitted_image_ids"]:
+            traces.append({"kind": "visual_budget", "step": step,
+                           "phase": "tool_context_retention", **visual_budget})
         return {"tool_calls": count, "messages": messages, "traces": traces,
                 "web_sources": web_sources, "evidence": evidence, "complete_ids": sorted(complete), "termination_reason": reason,
                 "evidence_budget_texts": budget_texts, "evidence_body_tokens": body_tokens,
@@ -1173,7 +1207,11 @@ class StandardAgent:
                            if state["evidence_budget_exhausted"] else []) + (["回答的行内标记与明确引用列表不一致；请结合列出的原文阅读，尚未核对逐句支持。"]
                            if any(t.get("kind") == "citation_display" for t in state["traces"]) else [])
                            + (["已保留模型原文；输出格式或引用核对未完成，请结合来源阅读。"]
-                              if any(t.get("kind") == "reply_validation" for t in state["traces"]) else []))
+                              if any(t.get("kind") == "reply_validation" for t in state["traces"]) else [])
+                           + (["部分页图因图片数量、大小或图像上下文预算被替换为页码/区域回读定位；"
+                               "未实际提供的图像不能作为已读依据，必要时请重新读取关键区域。"]
+                              if any(t.get("omitted_image_ids") or t.get("visual_budget", {}).get("omitted_image_ids")
+                                     for t in state["traces"]) else []))
 
 
     def run(self, question: str, *, corpus_id: str, history=None) -> AgentResult:

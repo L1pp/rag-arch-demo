@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import re
 from .plan_location_display import format_physical_locator
+from .page_regions import normalize_region
 
 
 def locator_text(locator):
@@ -176,9 +177,20 @@ def runtime_error_notice(result):
 def _page_location(source):
     filename = str(source.get("filename") or "来源文件")
     page = source.get("page", "未记录")
-    numbering = "系统排版第" if filename.lower().endswith(".docx") else "物理第"
+    numbering = ("系统排版第" if source.get("page_numbering") == "system_rendered_page"
+                  or filename.lower().endswith((".doc", ".docx")) else "物理第")
     total = source.get("page_count")
     return f"{filename} · {numbering}{page}页" + (f" / 共{total}页" if total else "")
+
+
+def _region_location(source):
+    try:
+        region = normalize_region(source.get("region"))
+    except ValueError:
+        return " · 局部区域（位置未核实）"
+    if region is None:
+        return ""
+    return " · 局部区域[" + ", ".join(f"{coordinate:.2%}" for coordinate in region) + "]（显示页左、上、右、下）"
 
 
 def _runtime_source_lines(row):
@@ -186,6 +198,11 @@ def _runtime_source_lines(row):
     runtime = row.get("runtime") or {}
     lines = []
     pages = runtime.get("page_sources") or []
+    visual = runtime.get("visual_review", runtime.get("visual_review_ledger"))
+    visual = visual if isinstance(visual, dict) else {}
+    images = visual.get("images")
+    if isinstance(images, list) and images:
+        pages = [source for source in images if isinstance(source, dict)]
     directory = runtime.get("visual_page_index") or {}
     if directory.get("ok"):
         candidate_count = directory.get("visual_candidate_count")
@@ -194,13 +211,42 @@ def _runtime_source_lines(row):
         count_text = str(candidate_count) if isinstance(candidate_count, int) else "未统计"
         lines.extend([f"图表候选目录：{count_text}页；本轮实际提供方案页图{len(provided)}页。"
                       "候选目录与图像发送均不代表已完成全部图纸核验。", ""])
+    if visual:
+        automatic = [source for source in pages if source.get("automatic") is True]
+        confirmed = [source for source in automatic if source.get("response_received") is True]
+        lines.extend([f"首批自动附图：已取得{len(automatic)}个页图视图；其中{len(confirmed)}个随成功返回的模型请求提供。"
+                      "自动选图按关键内容与预算取舍，不表示全部图表已核查。", ""])
+        attempts = visual.get("attempts") or []
+        unconfirmed = [attempt for attempt in attempts if isinstance(attempt, dict)
+                       and attempt.get("response_received") is not True]
+        if unconfirmed:
+            lines.extend([f"另有{len(unconfirmed)}次带图请求未确认成功返回；请求尝试不证明服务端收到图片，也不证明模型已经判读。", ""])
     if pages:
         lines.extend(["## 本轮页图来源", "",
-                      "页图按需提供给模型；图像识别引文未逐字核验，也不计入可读文字的完整提供范围。DOCX页码以本次系统排版为准。", ""])
+                      "页图可能由首批自动附入或模型按需读取；提供图片、成功返回和引用均不证明识别准确或整页全部核查，图像识别引文未逐字核验，也不计入可读文字的完整提供范围。DOC和DOCX页码以本次系统排版为准。", ""])
         for source in pages:
             identifier = source.get("evidence_id") or source.get("citation") or source.get("source_ref") or "未编号"
-            delivery = "已发送给模型" if source.get("sent_to_model") is True else "未确认发送给模型"
-            lines.append(f"- {identifier} · {_page_location(source)} · 来源标识：{source.get('source_ref') or '未记录'} · {delivery}")
+            if source.get("response_received") is True:
+                delivery = "已提供给模型（请求成功返回）"
+            elif source.get("request_attempted") is True:
+                delivery = "已尝试请求，投递未确认"
+            elif source.get("acquired") is True:
+                delivery = "已取得，尚未进入模型请求"
+            else:
+                delivery = "已发送给模型" if source.get("sent_to_model") is True else "未确认发送给模型"
+            origin = (" · 首批自动附图" if source.get("automatic") is True else
+                      " · 模型按需读取" if "automatic" in source else "")
+            citation = (" · 模型明确引用（不代表识别已验证）" if source.get("cited") is True else "")
+            lines.append(f"- {identifier} · {_page_location(source)}{_region_location(source)} · 来源标识：{source.get('source_ref') or '未记录'} · {delivery}{origin}{citation}")
+        lines.append("")
+    failures = visual.get("read_failures") or []
+    if failures:
+        lines.extend(["## 页图读取未完成", ""])
+        for failure in failures:
+            if not isinstance(failure, dict):
+                continue
+            lines.append(f"- 来源{failure.get('source_ref') or '未记录'} · 第{failure.get('page') or '未记录'}页"
+                         f"{_region_location(failure)} · 读取失败（{failure.get('error_type') or 'ReadError'}）；相关内容仍待核实。")
         lines.append("")
     web = runtime.get("web_sources") or []
     if web:

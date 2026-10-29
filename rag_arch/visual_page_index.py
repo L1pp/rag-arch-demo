@@ -6,6 +6,8 @@ an assertion that a page contains a particular kind of diagram or table.
 """
 from __future__ import annotations
 
+from bisect import bisect_right
+import math
 import re
 from typing import Any, Iterable
 
@@ -119,9 +121,9 @@ def _image_signals(page: Any, page_rect: tuple[float, float, float, float]) -> t
     try:
         # Explicitly keep hashes off: the index only needs placement geometry.
         infos = page.get_image_info(hashes=False)
-    except TypeError:
-        infos = page.get_image_info()
-    except (AttributeError, RuntimeError, ValueError):
+    except (TypeError, AttributeError, RuntimeError, ValueError):
+        # Older/injected APIs may not support an explicit hashes=False.  Do not
+        # fall back to an unspecified call; geometry hints are optional.
         infos = []
     page_area = _rect_area(page_rect)
     if not page_area:
@@ -143,12 +145,13 @@ def _image_signals(page: Any, page_rect: tuple[float, float, float, float]) -> t
     return meaningful, scanned
 
 
-def _vector_signal(page: Any, page_rect: tuple[float, float, float, float]) -> bool:
+def _vector_signal(page: Any, page_rect: tuple[float, float, float, float], drawings=None) -> bool:
     """Recognise substantial vector structure while ignoring page frames/logos."""
-    try:
-        drawings = page.get_drawings()
-    except (AttributeError, RuntimeError, ValueError):
-        drawings = []
+    if drawings is None:
+        try:
+            drawings = page.get_drawings()
+        except (AttributeError, RuntimeError, ValueError):
+            drawings = []
     page_area = _rect_area(page_rect)
     if not page_area:
         return False
@@ -222,13 +225,137 @@ def _title_signal(text: str) -> bool:
     return bool(_TITLE_CUE_RE.search(_compact_text(text)))
 
 
+def _merged_rules(rules):
+    """Merge adjacent collinear grid segments, retaining a small bounded set."""
+    ordered = sorted(rules)
+    merged = []
+    for axis, start, end in ordered:
+        if merged and abs(merged[-1][0] - axis) <= 0.75 and start <= merged[-1][2] + 1.0:
+            previous = merged[-1]
+            merged[-1] = (previous[0], min(previous[1], start), max(previous[2], end))
+        else:
+            merged.append((axis, start, end))
+    return merged
+
+
+def _numeric_grid(page: Any, page_rect, drawings) -> dict | None:
+    """Identify only a clear, populated numeric table grid for auto-attachment.
+
+    Broad diagram/photo/scan candidates remain useful navigation, but do not
+    qualify here.  Missing geometry or word positions yields no automatic page.
+    This intentionally loses some real tables rather than attaching text pages.
+    """
+    if getattr(page, "rotation", 0):
+        # Do not infer a table with mixed coordinate systems.  Rotated pages
+        # remain in the broad directory and can be read explicitly.
+        return None
+    px0, py0, px1, py1 = page_rect
+    page_width, page_height = px1 - px0, py1 - py0
+    horizontal, vertical = [], []
+    item_count = 0
+    for drawing in drawings or ():
+        if not isinstance(drawing, dict):
+            continue
+        rect = _rect_values(drawing.get("rect"))
+        if rect is None or _is_page_frame(rect, page_rect):
+            continue
+        for item in drawing.get("items") or ():
+            item_count += 1
+            if item_count > 4000:
+                return None
+            if not item:
+                continue
+            lines = []
+            if item[0] == "l" and len(item) >= 3:
+                first, last = _rect_values(item[1]), _rect_values(item[2])
+                if first is not None and last is not None:
+                    lines = [(first[0], first[1], last[0], last[1])]
+            elif item[0] == "re" and len(item) >= 2:
+                box = _rect_values(item[1])
+                if box is not None and not _is_page_frame(box, page_rect):
+                    x0, y0, x1, y1 = box
+                    lines = [(x0, y0, x1, y0), (x0, y1, x1, y1),
+                             (x0, y0, x0, y1), (x1, y0, x1, y1)]
+            for x0, y0, x1, y1 in lines:
+                if not all(math.isfinite(value) for value in (x0, y0, x1, y1)):
+                    continue
+                if abs(y1 - y0) <= 0.5 and abs(x1 - x0) >= page_width * 0.05:
+                    horizontal.append(((y0 + y1) / 2, min(x0, x1), max(x0, x1)))
+                elif abs(x1 - x0) <= 0.5 and abs(y1 - y0) >= page_height * 0.02:
+                    vertical.append(((x0 + x1) / 2, min(y0, y1), max(y0, y1)))
+    horizontal, vertical = _merged_rules(horizontal), _merged_rules(vertical)
+    if len(horizontal) > 128 or len(vertical) > 128:
+        return None
+
+    def crosses(h, v):
+        return h[1] - 1 <= v[0] <= h[2] + 1 and v[1] - 1 <= h[0] <= v[2] + 1
+
+    # Remove disconnected decoration.  A qualifying grid needs at least three
+    # columns of vertical rules and four horizontal rules (six cells).
+    for _ in range(4):
+        next_h = [h for h in horizontal if sum(crosses(h, v) for v in vertical) >= 3]
+        next_v = [v for v in vertical if sum(crosses(h, v) for h in next_h) >= 4]
+        if next_h == horizontal and next_v == vertical:
+            break
+        horizontal, vertical = next_h, next_v
+    if len(horizontal) < 4 or len(vertical) < 3:
+        return None
+    intersections = sum(crosses(h, v) for h in horizontal for v in vertical)
+    if intersections < len(horizontal) * len(vertical) * 0.90:
+        return None
+    xs = sorted({round(v[0], 2) for v in vertical})
+    ys = sorted({round(h[0], 2) for h in horizontal})
+    if len(xs) < 3 or len(ys) < 4 or min(b - a for a, b in zip(xs, xs[1:])) < 8:
+        return None
+    if min(b - a for a, b in zip(ys, ys[1:])) < 8:
+        return None
+    x0, y0, x1, y1 = xs[0], ys[0], xs[-1], ys[-1]
+    if ((x1 - x0) < page_width * 0.25 or (y1 - y0) < page_height * 0.08
+            or (x1 - x0) * (y1 - y0) < page_width * page_height * 0.05):
+        return None
+    try:
+        words = page.get_text("words")
+    except (TypeError, AttributeError, RuntimeError, ValueError):
+        return None
+    populated, rows, columns, numeric_count, unit_count = set(), set(), set(), 0, 0
+    for word in words if isinstance(words, (list, tuple)) else ():
+        if not isinstance(word, (list, tuple)) or len(word) < 5:
+            continue
+        try:
+            left, top, right, bottom = (float(value) for value in word[:4])
+        except (TypeError, ValueError):
+            continue
+        cx, cy = (left + right) / 2, (top + bottom) / 2
+        value = str(word[4]).strip()
+        if not value or not (x0 + 1 < cx < x1 - 1 and y0 + 1 < cy < y1 - 1):
+            continue
+        col, row = bisect_right(xs, cx) - 1, bisect_right(ys, cy) - 1
+        if not (0 <= col < len(xs) - 1 and 0 <= row < len(ys) - 1):
+            continue
+        populated.add((row, col)); rows.add(row); columns.add(col)
+        numeric_count += bool(re.search(r"\d", value))
+        unit_count += bool(re.search(r"(?:mm|cm|kN|MPa|kPa|kg|m[²³23]?|N·m|毫米|千牛|兆帕)", value))
+    if len(populated) < 5 or len(rows) < 3 or len(columns) < 2 or numeric_count < 2:
+        return None
+    return {"auto_attach_eligible": True,
+            "auto_attach_reasons": ["populated_numeric_table_grid"],
+            "auto_attach_priority": min(numeric_count, 10) + min(unit_count, 5) * 2,
+            "auto_attach_table_region": [(x0 - px0) / page_width, (y0 - py0) / page_height,
+                                         (x1 - px0) / page_width, (y1 - py0) / page_height]}
+
+
 def _inspect_page(page: Any, number: int, text: str) -> dict | None:
     page_rect = _rect_values(getattr(page, "rect", None))
     if page_rect is None:
         return None
     has_text = bool(text)
     meaningful_image, scanned = _image_signals(page, page_rect)
-    vector = _vector_signal(page, page_rect)
+    try:
+        drawings = page.get_drawings()
+    except (AttributeError, RuntimeError, ValueError):
+        drawings = []
+    vector = _vector_signal(page, page_rect, drawings)
+    numeric_grid = _numeric_grid(page, page_rect, drawings)
     title = _title_signal(text)
     signals: list[str] = []
     if meaningful_image:
@@ -239,6 +366,8 @@ def _inspect_page(page: Any, number: int, text: str) -> dict | None:
         signals.append("scanned_page")
     if title:
         signals.append("title_cue")
+    if numeric_grid is not None:
+        signals.append("table_grid")
     if not signals:
         return None
     return {
@@ -247,6 +376,10 @@ def _inspect_page(page: Any, number: int, text: str) -> dict | None:
         "text_preview": _preview(text),
         "visual_candidate": True,
         "visual_signals": signals,
+        "auto_attach_eligible": False,
+        "auto_attach_reasons": [],
+        "auto_attach_priority": 0,
+        **(numeric_grid or {}),
     }
 
 

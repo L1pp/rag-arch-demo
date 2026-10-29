@@ -6,7 +6,6 @@ from collections import Counter
 from collections.abc import Sequence
 from contextlib import contextmanager
 from datetime import datetime, timezone
-import hashlib
 import json
 import math
 import os
@@ -62,20 +61,6 @@ def _fsync_directory(path: Path) -> None:
         pass
     finally:
         os.close(descriptor)
-
-
-def _sha256_file(path: Path) -> str:
-    digest = hashlib.sha256()
-    try:
-        with path.open("rb") as handle:
-            while True:
-                block = handle.read(1024 * 1024)
-                if not block:
-                    break
-                digest.update(block)
-    except OSError as exc:
-        raise BinaryBM25StoreError("无法读取BM25派生文件完整性数据。") from exc
-    return digest.hexdigest()
 
 
 def _file_size(path: Path) -> int:
@@ -155,47 +140,6 @@ def _row_ids(rows) -> list[str]:
     return [chunk_id for chunk_id, _ in rows]
 
 
-def _coerce_source_paths(source_paths) -> list[Path]:
-    if source_paths is None:
-        return []
-    if isinstance(source_paths, (str, os.PathLike)):
-        values = [source_paths]
-    else:
-        values = list(source_paths)
-    return [Path(value) for value in values]
-
-
-def _source_snapshot(paths: Sequence[Path]) -> list[dict[str, Any]]:
-    snapshot = []
-    for path in paths:
-        if _is_link_or_junction(path):
-            raise BinaryBM25StoreError("BM25 build source不得为符号链接或junction。")
-        try:
-            stat = path.stat()
-            regular_file = path.is_file()
-        except OSError as exc:
-            raise BinaryBM25StoreError("BM25 build source缺失或无法stat。") from exc
-        if not regular_file:
-            raise BinaryBM25StoreError("BM25 build source必须是普通文件。")
-        snapshot.append({
-            "name": path.name,
-            "device": int(stat.st_dev),
-            "inode": int(stat.st_ino),
-            "size_bytes": int(stat.st_size),
-            "mtime_ns": int(stat.st_mtime_ns),
-        })
-    return snapshot
-
-
-def snapshot_bm25_sources(source_paths=()) -> list[dict[str, Any]]:
-    """Capture private basename/stat evidence for a CLI load/build boundary.
-
-    This is a construction-time consistency check only. Runtime package
-    matching always uses exact chunk IDs, text, order, and tokenizer identity.
-    """
-    return _source_snapshot(_coerce_source_paths(source_paths))
-
-
 def _close_memmap(array: np.memmap | None) -> None:
     if array is None:
         return
@@ -262,17 +206,11 @@ def build_core_bm25(directory: str | Path, *, chunks: Sequence,
     """Build and atomically publish compact BM25 postings for current chunks.
 
     Only one chunk's ``Counter`` is alive at a time. Two passes build document
-    frequencies first, then scatter postings through mmap cursors. Source paths
-    are stat-checked before and after the build; only basenames and stat values
-    are recorded, with no source hash or persistent corpus freeze.
+    frequencies first, then scatter postings through mmap cursors. The legacy
+    source_paths and expected_source_stats arguments are accepted for caller
+    compatibility but do not trigger source snapshots or comparisons.
     """
     rows = _effective_chunks(chunks)
-    build_sources = _coerce_source_paths(source_paths)
-    expected_stats = (None if expected_source_stats is None
-                      else list(expected_source_stats))
-    source_stat_before = _source_snapshot(build_sources)
-    if expected_stats is not None and source_stat_before != expected_stats:
-        raise BinaryBM25StoreError("BM25源文件在chunk加载后、构建前已变化。")
     tokenize, tokenizer_contract = _tokenizer_parts()
     root = Path(directory)
     if _is_link_or_junction(root):
@@ -374,11 +312,6 @@ def build_core_bm25(directory: str | Path, *, chunks: Sequence,
                 cursors[term_id] += 1
         if vocabulary_count and not np.array_equal(cursors, offsets[1:]):
             raise BinaryBM25StoreError("倒排cursor未完整填充。")
-        source_stat_after = _source_snapshot(build_sources)
-        if (source_stat_before != source_stat_after
-                or (expected_stats is not None and source_stat_after != expected_stats)):
-            raise BinaryBM25StoreError("BM25构建期间源文件被替换或修改。")
-
         for array in mapped:
             array.flush()
             _close_memmap(array)
@@ -421,8 +354,6 @@ def build_core_bm25(directory: str | Path, *, chunks: Sequence,
             "length_dtype": length_dtype.name,
             "df_dtype": df_dtype.name,
             "row_ids": _row_ids(rows),
-            "source_stat_before": source_stat_before,
-            "source_stat_after": source_stat_after,
             "arrays": {
                 "offsets.npy": {"shape": [vocabulary_count + 1], "dtype": "uint64"},
                 "doc_lengths.npy": {"shape": [physical_docs], "dtype": length_dtype.name},
@@ -436,11 +367,7 @@ def build_core_bm25(directory: str | Path, *, chunks: Sequence,
             "array_bytes": {
                 filename: (temporary / filename).stat().st_size for filename in array_paths
             },
-            "array_sha256": {
-                filename: _sha256_file(temporary / filename) for filename in array_paths
-            },
             "vocabulary_bytes": vocabulary_path.stat().st_size,
-            "vocabulary_sha256": _sha256_file(vocabulary_path),
             "metadata_bytes": metadata_path.stat().st_size,
         }
         manifest_path = temporary / "manifest.json"
@@ -450,10 +377,6 @@ def build_core_bm25(directory: str | Path, *, chunks: Sequence,
             handle.write("\n")
             handle.flush()
             os.fsync(handle.fileno())
-        latest_source_stats = _source_snapshot(build_sources)
-        if (latest_source_stats != source_stat_after
-                or (expected_stats is not None and latest_source_stats != expected_stats)):
-            raise BinaryBM25StoreError("BM25发布前源文件状态已变化。")
         _fsync_directory(temporary)
         temporary.replace(published)
         _fsync_directory(versions)
@@ -619,23 +542,6 @@ class BinaryBM25Store:
                 or manifest.get("version_id") != version_id
                 or manifest.get("tokenizer") != tokenizer_contract):
             raise BinaryBM25StoreError("BM25格式、版本或tokenizer identity不匹配。")
-        source_before = manifest.get("source_stat_before")
-        source_after = manifest.get("source_stat_after")
-        if (not isinstance(source_before, list) or not isinstance(source_after, list)
-                or source_before != source_after):
-            raise BinaryBM25StoreError("BM25 manifest构建期源stat记录不一致。")
-        for source_stat in source_before:
-            if (not isinstance(source_stat, dict)
-                    or set(source_stat) != {"name", "device", "inode", "size_bytes", "mtime_ns"}
-                    or not isinstance(source_stat.get("name"), str)
-                    or not source_stat["name"]
-                    or Path(source_stat["name"]).name != source_stat["name"]
-                    or "/" in source_stat["name"] or "\\" in source_stat["name"]
-                    or ":" in source_stat["name"]
-                    or any(type(source_stat.get(field)) is not int or source_stat[field] < 0
-                           for field in ("device", "inode", "size_bytes", "mtime_ns"))):
-                raise BinaryBM25StoreError("BM25 manifest源stat格式无效。")
-
         document_count = manifest.get("document_count")
         vocabulary_count = manifest.get("vocabulary_count")
         posting_count = manifest.get("posting_count")
@@ -682,14 +588,11 @@ class BinaryBM25Store:
         }
         arrays_manifest = manifest.get("arrays")
         file_bytes = manifest.get("array_bytes")
-        file_digests = manifest.get("array_sha256")
-        if (not isinstance(arrays_manifest, dict) or not isinstance(file_bytes, dict)
-                or not isinstance(file_digests, dict)):
+        if not isinstance(arrays_manifest, dict) or not isinstance(file_bytes, dict):
             raise BinaryBM25StoreError("BM25 manifest数组目录无效。")
         expected_array_names = set(expected_shapes)
         if (set(arrays_manifest) != expected_array_names
-                or set(file_bytes) != expected_array_names
-                or set(file_digests) != expected_array_names):
+                or set(file_bytes) != expected_array_names):
             raise BinaryBM25StoreError("BM25 manifest数组文件集合无效。")
         for filename, shape in expected_shapes.items():
             expected_meta = arrays_manifest[filename]
@@ -703,15 +606,11 @@ class BinaryBM25Store:
             if not valid_meta:
                 raise BinaryBM25StoreError("BM25 manifest数组shape或dtype无效。")
             if (type(file_bytes.get(filename)) is not int
-                    or file_bytes[filename] != _file_size(paths[filename])
-                    or not isinstance(file_digests.get(filename), str)
-                    or not re.fullmatch(r"[0-9a-f]{64}", file_digests[filename])):
-                raise BinaryBM25StoreError("BM25数组文件长度或SHA256元数据无效。")
+                    or file_bytes[filename] != _file_size(paths[filename])):
+                raise BinaryBM25StoreError("BM25数组文件长度无效。")
 
         if (type(manifest.get("vocabulary_bytes")) is not int
                 or manifest["vocabulary_bytes"] != _file_size(paths["vocabulary.jsonl"])
-                or not isinstance(manifest.get("vocabulary_sha256"), str)
-                or not re.fullmatch(r"[0-9a-f]{64}", manifest["vocabulary_sha256"])
                 or type(manifest.get("metadata_bytes")) is not int
                 or manifest["metadata_bytes"] != _file_size(paths["metadata.jsonl"])):
             raise BinaryBM25StoreError("BM25词表或元数据长度无效。")
@@ -768,12 +667,6 @@ class BinaryBM25Store:
                 if array.offset + array.nbytes != file_bytes[filename]:
                     raise BinaryBM25StoreError("BM25 NPY header数据区长度与文件长度不一致。")
                 loaded[filename] = array
-            for filename in expected_shapes:
-                if _sha256_file(paths[filename]) != file_digests[filename]:
-                    raise BinaryBM25StoreError(f"{filename} SHA256校验失败。")
-            if _sha256_file(paths["vocabulary.jsonl"]) != manifest["vocabulary_sha256"]:
-                raise BinaryBM25StoreError("BM25 vocabulary.jsonl SHA256校验失败。")
-
             offsets = loaded["offsets.npy"]
             doc_lengths_base = loaded["doc_lengths.npy"]
             doc_freqs_base = loaded["doc_freqs.npy"]

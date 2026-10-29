@@ -13,6 +13,7 @@ import math
 import os
 from pathlib import Path
 import stat
+import time
 from typing import Any, Callable
 
 from ..resource_supervision import resource_owner_descriptor_path
@@ -299,6 +300,51 @@ def _mark_exited(repository, worker_instance: str, resource: dict) -> bool:
     )
 
 
+def _recover_office_resource(repository, worker: dict, resource: dict, *, root: Path,
+                             local_host: str) -> dict:
+    """A launcher exit alone does not prove that its Office process group exited."""
+    worker_instance = worker["worker_instance"]
+    resource_id = resource["resource_id"]
+    try:
+        from ..office_conversion import probe_office_owner
+        owner_path = Path(resource["owner_path"]).absolute()
+        expected = (root / "data/runtime/office_conversion/active.json").absolute()
+        if _norm_path(owner_path) != _norm_path(expected):
+            raise ValueError("office owner path is outside the conversion directory")
+        descriptor, file_identity = read_owner_descriptor(resource, worker, root=root)
+        child = validate_owner_descriptor(descriptor, resource, worker, local_host=local_host)
+        if child["host_id"].casefold() != local_host.casefold():
+            return {"resource_id": resource_id, "state": "unknown", "action": "remote_child"}
+        outcome = probe_office_owner(
+            owner_path, pid=child["pid"], token=child["process_start_token"],
+            executable=child["executable"])
+        # Unknown descendants must never be converted into an exited identity by
+        # the database backfill, even when the launcher itself has disappeared.
+        proven_exited = outcome == ProcessProbeState.EXITED
+        if resource.get("pid") is None:
+            updated = repository.backfill_unknown_resource_identity(
+                worker_instance, resource_id,
+                owner_descriptor_path=resource["owner_descriptor_path"],
+                descriptor=descriptor, descriptor_file_identity=file_identity,
+                probe_state="exited" if proven_exited else "unknown")
+            if proven_exited:
+                return {"resource_id": resource_id, "state": updated["state"],
+                        "action": "office_group_exit_backfilled"}
+        elif proven_exited:
+            accepted = _mark_exited(repository, worker_instance, resource)
+            return {"resource_id": resource_id,
+                    "state": "exited" if accepted else "unknown",
+                    "action": "office_group_exited" if accepted else "exit_identity_rejected"}
+    except Exception as exc:
+        if resource["state"] != "unknown":
+            repository.resource_unknown(worker_instance, resource_id, "office_owner_untrusted")
+        return {"resource_id": resource_id, "state": "unknown",
+                "action": "office_owner_untrusted", "reason": type(exc).__name__}
+    if resource["state"] != "unknown":
+        repository.resource_unknown(worker_instance, resource_id, "office_group_exit_unconfirmed")
+    return {"resource_id": resource_id, "state": "unknown", "action": "office_group_exit_unconfirmed"}
+
+
 def _recover_one_resource(repository, worker: dict, resource: dict, *, root: Path,
                           cleanup_owned: bool, local_host: str, probe: Callable,
                           psutil_module=None) -> dict:
@@ -312,6 +358,10 @@ def _recover_one_resource(repository, worker: dict, resource: dict, *, root: Pat
 
     if state == "exited":
         return {"resource_id": resource_id, "state": "exited", "action": "already_exited"}
+    if (resource.get("kind") == "word" and resource.get("owner_path")
+            and Path(resource["owner_path"]).name == "active.json"):
+        return _recover_office_resource(repository, worker, resource, root=root,
+                                        local_host=local_host)
     if state == "starting" and pid is None:
         repository.resource_unknown(worker_instance, resource_id, "worker_exited_before_resource_attach")
         resource = {**resource, "state": "unknown"}
@@ -524,7 +574,99 @@ def resolve_task(repository, task_id: str, proof: dict, *, root: str | Path = RO
     return repository.resolve_confirmed_task_by_proof(task_id, proof)
 
 
+def maintain_recovery(repository, *, cleanup_owned: bool = True,
+                      cooldown_seconds: float = 120.0, root: str | Path = ROOT,
+                      probe: Callable = probe_process_identity,
+                      psutil_module=None) -> list[dict[str, Any]]:
+    """Isolate interrupted attempts after proving all local execution has ended.
+
+    Remote request completion is deliberately not inferred from a timeout or
+    local process exit. The cooldown only spaces recovery and subsequent work;
+    audit records continue to say that external work is unknown. This path never
+    retries the interrupted task and does not weaken explicit administrator
+    resolution. A running, inaccessible or remote local resource still blocks
+    release rather than being labelled exited.
+    """
+    if (isinstance(cooldown_seconds, bool) or not isinstance(cooldown_seconds, (int, float))
+            or not math.isfinite(cooldown_seconds) or cooldown_seconds < 0):
+        raise ValueError("cooldown_seconds 必须是有限非负数。")
+    outcomes = recover_resources(
+        repository, cleanup_owned=cleanup_owned, root=root, probe=probe,
+        psutil_module=psutil_module,
+    )
+    local_host = local_host_id()
+    for worker in repository.workers():
+        worker_instance = worker.get("worker_instance")
+        if not worker_instance or worker.get("state") != "exited":
+            continue
+        worker_host = worker.get("host_id")
+        if not isinstance(worker_host, str) or worker_host.casefold() != local_host.casefold():
+            continue
+        tasks = repository.recovery_tasks_for_worker(worker_instance)
+        if not tasks:
+            continue
+        report = {"kind": "task_isolation", "worker_instance": worker_instance,
+                  "isolated_tasks": [], "blocked": [],
+                  "external_work_state": "unknown", "automatic_retry": False}
+        outcomes.append(report)
+        parent_state = _probe(
+            worker_host, int(worker["pid"]), worker["process_start_token"], None,
+            local_host=local_host, probe=probe, psutil_module=psutil_module,
+        )
+        if parent_state != ProcessProbeState.EXITED:
+            report["blocked"].append("worker_exit_unconfirmed")
+            continue
+        exited_at = worker.get("exited_at")
+        if exited_at is None or time.time() < float(exited_at) + cooldown_seconds:
+            report["blocked"].append("cooldown")
+            if exited_at is not None:
+                report["eligible_after"] = float(exited_at) + cooldown_seconds
+            continue
+        resources = repository.resources_for_worker(worker_instance)
+        for resource in resources:
+            if resource.get("state") != "exited":
+                report["blocked"].append("resource_exit_unconfirmed")
+                break
+            identity = (resource.get("host_id"), resource.get("pid"),
+                        resource.get("process_start_token"))
+            if identity == (None, None, None):
+                # Exited-before-attach is accepted only after the existing
+                # resource lifecycle has durably established no child exists.
+                continue
+            child_state = _probe(
+                resource.get("host_id"), resource.get("pid"),
+                resource.get("process_start_token"), resource.get("executable"),
+                local_host=local_host, probe=probe, psutil_module=psutil_module,
+            )
+            if child_state != ProcessProbeState.EXITED:
+                report["blocked"].append("resource_exit_unconfirmed")
+                break
+        if report["blocked"]:
+            continue
+        proof = {
+            "operator": "scheduled-maintenance",
+            "reason": "Exact local worker and all registered resources exited; isolate without retry.",
+            "resolution_kind": "local_exit_isolation", "external_work_state": "unknown",
+            "automatic_retry": False,
+            "worker": {key: worker[key] for key in (
+                "worker_instance", "host_id", "pid", "process_start_token")},
+            "resources": [{key: resource.get(key) for key in (
+                "resource_id", "host_id", "pid", "process_start_token")}
+                for resource in resources],
+        }
+        for task in tasks:
+            accepted = repository.isolate_confirmed_local_exit(
+                worker_instance, task["task_id"], task["attempt_token"], proof,
+                cooldown_seconds=cooldown_seconds,
+            )
+            if accepted:
+                report["isolated_tasks"].append(task["task_id"])
+            else:
+                report["blocked"].append("task_state_changed_or_resources_unconfirmed")
+    return outcomes
+
+
 __all__ = [
-    "read_owner_descriptor", "recover_resources", "resolve_task",
+    "read_owner_descriptor", "recover_resources", "maintain_recovery", "resolve_task",
     "validate_owner_descriptor",
 ]

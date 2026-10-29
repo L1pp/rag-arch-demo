@@ -10,6 +10,7 @@ from starlette.concurrency import run_in_threadpool
 from ..config import DEFAULT_PLAN_MAX_STEPS, DEFAULT_PLAN_MAX_TOOL_CALLS
 from ..loaders import MAX_UPLOAD_BYTES, validate_upload_sizes
 from .tenancy import check_workspace, current_documents
+from .page_region_query import parse_region_query, region_query_value
 
 
 def validate_task_documents(body, store):
@@ -38,7 +39,7 @@ def create_document_router():
     def asset_view(row, workspace_id):
         return {**row, "page_url": "/viewer/pages?" + urlencode({
             "asset": row["asset_id"], "workspace_id": workspace_id})
-            if Path(row["filename"]).suffix.lower() in {".pdf", ".docx"} else None}
+            if Path(row["filename"]).suffix.lower() in {".pdf", ".doc", ".docx"} else None}
 
     def read(operation, *, page=False):
         try:
@@ -97,7 +98,7 @@ def create_document_router():
         store = current_documents(request)
         rows = read(lambda: store.registered_plans())
         return {"plans": [{**row, "page_url": "/viewer/pages?" + urlencode({"plan_id": row["plan_id"]})
-                           if Path(row["filename"]).suffix.lower() in {".pdf", ".docx"} else None} for row in rows],
+                           if Path(row["filename"]).suffix.lower() in {".pdf", ".doc", ".docx"} else None} for row in rows],
                 "defaults": {"max_steps": DEFAULT_PLAN_MAX_STEPS, "max_tool_calls": DEFAULT_PLAN_MAX_TOOL_CALLS}}
 
     def page_service(request, store, asset, plan_id, workspace_id):
@@ -108,7 +109,7 @@ def create_document_router():
             source = store.get(asset)
             service = store.pages_for_asset(asset)
             if service is None:
-                raise ValueError("此文件不是可分页查看的PDF或DOCX原件。")
+                raise ValueError("此文件不是可分页查看的 PDF、DOC 或 DOCX 原件。")
             return service, source.filename, "上传资料"
         plan = store.get_plan(registered_plan_id=plan_id)
         return store.pages_for_plan(plan.document, plan.asset, corpus=None), plan.document.filename, plan_id
@@ -116,38 +117,47 @@ def create_document_router():
     @router.get("/api/documents/pages")
     def pages(request: Request, response: Response, asset: str | None = None, plan_id: str | None = None,
               workspace_id: str | None = None, source_ref: str | None = None,
-              page: int = Query(default=1, ge=1)):
+              page: int = Query(default=1, ge=1), region: str | None = Query(default=None, max_length=200)):
         store = current_documents(request)
         response.headers["Cache-Control"] = "private, no-store"
         response.headers["Vary"] = "Cookie"
 
         def perform():
             service, title, code = page_service(request, store, asset, plan_id, workspace_id)
+            selected_region = parse_region_query(region)
             sources = service.sources()
             if not sources:
-                raise ValueError("此来源暂不支持分页图像；PDF和DOCX原件可按页查看。")
+                raise ValueError("此来源暂不支持分页图像；PDF、DOC 和 DOCX 原件可按页查看。")
             selected = next((row for row in sources if row["source_ref"] == source_ref), None) if source_ref else sources[0]
             if selected is None:
                 raise KeyError("所选来源未登记。")
             ref = selected["source_ref"]
             info = service.list_pages(ref, start=page, limit=1)
             query = {"source_ref": ref, "page": page}
+            if selected_region is not None:
+                query["region"] = region_query_value(selected_region)
             query.update({"asset": asset, "workspace_id": workspace_id} if asset else {"plan_id": plan_id})
             return {"std_no": code, "title": title, "filename": selected["filename"], "source_ref": ref,
                     "page_count": info["page_count"],
                     "sources": [{"source_ref": row["source_ref"], "filename": row["filename"], "pages": []} for row in sources],
-                    "pages": [{"page": page, "image_url": "/api/documents/page-image?" + urlencode(query)}],
-                    "warning": "PDF使用原件物理页码；DOCX使用后台排版后的物理页码，不推测段落对应页。"}
+                    "pages": [{"page": page, "region": selected_region,
+                               "image_url": "/api/documents/page-image?" + urlencode(query)}],
+                    "warning": "PDF使用原件物理页码；DOC和DOCX使用后台排版后的物理页码，不推测段落对应页。"}
         return read(perform, page=True)
 
     @router.get("/api/documents/page-image")
     def image(request: Request, source_ref: str, page: int = Query(ge=1), asset: str | None = None,
-              plan_id: str | None = None, workspace_id: str | None = None):
+              plan_id: str | None = None, workspace_id: str | None = None,
+              region: str | None = Query(default=None, max_length=200)):
         store = current_documents(request)
 
         def perform():
             service, _, _ = page_service(request, store, asset, plan_id, workspace_id)
-            return service.read_page(source_ref, page)["image_bytes"]
+            if not any(row.get("source_ref") == source_ref for row in service.sources()):
+                raise KeyError("所选来源未登记。")
+            selected_region = parse_region_query(region)
+            return service.read_page(source_ref, page,
+                **({"region": selected_region} if selected_region is not None else {}))["image_bytes"]
         data = read(perform, page=True)
         return Response(data, media_type="image/png",
                         headers={"Cache-Control": "private, no-store", "Vary": "Cookie"})

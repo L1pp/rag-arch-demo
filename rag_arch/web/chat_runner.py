@@ -11,13 +11,15 @@ from urllib.parse import urlencode
 from ..config import load_settings
 from ..generation_experiments import safe_error
 from ..graph_agent import _usage, _usage_total
-from ..models import Answer, Chunk, ConversationTurn, SearchHit
+from ..models import Answer, Chunk, ConversationTurn, SearchHit, ocr_evidence_warnings
 from ..providers import (create_chat_model, create_embeddings, create_reranker,
                          create_web_search_provider)
-from ..qa import answer_question
+from ..qa import SYSTEM_PROMPT, answer_question
 from ..runtime_audit import (arecord_event, arecord_run, record_event, record_run,
                              tenant_audit_metadata)
 from ..async_support import TaskResourceCleanupError, run_local
+from .ocr_preparation import OCRDocumentUnreadable
+from .page_region_query import page_source_url
 
 
 def _cancelled(cancel_event):
@@ -94,18 +96,30 @@ def _file_fields(prepared, answer, file_mode):
         public = {key: item[key] for key in ("asset_id", "filename", "size_bytes")}
         public["page_url"] = (
             "/viewer/pages?" + urlencode({"asset": public["asset_id"], "workspace_id": prepared.workspace_id})
-            if public["filename"].lower().endswith((".pdf", ".docx")) else None)
+            if public["filename"].lower().endswith((".pdf", ".doc", ".docx")) else None)
         files.append(public)
     by_asset = {row["asset_id"]: row for row in files}
     file_warnings = []
+    source_warnings = set()
     for document in prepared.collection.documents:
-        file_warnings.extend(f"{document.filename}（文字提取）：{warning}" for warning in document.warnings)
+        ocr_pages = getattr(document, "ocr_pages", [])
+        warnings = list(dict.fromkeys(list(document.warnings) +
+            ocr_evidence_warnings(ocr_pages, source_kind=document.source_kind, units=document.units)))
+        source_warnings.update(warnings)
+        file_warnings.extend(f"{document.filename}（文字提取）：{warning}" for warning in warnings)
         asset = prepared.document_assets.get(document.doc_id)
         if asset and asset["asset_id"] in by_asset:
-            by_asset[asset["asset_id"]].update(warnings=list(document.warnings),
+            by_asset[asset["asset_id"]].update(warnings=warnings,
                 unread_pages=list(document.unread_pages), page_count=document.page_count)
+            if ocr_pages:
+                by_asset[asset["asset_id"]]["ocr_pages"] = deepcopy(ocr_pages)
     if file_mode == "pages_only":
-        file_warnings.append("附件没有可检索文字；可按需读取原页。本轮未执行OCR，页图读取不代表全文文字已完整提取。")
+        if any(ocr_evidence_warnings(getattr(document, "ocr_pages", []),
+                                     source_kind=document.source_kind, units=document.units)
+               for document in prepared.collection.documents):
+            file_warnings.append("附件没有可检索文字；OCR未完成或未取得可用结果，可按需读取原页。")
+        else:
+            file_warnings.append("附件没有可检索文字；可按需读取原页。本轮未执行OCR，页图读取不代表全文文字已完整提取。")
     citations = []
     for number in (answer.citation_check or {}).get("cited_numbers", []):
         if type(number) is not int or not 1 <= number <= len(answer.hits):
@@ -116,14 +130,21 @@ def _file_fields(prepared, answer, file_mode):
             continue
         file = by_asset[asset["asset_id"]]
         url = file["page_url"]
-        # PDF text units have exact physical pages. DOCX paragraphs/tables do
+        # PDF text units have exact physical pages. DOC/DOCX paragraphs/tables do
         # not establish rendered pagination, so retain their original locator.
-        page = chunk.locator.get("page") if chunk.source_kind == "pdf" else None
+        is_ocr = chunk.locator.get("text_source") == "cloud_ocr"
+        rendered_word_page = (is_ocr and chunk.source_kind in {"doc", "docx"}
+                              and chunk.locator.get("page_numbering") == "system_rendered_page")
+        page = chunk.locator.get("page") if chunk.source_kind == "pdf" or rendered_word_page else None
         if url and type(page) is int and page > 0:
             url += "&" + urlencode({"page": page})
-        citations.append({"evidence_id": f"S{number}", "kind": "file_chunk",
+        citation = {"evidence_id": f"S{number}", "kind": "file_chunk",
             "asset_id": file["asset_id"], "filename": chunk.filename,
-            "text": chunk.text, "locator": deepcopy(chunk.locator), "page_url": url})
+            "text": chunk.text, "locator": deepcopy(chunk.locator), "page_url": url}
+        if is_ocr:
+            citation.update(recognition_verified=False,
+                            recognition_warning="OCR文字未经原页逐字核实，请回看该页。")
+        citations.append(citation)
     page_sources = deepcopy(answer.page_sources)
     contexts = getattr(prepared.pages, "source_context", {})
     for source in page_sources:
@@ -131,15 +152,25 @@ def _file_fields(prepared, answer, file_mode):
         file = by_asset.get(asset_id)
         if file:
             source["asset_id"] = asset_id
-            source["page_url"] = file["page_url"]
-            if source["page_url"] and type(source.get("page")) is int and source["page"] > 0:
-                source["page_url"] += "&" + urlencode({"page": source["page"]})
+            source["page_url"] = page_source_url(file["page_url"], source)
     return {"files": files, "file_mode": file_mode,
             "uses_embeddings": bool(prepared.collection.uses_embeddings and prepared.collection.chunks),
             "citations": citations, "page_sources": page_sources,
             "grounded": answer.grounded, "citation_check": deepcopy(answer.citation_check),
             "hits": [asdict(hit) for hit in answer.hits],
-            "warnings": list(dict.fromkeys(file_warnings + list(answer.warnings)))}
+            "warnings": list(dict.fromkeys(file_warnings + [warning for warning in answer.warnings
+                                                              if warning not in source_warnings]))}
+
+
+def _ocr_system_prompt(prepared):
+    """Tell the model the evidence boundary before it uses attachment text."""
+    if not any(ocr_evidence_warnings(getattr(document, "ocr_pages", []),
+                                     source_kind=document.source_kind, units=document.units)
+               for document in prepared.collection.documents):
+        return None
+    return (SYSTEM_PROMPT + "\n部分附件页含OCR补充文字或OCR未完成。OCR文字可能错写、漏读或错配表格；"
+            "重要数字、单位和上下文要回看原页，无法核对时明确待核。"
+            "未识别或未读取的内容不能据此断定原件没有；其他原生可读文字可分别使用。")
 
 
 class _ObservedModel:
@@ -315,6 +346,9 @@ def run_chat(request, progress, cancel_event, *, settings=None, model_factory=No
                 if not usable and (pages is None or not pages.sources()):
                     raise ValueError("附件没有可用文字或可按页读取的原件，暂不能问答。")
                 file_mode = collection.mode if usable else "pages_only"
+                ocr_prompt = _ocr_system_prompt(prepared)
+                if ocr_prompt is not None:
+                    qa_options["system_prompt"] = ocr_prompt
 
                 run_index = None
                 rerank_warnings = []
@@ -412,10 +446,14 @@ def run_chat(request, progress, cancel_event, *, settings=None, model_factory=No
                     "task_id": request.get("task_id"), "model": settings.chat_model,
                     "token_usage": _usage_total(samples), "audit_log": audit.info})
                 raise CancelledError("本轮聊天已取消。") from None
-            error = safe_error(exc, component="chat")
+            error = exc.as_error() if isinstance(exc, OCRDocumentUnreadable) else safe_error(exc, component="chat")
             audit.set_result({"status": "failed", "simulation": False,
                 "task_id": request.get("task_id"), "model": settings.chat_model,
                 "error": error, "token_usage": _usage_total(samples), "audit_log": audit.info})
+            if isinstance(exc, OCRDocumentUnreadable):
+                # This typed error is constructed from trusted page numbers and
+                # statuses; let the worker retain its safe OCR-specific message.
+                raise
             # Never pass provider str(exc), response bodies or credential-bearing URLs outward.
             raise RuntimeError(json.dumps(error, ensure_ascii=False)) from None
     return result
@@ -489,6 +527,9 @@ async def arun_chat(request, progress, cancel_event, *, settings=None, model_fac
                 if not usable and not page_sources:
                     raise ValueError("附件没有可用文字或可按页读取的原件，暂不能问答。")
                 file_mode = collection.mode if usable else "pages_only"
+                ocr_prompt = _ocr_system_prompt(prepared)
+                if ocr_prompt is not None:
+                    qa_options["system_prompt"] = ocr_prompt
 
                 run_index = None
                 rerank_warnings = []
@@ -596,10 +637,13 @@ async def arun_chat(request, progress, cancel_event, *, settings=None, model_fac
                     raise
                 raise CancelledError("本轮聊天已取消。") from None
             primary_failed = True
-            error = safe_error(exc, component="chat")
+            error = exc.as_error() if isinstance(exc, OCRDocumentUnreadable) else safe_error(exc, component="chat")
             audit.set_result({"status": "failed", "simulation": False,
                 "task_id": request.get("task_id"), "model": settings.chat_model,
                 "error": error, "token_usage": _usage_total(samples), "audit_log": audit.info})
+            if isinstance(exc, OCRDocumentUnreadable):
+                # Finally still owns async resources even when this propagates.
+                raise
             raise RuntimeError(json.dumps(error, ensure_ascii=False)) from None
         finally:
             close_failures = []
