@@ -37,6 +37,8 @@ def _synthetic_pdf() -> bytes:
 
 def _blocking_worker_call(_operation, payload):
     """Test child: it waits for an explicit marker owned by the test."""
+    if _operation == "ready":
+        return os.getpid(), {"ready": True}
     started = Path(payload["started_path"])
     release = Path(payload["release_path"])
     temporary = started.with_suffix(".tmp")
@@ -105,6 +107,17 @@ class PdfSupervisionTests(unittest.TestCase):
             time.sleep(0.01)
         self.fail(f"test worker did not create {Path(path).name}")
 
+    def warm_blocking_worker(self, backend):
+        # Bound interpreter readiness separately from the operation deadline
+        # whose timeout and PID-identity behavior these tests actually assert.
+        original_timeout = backend.call_timeout
+        backend.call_timeout = 15
+        try:
+            backend._call("ready", {})
+            self.assertTrue(backend._process.is_alive())
+        finally:
+            backend.call_timeout = original_timeout
+
     def test_synthetic_pdf_keeps_sync_results_and_cleans_owned_temp(self):
         backend = self.make_backend(call_timeout=5)
         pdf = _synthetic_pdf()
@@ -143,6 +156,7 @@ class PdfSupervisionTests(unittest.TestCase):
             call_timeout=3.0, cleanup_timeout=0.5,
             _worker_callable=_blocking_worker_call,
         )
+        self.warm_blocking_worker(backend)
         pool = ThreadPoolExecutor(max_workers=1)
         self.addCleanup(pool.shutdown, wait=True, cancel_futures=True)
         started = time.monotonic()
@@ -166,6 +180,7 @@ class PdfSupervisionTests(unittest.TestCase):
             _worker_callable=_blocking_worker_call,
         )
         self.addCleanup(_close_backend, backend)
+        self.warm_blocking_worker(backend)
         pool = ThreadPoolExecutor(max_workers=1)
         self.addCleanup(pool.shutdown, wait=True, cancel_futures=True)
         future = pool.submit(backend._call, "block", self.block_payload())
@@ -191,6 +206,7 @@ class PdfSupervisionTests(unittest.TestCase):
         )
         self.addCleanup(_close_backend, backend)
         with patch("rag_arch.pdf_backend.begin_resource", return_value=handle):
+            self.warm_blocking_worker(backend)
             future_pool = ThreadPoolExecutor(max_workers=1)
             self.addCleanup(future_pool.shutdown, wait=True, cancel_futures=True)
             future = future_pool.submit(backend._call, "block", self.block_payload())
@@ -221,6 +237,7 @@ class PdfSupervisionTests(unittest.TestCase):
         )
         self.addCleanup(_close_backend, backend)
         with patch("rag_arch.pdf_backend.begin_resource", return_value=handle):
+            self.warm_blocking_worker(backend)
             future_pool = ThreadPoolExecutor(max_workers=1)
             self.addCleanup(future_pool.shutdown, wait=True, cancel_futures=True)
             future = future_pool.submit(backend._call, "block", self.block_payload())

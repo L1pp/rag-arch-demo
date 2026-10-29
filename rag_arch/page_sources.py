@@ -2,6 +2,7 @@
 from __future__ import annotations
 from copy import deepcopy
 from itertools import chain
+import os
 from pathlib import Path
 from .config import ROOT
 from .document_pages import DocumentPageService, SUPPORTED_SUFFIXES
@@ -36,7 +37,7 @@ def _role_path(root, value):
     if not isinstance(value, str) or not value or "://" in value:
         return None
     path = Path(value)
-    return str((path if path.is_absolute() else Path(root) / path).resolve()).casefold()
+    return os.path.normcase(str((path if path.is_absolute() else Path(root) / path).resolve()))
 
 
 def _catalog_role_ranges(catalog, root, selected):
@@ -99,7 +100,7 @@ class PageSources(DocumentPageService):
         if path is not None:
             full = Path(path)
             full = full if full.is_absolute() else self.project_root / full
-            self._path_refs[str(full.resolve()).casefold()] = source_ref
+            self._path_refs[os.path.normcase(str(full.resolve()))] = source_ref
             self.source_context[source_ref]["source_path"] = str(full.resolve())
         return value
 
@@ -165,7 +166,7 @@ class PageSources(DocumentPageService):
             return None
         full = Path(path)
         full = full if full.is_absolute() else self.project_root / full
-        return self._path_refs.get(str(full.resolve()).casefold())
+        return self._path_refs.get(os.path.normcase(str(full.resolve())))
 
 
 def _locations(record):
@@ -215,7 +216,7 @@ def add_standard_sources(service, corpus, selected=None):
                     continue
                 path = Path(value)
                 path = path if path.is_absolute() else service.project_root / path
-                normalized = str(path.absolute()).casefold()
+                normalized = os.path.normcase(str(path.resolve()))
                 if normalized in seen:
                     continue
                 seen.add(normalized)

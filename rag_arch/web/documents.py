@@ -52,6 +52,17 @@ def _document_cache_weight(document, original_bytes=0) -> int:
     return max(1, original_bytes * 4, weight)
 
 
+def _cacheable_ocr_document(document) -> bool:
+    # A no-text OCR outcome may be task-budget dependent. Rebuild it on a
+    # later task; the OCR client's own durable markers still fence re-requests.
+    return bool(getattr(document, "units", ())) or not getattr(document, "ocr_pages", ())
+
+
+def _cacheable_ocr_chat(prepared) -> bool:
+    return all(_cacheable_ocr_document(document)
+               for document in getattr(prepared.collection, "documents", ()))
+
+
 def _chat_cache_weight(prepared, original_bytes=0) -> int:
     collection = prepared.collection
     weight = sum(_document_cache_weight(doc) for doc in getattr(collection, "documents", ()))
@@ -232,7 +243,7 @@ class DocumentStore:
                 self._cache_bytes -= evicted_weight
         return value
 
-    def _memoized(self, namespace: str, key: Any, build, weight):
+    def _memoized(self, namespace: str, key: Any, build, weight, *, cache_if=None):
         cached = self._cache_get(namespace, key)
         if cached is not None:
             return cached
@@ -256,7 +267,8 @@ class DocumentStore:
             return future.result()
         try:
             value = build()
-            self._cache_put(namespace, key, value, weight(value))
+            if cache_if is None or cache_if(value):
+                self._cache_put(namespace, key, value, weight(value))
             future.set_result(value)
             return value
         except BaseException as exc:
@@ -267,7 +279,7 @@ class DocumentStore:
                 if self._inflight.get(token) is future:
                     self._inflight.pop(token, None)
 
-    async def _amemoized(self, namespace: str, key: Any, build, weight):
+    async def _amemoized(self, namespace: str, key: Any, build, weight, *, cache_if=None):
         """Share async cache builds without letting a cancelled waiter cancel peers."""
         cached = self._cache_get(namespace, key)
         if cached is not None:
@@ -289,7 +301,8 @@ class DocumentStore:
             async def complete_build():
                 try:
                     value = await build()
-                    self._cache_put(namespace, key, value, weight(value))
+                    if cache_if is None or cache_if(value):
+                        self._cache_put(namespace, key, value, weight(value))
                     if not future.done():
                         future.set_result(value)
                 except BaseException as exc:
@@ -328,7 +341,7 @@ class DocumentStore:
             # An exception raised by the shared build is distinct from this
             # caller receiving a cancellation request; a new caller may retry.
             if current is not None and current.cancelling() == 0:
-                return await self._amemoized(namespace, key, build, weight)
+                return await self._amemoized(namespace, key, build, weight, cache_if=cache_if)
             with self._lock:
                 remaining = self._async_inflight_waiters.get(token, 1) - 1
                 if remaining > 0:
@@ -608,18 +621,17 @@ class DocumentStore:
             data, _ = self._load_bytes(record)
             loaded = self._parse_upload(record, data)
             if self.ocr_client is not None and loaded.source_kind in {"pdf", "doc", "docx"}:
-                from .ocr_preparation import OCRDocumentUnreadable, supplement_document
+                from .ocr_preparation import supplement_document
                 pages = self.pages_for_asset(asset_id)
                 if pages is not None:
                     loaded = supplement_document(
                         loaded, pages, f"upload:{asset_id}", self.ocr_client,
                         record.path.parent / "ocr")
-                    if not loaded.units and loaded.ocr_pages:
-                        raise OCRDocumentUnreadable(loaded.ocr_pages, source_kind=loaded.source_kind)
             return loaded
 
         return self._memoized("loaded", asset_id, build,
-                              lambda value: _document_cache_weight(value, record.size_bytes))
+                              lambda value: _document_cache_weight(value, record.size_bytes),
+                              cache_if=_cacheable_ocr_document)
 
     def _build_collection(self, records: list[UploadAsset], embeddings=None,
                           *, loaded_documents=None):
@@ -691,7 +703,8 @@ class DocumentStore:
             return prepared
 
         return self._memoized("chat", key, build,
-                              lambda value: _chat_cache_weight(value, sum(record.size_bytes for record in records)))
+                              lambda value: _chat_cache_weight(value, sum(record.size_bytes for record in records)),
+                              cache_if=_cacheable_ocr_chat)
 
     async def aprepare_chat(self, attachment_ids: Iterable[str] | str,
                             *, embeddings=None, embeddings_factory=None) -> PreparedChat:
@@ -747,7 +760,8 @@ class DocumentStore:
 
         return await self._amemoized(
             "chat", key, build,
-            lambda value: _chat_cache_weight(value, sum(record.size_bytes for record in records)))
+            lambda value: _chat_cache_weight(value, sum(record.size_bytes for record in records)),
+            cache_if=_cacheable_ocr_chat)
 
     def pages_for_asset(self, asset_id: str):
         """Return the cached single-upload page service, if it is pageable."""
@@ -832,7 +846,8 @@ class DocumentStore:
                 return PlanContext(document, asset, context_id)
 
             return self._memoized("plan", key, build_uploaded,
-                                  lambda value: _document_cache_weight(value.document, record.size_bytes))
+                                  lambda value: _document_cache_weight(value.document, record.size_bytes),
+                                  cache_if=lambda value: _cacheable_ocr_document(value.document))
 
     def pages_for_plan(self, document: PlanDocument, asset: dict[str, Any], corpus=None):
         path = str(asset.get("path") or "")

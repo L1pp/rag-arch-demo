@@ -605,7 +605,7 @@
       "path": "rag_arch/web/resource_recovery.py",
       "origin": "local-core/web/resource_recovery.py",
       "selection": "application-runtime-and-storage",
-      "adapted": false
+      "adapted": true
     },
     {
       "path": "rag_arch/web/standards_resources.py",

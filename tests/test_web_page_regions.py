@@ -1,7 +1,9 @@
 """Protected region routes, source links and public result propagation."""
+from copy import deepcopy
 from io import BytesIO
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from threading import Event
 import time
 from types import SimpleNamespace
 from urllib.parse import parse_qs, urlsplit
@@ -9,13 +11,16 @@ import unittest
 
 from fastapi.testclient import TestClient
 from PIL import Image
+import pymupdf
 
 from rag_arch.standards import StandardCorpus
 from rag_arch.multimodal import image_source_record
 from rag_arch.pdf_backend import ProcessPdfBackend
+from rag_arch.page_sources import page_evidence_record, plan_page_sources
+from rag_arch.plan_documents import PlanDocument
 from rag_arch.web.app import create_app
 from rag_arch.web.page_region_query import page_source_url, parse_region_query
-from rag_arch.web.plan_runner import _citation_rows, _public_page_sources
+from rag_arch.web.plan_runner import _ObservedPageService, _citation_rows, _public_page_sources
 from rag_arch.web.standards_resources import StandardsResources
 from rag_arch.web.task_service import TaskService
 from tests import test_web_document_api as document_api
@@ -125,7 +130,8 @@ class StandardRegionHTTPTests(unittest.TestCase):
         service = self.resources.page_service("GB 99999-2099")
         source = next(row for row in service.sources() if row["filename"] == "selected.pdf")
         record = {"evidence_id": "PAGE:ignored:2:REGION:0.1,0.2,0.6,0.45", "kind": "page_image",
-                  "std_no": "GB 99999-2099", "text": "image", "page_source": {**source, "page": 2, "region": REGION}}
+                  "std_no": "GB 99999-2099", "text": "image", "page_source": {**source, "page": 2, "region": REGION},
+                  "source_spans": [{"source_path": str(self.root / "selected.pdf"), "page_start": 2, "page_end": 2}]}
         link = self.resources.citation(record)["page_url"]
         query = {key: values[0] for key, values in parse_qs(urlsplit(link).query).items()}
         self.assertEqual(query["page"], "2")
@@ -137,6 +143,55 @@ class StandardRegionHTTPTests(unittest.TestCase):
         self.assertEqual(image.status_code, 200)
         self.assertTrue(image.content.startswith(b"\x89PNG"))
         self.assertIn("no-store", image.headers["Cache-Control"])
+
+    def test_model_and_viewer_registries_map_saved_path_not_colliding_ref(self):
+        plan_path = self.root / "fictional-plan.pdf"
+        with pymupdf.open() as document:
+            document.new_page().insert_text((40, 40), "Fictional plan")
+            document.save(plan_path)
+        plan = PlanDocument("fictional", plan_path.name, [], source_kind="pdf")
+        pages = plan_page_sources(plan, {"filename": plan_path.name, "path": str(plan_path)},
+                                  corpus=self.corpus, root=self.root, pdf_backend=self.resources.pdf_backend)
+        model_sources = {row["source_ref"]: row["filename"] for row in pages.sources()}
+        viewer_sources = {row["source_ref"]: row["filename"]
+                          for row in self.resources.page_service("GB 99999-2099").sources()}
+        self.assertEqual(model_sources["standard:2"], "selected.pdf")
+        self.assertEqual(viewer_sources["standard:2"], "other-copy.pdf")
+        observed = _ObservedPageService(pages, lambda *_: None, Event())
+        image = observed.read_page("standard:2", 2, region=REGION)
+        record = page_evidence_record(image, observed)
+        self.assertEqual(record["page_source"]["source_ref"], "standard:2")
+        self.assertEqual(Path(record["source_spans"][0]["source_path"]).name, "selected.pdf")
+        original = deepcopy(record)
+        for model_ref in ("standard:2", "standard:missing"):
+            with self.subTest(model_ref=model_ref):
+                record["page_source"]["source_ref"] = model_ref
+                unchanged = deepcopy(record)
+                link = self.resources.citation(record)["page_url"]
+                self.assertEqual(record, unchanged)
+                self.assertIsNotNone(link)
+                query = {key: values[0] for key, values in parse_qs(urlsplit(link).query).items()}
+                self.assertNotIn("source_path", query)
+                self.assertTrue(all(str(self.root) not in value for value in query.values()))
+                self.assertEqual(query["source_ref"], "standard:1")
+                self.assertEqual(query["page"], "2")
+                self.assertEqual(query["region"], REGION_QUERY)
+                view = self.client.get("/api/standards/pages", params=query)
+                self.assertEqual(view.status_code, 200, view.text)
+                self.assertEqual(view.json()["filename"], "selected.pdf")
+                self.assertEqual(view.json()["pages"][0]["region"], REGION)
+                rendered = self.client.get(view.json()["pages"][0]["image_url"])
+                self.assertEqual(rendered.status_code, 200, rendered.text[:100])
+                self.assertTrue(rendered.content.startswith(b"\x89PNG"))
+        record = deepcopy(original)
+        record["source_spans"][0]["page_end"] = 10**12
+        self.assertIsNotNone(self.resources.citation(record)["page_url"])
+        record = deepcopy(original)
+        record["source_spans"] = []
+        self.assertIsNone(self.resources.citation(record)["page_url"])
+        record = deepcopy(original)
+        record["source_spans"].append({"source_path": "other-copy.pdf", "page_start": 2, "page_end": 2})
+        self.assertIsNone(self.resources.citation(record)["page_url"])
 
     def test_region_requires_page_and_valid_shape(self):
         self.assertEqual(self.client.get("/api/standards/pages", params={"std": "GB99999-2099", "region": REGION_QUERY}).status_code, 422)

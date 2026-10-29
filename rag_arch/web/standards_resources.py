@@ -461,7 +461,7 @@ class StandardsResources:
         raise KeyError("未找到属于所选标准的这条证据；不会改用其他版本。")
 
     @staticmethod
-    def _mapped_pages(record, service):
+    def _mapped_pages(record, service, *, only_page=None):
         """Pages belong to a named file; never transfer numbers to another copy."""
         mapped = {}
         for location in _locations(record):
@@ -476,8 +476,10 @@ class StandardsResources:
                     start = location.get("page", location.get("page_start"))
                     end = location.get("page_end", start)
                 if type(start) is int and type(end) is int and 0 < start <= end:
-                    target = mapped.setdefault(ref, {})
-                    for page in range(start, end + 1):
+                    pages = range(start, end + 1) if only_page is None else (
+                        (only_page,) if start <= only_page <= end else ())
+                    for page in pages:
+                        target = mapped.setdefault(ref, {})
                         # Only display book numbering explicitly recorded for this location.
                         logical = location.get("logical_page", location.get("document_page_start"))
                         target.setdefault(page, logical if page == start else None)
@@ -496,19 +498,19 @@ class StandardsResources:
             # A model-read image is an actual per-run page, not a corpus clause.
             # Resolve its saved source path in the per-standard page registry.
             if record.get("kind") == "page_image":
-                mapped = {}
                 service = self.page_service(entry["std_no"])
-                source = record.get("page_source") or {}
-                registered = {row["source_ref"] for row in service.sources()}
-                if (source.get("source_ref") in registered and type(source.get("page")) is int
-                        and source["page"] > 0):
-                    url = page_source_url("/viewer/pages?" + urlencode({"std": entry["catalog_id"]}), source)
-                else:
-                    mapped = self._mapped_pages(record, service)
-                if not url and mapped:
-                    ref = next(iter(mapped))
-                    url = "/viewer/pages?" + urlencode({"std": entry["catalog_id"],
-                                                        "source_ref": ref, "page": min(mapped[ref])})
+                source = record.get("page_source")
+                source = source if isinstance(source, dict) else {}
+                page = source.get("page")
+                # source_ref is scoped to its originating page registry. Only
+                # the saved path can identify the same original in this viewer.
+                mapped = (self._mapped_pages(record, service, only_page=page)
+                          if type(page) is int and page > 0 else {})
+                refs = list(mapped)
+                if len(refs) == 1:
+                    url = page_source_url(
+                        "/viewer/pages?" + urlencode({"std": entry["catalog_id"]}),
+                        {**source, "source_ref": refs[0]})
         return {"evidence_id": evidence_id, "std_no": entry["std_no"], "title": entry["title"],
                 "clause_no": record.get("clause_no"), "text": record.get("text", ""),
                 "page_url": url,

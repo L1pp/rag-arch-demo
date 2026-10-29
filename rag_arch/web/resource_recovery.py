@@ -302,47 +302,110 @@ def _mark_exited(repository, worker_instance: str, resource: dict) -> bool:
 
 def _recover_office_resource(repository, worker: dict, resource: dict, *, root: Path,
                              local_host: str) -> dict:
-    """A launcher exit alone does not prove that its Office process group exited."""
+    """Confirm the Office group and retire its matching marker under its conversion lock."""
+    from ..office_conversion import (
+        OfficeConverter, _load_private_json, _private_directory, probe_office_owner,
+    )
+
     worker_instance = worker["worker_instance"]
     resource_id = resource["resource_id"]
+    already_exited = resource["state"] == "exited"
     try:
-        from ..office_conversion import probe_office_owner
         owner_path = Path(resource["owner_path"]).absolute()
         expected = (root / "data/runtime/office_conversion/active.json").absolute()
         if _norm_path(owner_path) != _norm_path(expected):
             raise ValueError("office owner path is outside the conversion directory")
-        descriptor, file_identity = read_owner_descriptor(resource, worker, root=root)
-        child = validate_owner_descriptor(descriptor, resource, worker, local_host=local_host)
-        if child["host_id"].casefold() != local_host.casefold():
-            return {"resource_id": resource_id, "state": "unknown", "action": "remote_child"}
-        outcome = probe_office_owner(
-            owner_path, pid=child["pid"], token=child["process_start_token"],
-            executable=child["executable"])
-        # Unknown descendants must never be converted into an exited identity by
-        # the database backfill, even when the launcher itself has disappeared.
-        proven_exited = outcome == ProcessProbeState.EXITED
-        if resource.get("pid") is None:
-            updated = repository.backfill_unknown_resource_identity(
-                worker_instance, resource_id,
-                owner_descriptor_path=resource["owner_descriptor_path"],
-                descriptor=descriptor, descriptor_file_identity=file_identity,
-                probe_state="exited" if proven_exited else "unknown")
+        if already_exited:
+            # Historical exited resources must not wait on a newer owner's lock.
+            # This is only a prefilter: all trust checks are repeated under lock.
+            try:
+                current = _load_private_json(owner_path)
+            except FileNotFoundError:
+                return {"resource_id": resource_id, "state": "exited", "action": "already_exited"}
+            if current.get("resource_id") != resource_id:
+                return {"resource_id": resource_id, "state": "exited", "action": "already_exited"}
+        directory = _private_directory(root)
+        converter = OfficeConverter(root, timeout=2)
+        with converter._lock(directory, time.monotonic() + converter.timeout):
+            descriptor, file_identity = read_owner_descriptor(resource, worker, root=root)
+            child = validate_owner_descriptor(descriptor, resource, worker, local_host=local_host)
+            if child["host_id"].casefold() != local_host.casefold():
+                return {"resource_id": resource_id, "state": "unknown", "action": "remote_child"}
+            outcome = probe_office_owner(
+                owner_path, pid=child["pid"], token=child["process_start_token"],
+                executable=child["executable"])
+            # Unknown descendants must never become exited merely because the
+            # launcher itself has disappeared.
+            proven_exited = outcome == ProcessProbeState.EXITED
+            snapshot = None
             if proven_exited:
-                return {"resource_id": resource_id, "state": updated["state"],
-                        "action": "office_group_exit_backfilled"}
-        elif proven_exited:
-            accepted = _mark_exited(repository, worker_instance, resource)
-            return {"resource_id": resource_id,
-                    "state": "exited" if accepted else "unknown",
-                    "action": "office_group_exited" if accepted else "exit_identity_rejected"}
+                snapshot = _load_private_json(owner_path)
+                owner_executable = snapshot.get("executable")
+                if (snapshot.get("resource_id") != resource_id
+                        or type(snapshot.get("pid")) is not int or snapshot["pid"] != child["pid"]
+                        or snapshot.get("token") != child["process_start_token"]
+                        or type(snapshot.get("group_id")) is not int or snapshot["group_id"] != child["pid"]
+                        or not isinstance(owner_executable, str)
+                        or os.path.normcase(os.path.realpath(owner_executable))
+                           != os.path.normcase(os.path.realpath(child["executable"]))):
+                    raise ValueError("office marker identity does not match the resource")
+                # The marker may have changed despite the lock. Confirm the
+                # same child group and completion evidence immediately again.
+                if probe_office_owner(owner_path, pid=child["pid"],
+                                      token=child["process_start_token"],
+                                      executable=child["executable"]) != ProcessProbeState.EXITED:
+                    proven_exited = False
+            if already_exited:
+                if not proven_exited:
+                    return {"resource_id": resource_id, "state": "exited",
+                            "action": "office_marker_exit_unconfirmed"}
+                action = "office_marker_retired_after_exit"
+            elif resource.get("pid") is None:
+                updated = repository.backfill_unknown_resource_identity(
+                    worker_instance, resource_id,
+                    owner_descriptor_path=resource["owner_descriptor_path"],
+                    descriptor=descriptor, descriptor_file_identity=file_identity,
+                    probe_state="exited" if proven_exited else "unknown")
+                if not proven_exited:
+                    return {"resource_id": resource_id, "state": "unknown",
+                            "action": "office_group_exit_unconfirmed"}
+                if updated.get("state") != "exited":
+                    return {"resource_id": resource_id, "state": "unknown",
+                            "action": "exit_identity_rejected"}
+                action = "office_group_exit_backfilled"
+            elif proven_exited:
+                if not _mark_exited(repository, worker_instance, resource):
+                    return {"resource_id": resource_id, "state": "unknown",
+                            "action": "exit_identity_rejected"}
+                action = "office_group_exited"
+            else:
+                if resource["state"] != "unknown":
+                    repository.resource_unknown(worker_instance, resource_id, "office_group_exit_unconfirmed")
+                return {"resource_id": resource_id, "state": "unknown",
+                        "action": "office_group_exit_unconfirmed"}
+
+            try:
+                # Keep a replacement/new owner's marker untouched, even if it
+                # appeared while the database operation was in progress.
+                if _load_private_json(owner_path) != snapshot:
+                    return {"resource_id": resource_id, "state": "exited",
+                            "action": "office_marker_changed"}
+                owner_path.unlink()
+            except FileNotFoundError:
+                pass  # The matching marker has already been retired.
+            except (OSError, ValueError):
+                # A later recovery may retry cleanup for an exited resource.
+                return {"resource_id": resource_id, "state": "exited",
+                        "action": "office_marker_cleanup_pending"}
+            return {"resource_id": resource_id, "state": "exited", "action": action}
+    except TimeoutError:
+        return {"resource_id": resource_id, "state": "exited" if already_exited else "unknown",
+                "action": "office_marker_lock_unavailable"}
     except Exception as exc:
-        if resource["state"] != "unknown":
+        if not already_exited and resource["state"] != "unknown":
             repository.resource_unknown(worker_instance, resource_id, "office_owner_untrusted")
-        return {"resource_id": resource_id, "state": "unknown",
+        return {"resource_id": resource_id, "state": "exited" if already_exited else "unknown",
                 "action": "office_owner_untrusted", "reason": type(exc).__name__}
-    if resource["state"] != "unknown":
-        repository.resource_unknown(worker_instance, resource_id, "office_group_exit_unconfirmed")
-    return {"resource_id": resource_id, "state": "unknown", "action": "office_group_exit_unconfirmed"}
 
 
 def _recover_one_resource(repository, worker: dict, resource: dict, *, root: Path,
@@ -356,12 +419,12 @@ def _recover_one_resource(repository, worker: dict, resource: dict, *, root: Pat
     host_id = resource.get("host_id")
     executable = resource.get("executable")
 
-    if state == "exited":
-        return {"resource_id": resource_id, "state": "exited", "action": "already_exited"}
     if (resource.get("kind") == "word" and resource.get("owner_path")
             and Path(resource["owner_path"]).name == "active.json"):
         return _recover_office_resource(repository, worker, resource, root=root,
                                         local_host=local_host)
+    if state == "exited":
+        return {"resource_id": resource_id, "state": "exited", "action": "already_exited"}
     if state == "starting" and pid is None:
         repository.resource_unknown(worker_instance, resource_id, "worker_exited_before_resource_attach")
         resource = {**resource, "state": "unknown"}
