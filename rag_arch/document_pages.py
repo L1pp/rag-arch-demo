@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from collections import OrderedDict
+from copy import deepcopy
 from decimal import Decimal, InvalidOperation
 import math
 import json
@@ -21,13 +22,16 @@ from zipfile import BadZipFile, ZipFile
 import pymupdf
 
 from .visual_page_index import build_visual_page_index, paginate_visual_page_index
+from .page_regions import (normalize_region, page_image_id, render_page_image,
+                           validate_page_result_identity)
 
 
 MAX_IMAGE_PIXELS = 4_000_000
 MAX_IMAGE_EDGE = 2400
 MAX_IMAGE_BYTES = 8 * 1024 * 1024
+MAX_PAGE_CACHE_BYTES = 24 * 1024 * 1024
 MAX_SOURCE_BYTES = 128 * 1024 * 1024
-SUPPORTED_SUFFIXES = {".pdf", ".docx", ".png", ".jpg", ".jpeg"}
+SUPPORTED_SUFFIXES = {".pdf", ".doc", ".docx", ".png", ".jpg", ".jpeg"}
 _DOCX_RENDER_LOCK = threading.Lock()
 
 
@@ -43,6 +47,9 @@ class _Source:
     cached_input: Path | None = None
     rendered_pdf: Path | None = None
     validated_pdf_stamp: tuple[int, int] | None = None
+    normalized_docx_path: Path | None = None
+    normalized_docx_stamp: tuple[int, int] | None = None
+    cached_normalized_docx: Path | None = None
 
     @property
     def suffix(self) -> str:
@@ -86,7 +93,8 @@ class DocumentPageService:
 
     def __init__(self, project_root: str | Path, cache_dir: str | Path | None = None,
                  *, docx_renderer: Callable[[Path, Path], None] | None = None,
-                 conversion_timeout: float = 120, pdf_backend: Any | None = None):
+                 conversion_timeout: float = 120, pdf_backend: Any | None = None,
+                 office_converter: Any | None = None):
         self.project_root = Path(project_root).resolve()
         self.cache_root = (self.project_root / "data/runtime/document_pages").resolve()
         candidate = Path(cache_dir) if cache_dir is not None else self.cache_root
@@ -100,13 +108,17 @@ class DocumentPageService:
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         self._sources: dict[str, _Source] = {}
         self._lock = threading.RLock()
-        self._docx_renderer = docx_renderer or self._render_with_word
+        self._docx_renderer = docx_renderer or self._render_office
+        self._custom_docx_renderer = docx_renderer is not None
+        self._office_converter = office_converter
         self.pdf_backend = pdf_backend
-        self._page_cache: OrderedDict[tuple[str, object, int, float], dict] = OrderedDict()
+        self._page_cache: OrderedDict[tuple, dict] = OrderedDict()
+        self._page_cache_bytes = 0
         self._visual_index_cache: dict[tuple[str, object], dict] = {}
 
     def register(self, source_ref: str, filename: str, path: str | Path | None = None,
-                 data: bytes | None = None, label: str | None = None) -> dict:
+                 data: bytes | None = None, label: str | None = None,
+                 normalized_docx_path: str | Path | None = None) -> dict:
         """Register only: paths use stat; uploaded bytes stay in memory until first read."""
         if not isinstance(source_ref, str) or not source_ref.strip():
             raise ValueError("source_ref 不能为空。")
@@ -115,7 +127,19 @@ class DocumentPageService:
         filename = Path(filename.replace("\\", "/")).name
         suffix = Path(filename).suffix.lower()
         if suffix not in SUPPORTED_SUFFIXES:
-            raise ValueError("分页仅支持 PDF、DOCX、PNG 和 JPEG。")
+            raise ValueError("分页仅支持 PDF、DOC、DOCX、PNG 和 JPEG。")
+        normalized_path = None
+        normalized_stamp = None
+        if normalized_docx_path is not None:
+            if suffix != ".doc":
+                raise ValueError("只有 DOC 来源可指定派生 DOCX。")
+            normalized_path = Path(normalized_docx_path)
+            normalized_path = (normalized_path if normalized_path.is_absolute()
+                               else self.project_root / normalized_path).resolve()
+            if normalized_path.suffix.lower() != ".docx" or not normalized_path.is_file():
+                raise ValueError("DOC 派生文字文档不存在或格式无效。")
+            normalized_status = normalized_path.stat()
+            normalized_stamp = (normalized_status.st_size, normalized_status.st_mtime_ns)
         approved = None
         stamp = None
         if data is None:
@@ -134,27 +158,33 @@ class DocumentPageService:
             data = bytes(data)
             if len(data) > MAX_SOURCE_BYTES:
                 raise ValueError("上传内容超过分页服务的 128 MB 上限。")
+            if suffix == ".doc" and not data.startswith(b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1"):
+                raise ValueError("文件不是有效的 DOC 二进制文档。")
         with self._lock:
             previous = self._sources.get(source_ref)
             if (previous is not None and previous.filename == filename
                     and previous.registered_path == approved
-                    and previous.stamp == stamp and previous.data == data):
+                    and previous.stamp == stamp and previous.data == data
+                    and previous.normalized_docx_path == normalized_path
+                    and previous.normalized_docx_stamp == normalized_stamp):
                 new_label = str(label or filename)
                 if previous.label != new_label:
                     previous.label = new_label
                     for key in list(self._page_cache):
                         if key[0] == source_ref:
-                            self._page_cache.pop(key, None)
+                            self._drop_cached_page(key)
                     for key in list(self._visual_index_cache):
                         if key[0] == source_ref:
                             self._visual_index_cache.pop(key, None)
                 return self._describe(previous)
             source = _Source(source_ref, filename, str(label or filename), approved, data, stamp,
                              1 if suffix in {".png", ".jpg", ".jpeg"} else None)
+            source.normalized_docx_path = normalized_path
+            source.normalized_docx_stamp = normalized_stamp
             self._sources[source_ref] = source
             for key in list(self._page_cache):
                 if key[0] == source_ref:
-                    self._page_cache.pop(key, None)
+                    self._drop_cached_page(key)
             for key in list(self._visual_index_cache):
                 if key[0] == source_ref:
                     self._visual_index_cache.pop(key, None)
@@ -170,7 +200,8 @@ class DocumentPageService:
         return {"source_ref": source.source_ref, "filename": source.filename,
                 "label": source.label, "page_count": source.page_count,
                 "format": source.suffix.lstrip("."),
-                "page_numbering": "physical_page_of_cached_pdf"}
+                "page_numbering": ("system_rendered_page" if source.suffix in {".doc", ".docx"}
+                                   else "physical_page_of_cached_pdf")}
 
     def sources(self) -> list[dict]:
         """List registrations without starting Word or enumerating the filesystem."""
@@ -203,6 +234,13 @@ class DocumentPageService:
                 raise ValueError("已登记的来源文件已不可用，请重新登记。") from exc
             if (status.st_size, status.st_mtime_ns) != source.stamp:
                 raise ValueError("来源文件已更新，请重新登记后读取页面。")
+        if source.normalized_docx_path is not None:
+            try:
+                status = source.normalized_docx_path.stat()
+            except OSError as exc:
+                raise ValueError("DOC 派生文字文档已不可用，请重新登记。") from exc
+            if (status.st_size, status.st_mtime_ns) != source.normalized_docx_stamp:
+                raise ValueError("DOC 派生文字文档已更新，请重新登记后读取页面。")
 
     @staticmethod
     def _path_stamp(path: Path) -> tuple[int, int] | None:
@@ -237,10 +275,65 @@ class DocumentPageService:
             source.cached_input = target
         return source.cached_input
 
+    def _office(self):
+        if self._office_converter is None:
+            from .office_conversion import OfficeConverter
+            self._office_converter = OfficeConverter(
+                self.project_root, timeout=self.conversion_timeout)
+        return self._office_converter
+
+    def _render_office(self, source: Path, output: Path) -> None:
+        if not self._uses_libreoffice():
+            self._render_with_word(source, output)
+        else:
+            self._office().render_pdf(source, output)
+
+    @staticmethod
+    def _uses_libreoffice() -> bool:
+        return os.name != "nt"
+
+    def _shared_office_pdf(self, source: _Source) -> Path | None:
+        """Tenant uploads share a PDF across API, chat and plan page services."""
+        if (self._custom_docx_renderer or not self._uses_libreoffice()
+                or source.registered_path is None or source.suffix not in {".doc", ".docx"}):
+            return None
+        upload_root = (self.project_root / "data/runtime/web_uploads").resolve()
+        if not source.registered_path.is_relative_to(upload_root):
+            return None
+        if source.suffix == ".doc":
+            normalized = source.normalized_docx_path
+            if normalized is None:
+                normalized = source.registered_path.with_name("normalized.docx")
+                self._office().ensure_docx(source.registered_path, normalized)
+            render_input = normalized
+        else:
+            render_input = source.registered_path
+        _check_docx(render_input)
+        target = source.registered_path.with_name("pages.pdf")
+        self._office().ensure_pdf(render_input, target)
+        self._assert_unchanged(source)
+        return target
+
+    def _normalized_snapshot(self, source: _Source, original: Path) -> Path:
+        if source.cached_normalized_docx is None:
+            target = original.with_name("normalized.docx")
+            if source.normalized_docx_path is None:
+                self._office().ensure_docx(original, target)
+            else:
+                shutil.copyfile(source.normalized_docx_path, target)
+                self._assert_unchanged(source)
+            _check_docx(target)
+            source.cached_normalized_docx = target
+        return source.cached_normalized_docx
+
     def _pdf(self, source: _Source) -> Path:
         with self._lock:
             self._assert_unchanged(source)
             validated_page_count = None
+            if source.rendered_pdf is None:
+                shared_pdf = self._shared_office_pdf(source)
+                if shared_pdf is not None:
+                    source.rendered_pdf = shared_pdf
             if source.suffix == ".pdf":
                 # Registered library PDFs are opened directly, never copied or hashed.
                 pdf_path = source.registered_path or self._snapshot(source)
@@ -251,10 +344,12 @@ class DocumentPageService:
                 pdf_path = input_path.with_name("pages.pdf")
                 temp = pdf_path.with_name("render-" + uuid4().hex + ".pdf")
                 try:
-                    if source.suffix == ".docx":
-                        _check_docx(input_path)
+                    if source.suffix in {".doc", ".docx"}:
                         with _DOCX_RENDER_LOCK:
-                            self._docx_renderer(input_path, temp)
+                            render_input = (self._normalized_snapshot(source, input_path)
+                                            if source.suffix == ".doc" else input_path)
+                            _check_docx(render_input)
+                            self._docx_renderer(render_input, temp)
                     elif self.pdf_backend is not None:
                         temp.write_bytes(self.pdf_backend.image_to_pdf(input_path, source.suffix))
                     else:
@@ -329,6 +424,41 @@ class DocumentPageService:
                 "visual_index_complete": result["visual_index_complete"],
                 "next_start": result["next_start"]}
 
+    def ocr_candidates(self, source_ref: str) -> list[dict]:
+        """Inspect the cached PDF for pages that may need supplementary OCR.
+
+        DOC/DOCX page numbers refer to the server-rendered PDF layout. Results
+        are heuristics, not proof that remaining image content was read.
+        """
+        source = self._source(source_ref)
+        pdf_path = self._pdf(source)
+        if self.pdf_backend is not None:
+            scanner = getattr(self.pdf_backend, "ocr_candidates", None)
+            if not callable(scanner):
+                raise ValueError("PDF worker 不支持识别候选页检测。")
+            rows = scanner(pdf_path)
+        else:
+            from .ocr_page_policy import build_ocr_page_candidates
+            with pymupdf.open(pdf_path) as document:
+                rows = build_ocr_page_candidates(document)
+        if (not isinstance(rows, list) or len(rows) != source.page_count
+                or any(not isinstance(row, dict)
+                       or type(row.get("page")) is not int
+                       or row["page"] != index
+                       or type(row.get("needs_ocr")) is not bool
+                       or not isinstance(row.get("reason"), str)
+                       or type(row.get("native_chars")) is not int
+                       or row["native_chars"] < 0
+                       or type(row.get("body_chars")) is not int
+                       or row["body_chars"] < 0
+                       or type(row.get("blank")) is not bool
+                       or type(row.get("image_coverage")) not in (int, float)
+                       or not math.isfinite(row["image_coverage"])
+                       or not 0 <= row["image_coverage"] <= 1
+                       for index, row in enumerate(rows, 1))):
+            raise ValueError("PDF worker 返回的候选页检测结果无效。")
+        return rows
+
     def list_pages(self, source_ref: str, start: int = 1, limit: int = 20,
                    query: str = "", visual_only: bool = False) -> dict:
         self._positive_int(start, "起始页码")
@@ -368,61 +498,65 @@ class DocumentPageService:
                 "start": start, "limit": limit, "query": query,
                 "next_start": last_page + 1 if last_page < source.page_count else None}
 
-    def read_page(self, source_ref: str, page: int, scale: float = 1.5) -> dict:
+    @staticmethod
+    def _cached_page_weight(result: dict) -> int:
+        return len(result.get("image_bytes", b"")) + 4 * len(result.get("text", ""))
+
+    def _drop_cached_page(self, key) -> None:
+        removed = self._page_cache.pop(key, None)
+        if removed is not None:
+            self._page_cache_bytes -= self._cached_page_weight(removed)
+
+    def _cache_page(self, key, result: dict) -> None:
+        """Bound retained encoded pixels and extracted text, as well as entry count."""
+        weight = self._cached_page_weight(result)
+        with self._lock:
+            self._drop_cached_page(key)
+            if weight <= MAX_PAGE_CACHE_BYTES:
+                self._page_cache[key] = deepcopy(result)
+                self._page_cache_bytes += weight
+            while len(self._page_cache) > 16 or self._page_cache_bytes > MAX_PAGE_CACHE_BYTES:
+                self._drop_cached_page(next(iter(self._page_cache)))
+
+    def read_page(self, source_ref: str, page: int, scale: float = 1.5, region=None) -> dict:
         self._positive_int(page, "物理页码")
         if (isinstance(scale, bool) or not isinstance(scale, (int, float))
-                or not math.isfinite(scale) or not 0.25 <= scale <= 4):
+                or not 0.25 <= scale <= 4 or not math.isfinite(scale)):
             raise ValueError("页面缩放必须在 0.25 到 4 之间。")
+        region = normalize_region(region)
         source = self._source(source_ref)
         pdf_path = self._pdf(source)
         # Path registrations use the existing stat stamp; uploaded sources use
         # the registration object's identity, so a concurrent re-registration
         # cannot make an older render look current.
         source_token = source.stamp if source.stamp is not None else id(source)
-        cache_key = (source_ref, source_token, page, float(scale))
+        cache_key = (source_ref, source_token, page, float(scale), region)
         with self._lock:
             cached = self._page_cache.get(cache_key)
             if cached is not None:
                 self._page_cache.move_to_end(cache_key)
+                validate_page_result_identity(cached, source_ref, page, region)
                 self._check_page_image(cached)
-                return dict(cached)
+                return deepcopy(cached)
         if self.pdf_backend is not None:
-            result = self.pdf_backend.read_page(pdf_path, page, float(scale))
+            # Keep old injected whole-page backends compatible; region support
+            # is required only when a caller explicitly asks for a crop.
+            kwargs = {"region": region} if region is not None else {}
+            result = self.pdf_backend.read_page(pdf_path, page, float(scale), **kwargs)
             result = {"ok": True, **self._describe(source), **result}
-            self._check_page_image(result)
-            with self._lock:
-                self._page_cache[cache_key] = dict(result)
-                self._page_cache.move_to_end(cache_key)
-                while len(self._page_cache) > 16:
-                    self._page_cache.popitem(last=False)
-            return result
-        with pymupdf.open(pdf_path) as document:
-            if page > len(document):
-                raise ValueError("物理页码超出来源页面范围。")
-            original = document[page - 1]
-            width, height = original.rect.width, original.rect.height
-            render_scale = min(float(scale), (MAX_IMAGE_EDGE - 1) / max(width, height),
-                               math.sqrt(MAX_IMAGE_PIXELS / (width * height)) * 0.99)
-            for _ in range(3):
-                pixmap = original.get_pixmap(matrix=pymupdf.Matrix(render_scale, render_scale),
-                                             colorspace=pymupdf.csRGB, alpha=False)
-                png = pixmap.tobytes("png")
-                if len(png) <= MAX_IMAGE_BYTES:
-                    break
-                render_scale *= 0.7
-            else:
-                raise ValueError("页面图像过大，请使用更小的缩放比例。")
-            result = {"ok": True, **self._describe(source), "page": page,
-                    "text": original.get_text().strip(), "image_bytes": png,
-                    "mime_type": "image/png", "width": pixmap.width, "height": pixmap.height,
-                    "rendered_scale": render_scale}
-            self._check_page_image(result)
-            with self._lock:
-                self._page_cache[cache_key] = dict(result)
-                self._page_cache.move_to_end(cache_key)
-                while len(self._page_cache) > 16:
-                    self._page_cache.popitem(last=False)
-            return result
+        else:
+            with pymupdf.open(pdf_path) as document:
+                if page > len(document):
+                    raise ValueError("物理页码超出来源页面范围。")
+                result = {"ok": True, **self._describe(source), "page": page,
+                          **render_page_image(document[page - 1], scale, region,
+                              max_pixels=MAX_IMAGE_PIXELS, max_edge=MAX_IMAGE_EDGE,
+                              max_bytes=MAX_IMAGE_BYTES)}
+        validate_page_result_identity(result, source_ref, page, region)
+        result["evidence_id"] = page_image_id(source_ref, page, region)
+        self._check_page_image(result)
+        self._cache_page(cache_key, result)
+        return result
 
     @staticmethod
     def _resource_api():

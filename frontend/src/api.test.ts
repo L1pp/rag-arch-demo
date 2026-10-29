@@ -16,6 +16,7 @@ describe('frontend resource URLs', () => {
     expect(documentUrl).toContain('asset=asset-1')
     expect(documentUrl).toContain('workspace_id=workspace-1')
     expect(documentUrl).toContain('page=2')
+    expect(standardsPagesUrl({ asset: 'asset-1', region: '0.1,0.2,0.6,0.45' })).toContain('region=0.1%2C0.2%2C0.6%2C0.45')
   })
 
   it('exposes the optional debug task download format', () => {

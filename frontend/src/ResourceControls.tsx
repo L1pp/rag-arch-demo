@@ -3,7 +3,7 @@ import { useWorkspace } from './WorkspaceContext'
 import type { AssistantId, UploadAsset } from './types'
 
 export const MAX_UPLOAD_BYTES = 10 * 1024 * 1024
-const SUPPORTED_UPLOAD_EXTENSIONS = ['.pdf', '.docx', '.txt', '.md']
+const SUPPORTED_UPLOAD_EXTENSIONS = ['.pdf', '.doc', '.docx', '.txt', '.md']
 
 export function formatBytes(value: number) {
   if (value < 1024) return `${value} B`
@@ -13,7 +13,7 @@ export function formatBytes(value: number) {
 
 export function validateUploadBatch(files: File[], existingBytes = 0, maxFiles = Number.POSITIVE_INFINITY) {
   if (files.length > maxFiles) return `本助手最多选择 ${maxFiles} 个文件。`
-  if (files.some(file => !SUPPORTED_UPLOAD_EXTENSIONS.some(extension => file.name.toLowerCase().endsWith(extension)))) return '仅支持 PDF、DOCX、TXT、MD 文件。'
+  if (files.some(file => !SUPPORTED_UPLOAD_EXTENSIONS.some(extension => file.name.toLowerCase().endsWith(extension)))) return '仅支持 PDF、DOC、DOCX、TXT、MD 文件。'
   const batchBytes = files.reduce((total, file) => total + file.size, 0)
   if (files.some(file => file.size > MAX_UPLOAD_BYTES)) return '单个文件不能超过 10 MiB。'
   if (batchBytes > MAX_UPLOAD_BYTES || existingBytes + batchBytes > MAX_UPLOAD_BYTES) return '本批附件总大小不能超过 10 MiB。'
@@ -103,7 +103,7 @@ export default function ResourceControls({ id, busy }: { id: AssistantId; busy: 
     {id === 'chat' && <>
       <div className="resource-toolbar">
         <label className="upload-button">
-          <input ref={inputRef} aria-label="选择附件" type="file" multiple accept=".pdf,.docx,.txt,.md,application/pdf,text/plain,application/vnd.openxmlformats-officedocument.wordprocessingml.document" disabled={busy || uploading} onChange={handleFiles}/>
+          <input ref={inputRef} aria-label="选择附件" type="file" multiple accept=".pdf,.doc,.docx,.txt,.md,application/pdf,application/msword,text/plain,application/vnd.openxmlformats-officedocument.wordprocessingml.document" disabled={busy || uploading} onChange={handleFiles}/>
           <span>添加附件</span>
         </label>
         {state.uploadingAssistant === id && <span className="resource-uploading">上传中…</span>}
@@ -126,7 +126,7 @@ export default function ResourceControls({ id, busy }: { id: AssistantId; busy: 
           </select>
         </label>
         <label className="upload-button">
-          <input ref={inputRef} aria-label="选择方案文件" type="file" accept=".pdf,.docx,.txt,.md,application/pdf,text/plain,application/vnd.openxmlformats-officedocument.wordprocessingml.document" disabled={busy || uploading} onChange={handleFiles}/>
+          <input ref={inputRef} aria-label="选择方案文件" type="file" accept=".pdf,.doc,.docx,.txt,.md,application/pdf,application/msword,text/plain,application/vnd.openxmlformats-officedocument.wordprocessingml.document" disabled={busy || uploading} onChange={handleFiles}/>
           <span>上传方案</span>
         </label>
       </div>

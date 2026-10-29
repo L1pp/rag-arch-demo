@@ -153,7 +153,30 @@ describe('execution mode presentation', () => {
     fireEvent.click(screen.getByText('规范依据'))
     expect(screen.getByRole('link', { name: '查看证据页↗' })).toHaveAttribute('target', '_blank')
     expect(screen.getByRole('link', { name: '查看原件↗' })).toHaveAttribute('target', '_blank')
-    expect(screen.getByText('整份核查覆盖文字；追问可按需读图。')).toBeInTheDocument()
+    expect(screen.getByText('整份核查包含文字与图表；图表尽力核对，疑点会注明。')).toBeInTheDocument()
+  })
+
+  it('shows confirmed page-image records and region links without claiming recognition accuracy', () => {
+    const task: TaskSnapshot = {
+      task_id: 'plan-images', assistant_id: 'plan', request_id: 'image-request', prompt: '核查参数',
+      status: 'completed', stage: 'completed', detail: '完成', created_at: '2026-10-28T13:00:00Z',
+      started_at: null, finished_at: null, elapsed_seconds: 1, duration_seconds: null, updated_seq: 1,
+      result: { text: '关键数字待复核', page_sources: [
+        { image_id: 'whole', filename: '方案.docx', page: 7, sent_to_model: true, automatic: true, cited: false,
+          page_url: '/viewer/pages?asset=private&page=7' },
+        { image_id: 'region', filename: '方案.docx', page: 7, sent_to_model: true, region: [0.1, 0.2, 0.6, 0.45], cited: true,
+          page_url: '/viewer/pages?asset=private&page=7&region=0.1,0.2,0.6,0.45' },
+        { image_id: 'unconfirmed', filename: '未确认.pdf', page: 8, sent_to_model: false },
+      ] },
+    }
+    context.state.selected = 'plan'
+    context.state.assistants.plan.tasks = [task]
+    render(<App />)
+    fireEvent.click(screen.getByText('已提供模型的页图/区域 · 2 项'))
+    expect(screen.getByText('以下记录页图投递，不代表模型已正确识别；关键数字仍需结合原页核对。')).toBeInTheDocument()
+    expect(screen.getByRole('link', { name: '查看区域↗' })).toHaveAttribute('href', expect.stringContaining('region='))
+    expect(screen.getByText(/系统排版第7页 · 局部区域/)).toHaveTextContent('已引用')
+    expect(screen.queryByText('未确认.pdf')).not.toBeInTheDocument()
   })
 
   it.each([

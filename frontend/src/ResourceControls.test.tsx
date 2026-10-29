@@ -38,6 +38,26 @@ describe('resource controls', () => {
     expect(validateUploadBatch([new File(['x'], 'script.exe')])).toContain('仅支持')
   })
 
+  it('accepts DOC and DOCX in chat and plan file pickers', async () => {
+    const doc = new File(['legacy-word'], '方案.DOC', { type: 'application/msword' })
+    const docx = new File(['word'], '方案.docx', { type: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document' })
+    expect(validateUploadBatch([doc, docx])).toBeNull()
+    expect(validateUploadBatch([new File(['x'], '方案.doc.exe')])).toContain('仅支持')
+
+    const { unmount } = render(<ResourceControls id="chat" busy={false}/>)
+    const chatPicker = screen.getByLabelText('选择附件') as HTMLInputElement
+    expect(chatPicker.accept).toContain('.doc,')
+    fireEvent.change(chatPicker, { target: { files: [doc] } })
+    await waitFor(() => expect(context.uploadFiles).toHaveBeenCalledWith('chat', [doc]))
+    unmount()
+
+    render(<ResourceControls id="plan" busy={false}/>)
+    const planPicker = screen.getByLabelText('选择方案文件') as HTMLInputElement
+    expect(planPicker.accept).toContain('.doc,')
+    fireEvent.change(planPicker, { target: { files: [doc] } })
+    await waitFor(() => expect(context.uploadFiles).toHaveBeenCalledWith('plan', [doc]))
+  })
+
   it('uploads optional chat attachments without making them required', async () => {
     render(<ResourceControls id="chat" busy={false}/>)
     expect(screen.queryByText('启用向量检索')).not.toBeInTheDocument()

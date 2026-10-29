@@ -24,10 +24,12 @@ class PlanDocument:
     unread_pages: list[int] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
     source_revision: str = ""
+    ocr_pages: list[dict] = field(default_factory=list)
 
     def __post_init__(self):
         if not self.document_id or not self.filename:
             raise ValueError("方案缺少文档标识或文件名。")
+        self.ocr_pages = deepcopy(self.ocr_pages)
         clean, ids = [], set()
         for unit in self.units:
             uid, body = unit.get("unit_id"), unit.get("text")
@@ -56,17 +58,21 @@ class PlanDocument:
         return sum(len(u["text"]) for u in self.units)
 
     def metadata(self):
-        return {"document_id": self.document_id, "filename": self.filename,
+        result = {"document_id": self.document_id, "filename": self.filename,
                 "unit_count": len(self.units), "text_chars": self.text_chars, "source_revision": self.source_revision,
                 "page_count": self.page_count, "unread_pages": list(self.unread_pages),
                 "warnings": list(self.warnings)}
+        if self.ocr_pages:
+            result["ocr_pages"] = deepcopy(self.ocr_pages)
+        return result
 
     @classmethod
     def from_bundle(cls, bundle: dict):
         return cls(bundle["document_id"], bundle["filename"], bundle["units"],
                    bundle.get("source_kind", ""), bundle.get("page_count"),
                    list(bundle.get("unread_pages", [])), list(bundle.get("warnings", [])),
-                   str(bundle.get("source_revision") or ""))
+                   str(bundle.get("source_revision") or ""),
+                   deepcopy(bundle.get("ocr_pages") or []))
 
     def navigation(self, start: int = 1, limit: int = 30, max_chars: int = 8000) -> dict:
         """Bounded source navigation; previews are not acquired evidence."""
@@ -213,7 +219,10 @@ class PlanDocument:
         body = unit["text"]
         start = body.find(quote)
         if start >= 0:
-            return {"start": start, "end": start + len(quote), "quote": quote, "whitespace_normalized": False}
+            span = {"start": start, "end": start + len(quote), "quote": quote, "whitespace_normalized": False}
+            if isinstance(unit["locator"], dict) and unit["locator"].get("text_source") == "cloud_ocr":
+                span.update(text_source="cloud_ocr", recognition_verified=False)
+            return span
         # Accept only layout-space and Unicode-width normalization, never numbers
         # guessed from OCR, dropped words, ellipses or semantic paraphrases.
         chars, positions = [], []
@@ -227,7 +236,10 @@ class PlanDocument:
         if not needle or start < 0:
             return None
         left, right = positions[start], positions[start + len(needle) - 1] + 1
-        return {"start": left, "end": right, "quote": body[left:right], "whitespace_normalized": True}
+        span = {"start": left, "end": right, "quote": body[left:right], "whitespace_normalized": True}
+        if isinstance(unit["locator"], dict) and unit["locator"].get("text_source") == "cloud_ocr":
+            span.update(text_source="cloud_ocr", recognition_verified=False)
+        return span
 
 
 
@@ -286,4 +298,5 @@ def load_uploaded_document(filename: str, data: bytes, *, document_id: str | Non
                           "source_kind": loaded.source_kind,
                           "source_path": f"session/{loaded.doc_id}/{loaded.filename}"})
     return PlanDocument(pid, loaded.filename, units, loaded.source_kind, loaded.page_count,
-                        loaded.unread_pages, loaded.warnings, source_revision)
+                        loaded.unread_pages, loaded.warnings, source_revision,
+                        deepcopy(getattr(loaded, "ocr_pages", [])))

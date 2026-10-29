@@ -17,7 +17,7 @@ _PLAN_ENVELOPE_FIELDS = {
     "document_id", "next_cursor", "next_start", "batch_index", "total_batches",
     "total_units", "total_matches", "match_count", "matched_count", "returned_count", "count",
     "found", "has_more", "note", "message", "warnings", "missing", "insufficient_evidence",
-    "ok", "status", "error", "text", "source_format", "complete",
+    "ok", "status", "error", "text", "source_format", "complete", "ocr_sources", "ocr_note",
 }
 _RECORD_FIELDS = {
     "evidence_id", "kind", "std_no", "std_id", "clause_no", "table_id", "title", "text",
@@ -274,6 +274,24 @@ def model_plan_payload(payload):
     result = {key: deepcopy(value) for key, value in payload.items() if key in _PLAN_ENVELOPE_FIELDS}
     stamped = stamp_source_refs(units, anchors=document_anchor_index(units))
     result["text"] = render_anchored_text(stamped)
+    ocr_sources = []
+    for unit in stamped:
+        locator = unit.get("locator")
+        if not isinstance(locator, dict) or locator.get("text_source") != "cloud_ocr":
+            continue
+        item = {"source_ref": unit.get("source_ref"), "unit_id": unit["unit_id"],
+                "recognition_verified": False, "text_preview": unit["text"][:48]}
+        for key in ("page", "page_numbering"):
+            if key in locator:
+                item[key] = deepcopy(locator[key])
+        for key in ("text_start", "text_end"):
+            if type(unit.get(key)) is int:
+                item[key] = unit[key]
+        ocr_sources.append(item)
+    if ocr_sources:
+        result["ocr_sources"] = ocr_sources
+        result["ocr_note"] = ("列出的单元含OCR补充文字，识别可能遗漏或错写；数字、单位和表格关系应回看原页。"
+                              "同一锚点可能混有原生文字与OCR，请结合单元预览和页码区分。")
     result["source_format"] = PLAN_TEXT_VIEW_VERSION
     result["complete"] = all(_plan_unit_complete(unit) for unit in units)
     if isinstance(result.get("next_cursor"), dict):

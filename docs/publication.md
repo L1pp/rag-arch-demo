@@ -6,7 +6,7 @@ This repository was created in a new directory with independent Git history. It 
 
 The repository is a code showcase for engineering review and interviews, not a turnkey deployment bundle. The complete internal corpus, original standards documents, real plans, account database, service credentials, runtime logs, attachment history, and generated packages based on private data are not published. Users provide their own PostgreSQL instance, model configuration, corpus, original files, and derived retrieval packages required by their chosen workflows.
 
-The README evidence screenshot was captured on 2026-10-13 using a fictional offline sample. It shows an earlier React interface, not current account isolation, persistent PostgreSQL tasks, worker execution, or live model behavior. The archived images are visual examples only.
+The screenshot archive includes images captured on 2026-10-13 with a fictional offline sample. Those images show an earlier React interface and do not validate current worker execution or live model behavior.
 
 The authored DEMO identifiers, clauses, values, and plans are fictional. Public historical evaluation results are aggregate summaries only; source questions, reference answers, plans, complete reports, and request logs remain private. Conclusion-control and citation-recovery experiments are not presented as production features.
 

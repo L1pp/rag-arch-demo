@@ -243,6 +243,10 @@ def _evidence(hits: list[SearchHit]) -> str:
             "位置": format_locator(hit.chunk.locator),
             "片段": hit.chunk.chunk_id,
         }
+        if hit.chunk.locator.get("text_source") == "cloud_ocr":
+            # A rendered Word/PDF page has a different numbering contract;
+            # keep its original file kind alongside the OCR locator.
+            metadata["source_kind"] = hit.chunk.source_kind
         blocks.append(f"[S{number}] {json.dumps(metadata, ensure_ascii=False)}\n"
                       f"资料正文开始\n{hit.chunk.text}\n资料正文结束")
     return "\n\n".join(blocks)

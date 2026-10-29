@@ -24,6 +24,7 @@ import time
 from typing import Any, Callable
 from uuid import uuid4
 from ..async_support import TaskResourceCleanupError
+from ..request_control import RequestControlError
 from ..resource_supervision import (TaskResourceSupervisor, ResourceCleanupUncertain,
                                     resource_supervision_scope)
 from .task_service import BusyError
@@ -35,11 +36,11 @@ _TERMINAL = frozenset({"completed", "failed", "cancelled"})
 _LOG = logging.getLogger(__name__)
 
 
-class TaskControlUnavailable(RuntimeError):
+class TaskControlUnavailable(RequestControlError):
     """The database control plane failed; do not start another paid request."""
 
 
-class StaleWorkerAttempt(RuntimeError):
+class StaleWorkerAttempt(RequestControlError):
     """The database no longer recognizes this worker's attempt token."""
 
 
@@ -204,7 +205,7 @@ def _is_external_work_start(stage: str, detail: str) -> bool:
     """Identify runner callbacks immediately before model/tool/network work."""
     stage = str(stage).strip().lower()
     detail = str(detail).strip()
-    if stage == "model":
+    if stage in {"model", "ocr"}:
         return True
     if stage == "embedding":
         return "正在准备规范向量" in detail
@@ -219,7 +220,10 @@ def _is_external_work_start(stage: str, detail: str) -> bool:
 
 
 def _safe_error(exc: BaseException, assistant_id: str) -> str:
-    if isinstance(exc, TaskResourceCleanupError):
+    from .ocr_preparation import OCRDocumentUnreadable
+    if isinstance(exc, OCRDocumentUnreadable):
+        value = exc.as_error()
+    elif isinstance(exc, TaskResourceCleanupError):
         value = exc.as_error()
     elif isinstance(exc, TaskControlUnavailable):
         value = {"code": "control_plane_unavailable",
@@ -496,6 +500,7 @@ class WorkerRuntime:
                 raise SimulationModeMismatch()
             use_demo = request_simulation
             from ..request_control import request_control_scope
+            from .ocr_preparation import ocr_preparation_scope
 
             def check_external_request():
                 if cancel_event.is_set():
@@ -506,7 +511,8 @@ class WorkerRuntime:
             # Context-local provider guards share this task's raw cancellation
             # and database-health state. Scope cleanup is guaranteed even when
             # a runner or provider raises.
-            with resource_supervision_scope(supervisor), request_control_scope(check_external_request):
+            with (resource_supervision_scope(supervisor), request_control_scope(check_external_request),
+                  ocr_preparation_scope(lambda page: progress("ocr", f"正在补充识别第 {page} 页图片文字"))):
                 if use_demo:
                     # API-persisted simulation and the explicit test worker
                     # mode both route only to the local demonstration runner.
@@ -603,8 +609,13 @@ class WorkerRuntime:
         else:
             factory = self.document_store_factory
         resources = self._get_resources()
-        return factory(self.root, workspace_id, resources.pdf_backend,
-                       user_id=user_id, database=self.database)
+        options = {"user_id": user_id, "database": self.database}
+        if self.document_store_factory is None:
+            from ..cloud_ocr import OCRSettings, VLOCRClient
+            ocr_settings = OCRSettings.from_root(self.root)
+            if ocr_settings.enabled:
+                options["ocr_client"] = VLOCRClient(self.root, settings=ocr_settings)
+        return factory(self.root, workspace_id, resources.pdf_backend, **options)
 
     def _acquire_document_store(self, request):
         """Borrow a bounded user/workspace store; active stores cannot be evicted."""

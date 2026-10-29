@@ -621,6 +621,10 @@ export interface components {
              * @default false
              */
             uses_embeddings?: boolean;
+            /** Visual Review */
+            visual_review?: {
+                [key: string]: unknown;
+            } | null;
             /** Warnings */
             warnings?: string[];
             /** Web Sources */
@@ -854,6 +858,7 @@ export interface operations {
                 asset?: string | null;
                 plan_id?: string | null;
                 workspace_id?: string | null;
+                region?: string | null;
             };
             header?: never;
             path?: never;
@@ -889,6 +894,7 @@ export interface operations {
                 workspace_id?: string | null;
                 source_ref?: string | null;
                 page?: number;
+                region?: string | null;
             };
             header?: never;
             path?: never;
@@ -1109,6 +1115,7 @@ export interface operations {
                 std: string;
                 source_ref: string;
                 page: number;
+                region?: string | null;
             };
             header?: never;
             path?: never;
@@ -1143,6 +1150,7 @@ export interface operations {
                 evidence?: string | null;
                 source_ref?: string | null;
                 page?: number | null;
+                region?: string | null;
             };
             header?: never;
             path?: never;

@@ -141,6 +141,12 @@ class WebSearchChat(ChatOpenAI):
 _RESPONSES_SEARCH_FAMILIES = tuple(name for name in _BAILIAN_SEARCH_FAMILIES if name not in {
     "qwen3.6-max-preview", "qwen3.6-27b", "qwen-max", "qwen-plus", "qwen-flash", "qwen-turbo", "qwq-plus", "deepseek-v3.2"
 }) + ("glm-5.2", "kimi-k3")
+_RESPONSES_EXACT_MODELS = frozenset({"deepseek-v4.1-flash-1017"})
+
+
+def is_deepseek_v41_flash_1017(settings):
+    """Match only the documented 1017 snapshot, not other DeepSeek versions."""
+    return settings.chat_model.lower() == "deepseek-v4.1-flash-1017"
 
 
 def native_web_search_status(settings):
@@ -153,9 +159,9 @@ def native_web_search_status(settings):
                     "dashscope.aliyuncs.com", "dashscope-intl.aliyuncs.com", "dashscope-us.aliyuncs.com"} else "unknown")
     name = settings.chat_model.lower()
     supported = (provider != "unknown" and address.path.rstrip("/").endswith("/compatible-mode/v1")
-                 and any(name == family or (name.startswith(family + "-") and
+                 and (name in _RESPONSES_EXACT_MODELS or any(name == family or (name.startswith(family + "-") and
                     re.fullmatch(r"(?:\d{4}|\d{4}-\d{2}-\d{2}|preview)", name[len(family) + 1:]))
-                    for family in _RESPONSES_SEARCH_FAMILIES))
+                    for family in _RESPONSES_SEARCH_FAMILIES)))
     enabled = requested and supported and settings.chat_ready
     reason = ("disabled_by_setting" if not requested else "provider_or_model_not_supported" if not supported
               else "missing_chat_configuration" if not settings.chat_ready else "provider_documented")
@@ -226,7 +232,9 @@ class NativeWebSearchProvider:
             return {**base, "error": self.status["reason"]}
         body = {"model": self.settings.chat_model, "input": query.strip(),
                 "tools": [{"type": "web_search"}], "tool_choice": "auto", "store": False,
-                "max_output_tokens": self.max_output_tokens, "reasoning": {"effort": "low"}}
+                "max_output_tokens": self.max_output_tokens}
+        if not is_deepseek_v41_flash_1017(self.settings):
+            body["reasoning"] = {"effort": "low"}
         owned = self.client is None
         client = self.client or httpx.Client(timeout=self.timeout_seconds, follow_redirects=False)
         # Reuse the context-aware hooks without stealing an injected client's owner.
@@ -270,7 +278,9 @@ class NativeWebSearchProvider:
             return {**base, "error": self.status["reason"]}
         body = {"model": self.settings.chat_model, "input": query.strip(),
                 "tools": [{"type": "web_search"}], "tool_choice": "auto", "store": False,
-                "max_output_tokens": self.max_output_tokens, "reasoning": {"effort": "low"}}
+                "max_output_tokens": self.max_output_tokens}
+        if not is_deepseek_v41_flash_1017(self.settings):
+            body["reasoning"] = {"effort": "low"}
         try:
             from .request_control import check_request_control
             check_request_control()
@@ -329,7 +339,18 @@ def create_responses_chat(settings, *, max_tokens, thinking_budget=None, http_cl
                           http_async_client=None, json_output=False, stream_responses=False):
     from .responses_chat import ResponsesChat
     effort = None
-    if thinking_budget is not None:
+    reasoning_configuration = None
+    if is_deepseek_v41_flash_1017(settings):
+        # The inherited project budget is Qwen-specific; it is not a DeepSeek
+        # token limit or an equivalent effort setting. Keep the provider default
+        # and record that decision separately from the actual request fields.
+        reasoning_configuration = {
+            "policy": "provider_default",
+            "configured_thinking_budget": thinking_budget,
+            "sent_thinking_budget": None,
+            "sent_reasoning_effort": None,
+        }
+    elif thinking_budget is not None:
         if settings.chat_model.lower().startswith("qwen3.8"):
             # Project approximation using published effort levels, not an exact token cap.
             effort = "low" if thinking_budget <= 4096 else "medium" if thinking_budget <= 16384 else "xhigh"
@@ -338,6 +359,7 @@ def create_responses_chat(settings, *, max_tokens, thinking_budget=None, http_cl
     return ResponsesChat(model_name=settings.chat_model, api_key=settings.chat_api_key,
         base_url=settings.chat_base_url, timeout_seconds=settings.effective_chat_timeout_seconds,
         max_tokens=max_tokens, reasoning_effort=effort, native_tools=main_native_tools(settings),
-        extra_body={"thinking_budget": thinking_budget} if thinking_budget is not None else {},
+        extra_body={"thinking_budget": thinking_budget} if thinking_budget is not None and reasoning_configuration is None else {},
+        reasoning_configuration=reasoning_configuration,
         http_client=http_client, http_async_client=http_async_client,
         json_output=json_output, stream_responses=bool(stream_responses))

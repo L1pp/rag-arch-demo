@@ -13,6 +13,7 @@ import math
 import os
 from pathlib import Path
 import stat
+import time
 from typing import Any, Callable
 
 from ..resource_supervision import resource_owner_descriptor_path
@@ -299,6 +300,114 @@ def _mark_exited(repository, worker_instance: str, resource: dict) -> bool:
     )
 
 
+def _recover_office_resource(repository, worker: dict, resource: dict, *, root: Path,
+                             local_host: str) -> dict:
+    """Confirm the Office group and retire its matching marker under its conversion lock."""
+    from ..office_conversion import (
+        OfficeConverter, _load_private_json, _private_directory, probe_office_owner,
+    )
+
+    worker_instance = worker["worker_instance"]
+    resource_id = resource["resource_id"]
+    already_exited = resource["state"] == "exited"
+    try:
+        owner_path = Path(resource["owner_path"]).absolute()
+        expected = (root / "data/runtime/office_conversion/active.json").absolute()
+        if _norm_path(owner_path) != _norm_path(expected):
+            raise ValueError("office owner path is outside the conversion directory")
+        if already_exited:
+            # Historical exited resources must not wait on a newer owner's lock.
+            # This is only a prefilter: all trust checks are repeated under lock.
+            try:
+                current = _load_private_json(owner_path)
+            except FileNotFoundError:
+                return {"resource_id": resource_id, "state": "exited", "action": "already_exited"}
+            if current.get("resource_id") != resource_id:
+                return {"resource_id": resource_id, "state": "exited", "action": "already_exited"}
+        directory = _private_directory(root)
+        converter = OfficeConverter(root, timeout=2)
+        with converter._lock(directory, time.monotonic() + converter.timeout):
+            descriptor, file_identity = read_owner_descriptor(resource, worker, root=root)
+            child = validate_owner_descriptor(descriptor, resource, worker, local_host=local_host)
+            if child["host_id"].casefold() != local_host.casefold():
+                return {"resource_id": resource_id, "state": "unknown", "action": "remote_child"}
+            outcome = probe_office_owner(
+                owner_path, pid=child["pid"], token=child["process_start_token"],
+                executable=child["executable"])
+            # Unknown descendants must never become exited merely because the
+            # launcher itself has disappeared.
+            proven_exited = outcome == ProcessProbeState.EXITED
+            snapshot = None
+            if proven_exited:
+                snapshot = _load_private_json(owner_path)
+                owner_executable = snapshot.get("executable")
+                if (snapshot.get("resource_id") != resource_id
+                        or type(snapshot.get("pid")) is not int or snapshot["pid"] != child["pid"]
+                        or snapshot.get("token") != child["process_start_token"]
+                        or type(snapshot.get("group_id")) is not int or snapshot["group_id"] != child["pid"]
+                        or not isinstance(owner_executable, str)
+                        or os.path.normcase(os.path.realpath(owner_executable))
+                           != os.path.normcase(os.path.realpath(child["executable"]))):
+                    raise ValueError("office marker identity does not match the resource")
+                # The marker may have changed despite the lock. Confirm the
+                # same child group and completion evidence immediately again.
+                if probe_office_owner(owner_path, pid=child["pid"],
+                                      token=child["process_start_token"],
+                                      executable=child["executable"]) != ProcessProbeState.EXITED:
+                    proven_exited = False
+            if already_exited:
+                if not proven_exited:
+                    return {"resource_id": resource_id, "state": "exited",
+                            "action": "office_marker_exit_unconfirmed"}
+                action = "office_marker_retired_after_exit"
+            elif resource.get("pid") is None:
+                updated = repository.backfill_unknown_resource_identity(
+                    worker_instance, resource_id,
+                    owner_descriptor_path=resource["owner_descriptor_path"],
+                    descriptor=descriptor, descriptor_file_identity=file_identity,
+                    probe_state="exited" if proven_exited else "unknown")
+                if not proven_exited:
+                    return {"resource_id": resource_id, "state": "unknown",
+                            "action": "office_group_exit_unconfirmed"}
+                if updated.get("state") != "exited":
+                    return {"resource_id": resource_id, "state": "unknown",
+                            "action": "exit_identity_rejected"}
+                action = "office_group_exit_backfilled"
+            elif proven_exited:
+                if not _mark_exited(repository, worker_instance, resource):
+                    return {"resource_id": resource_id, "state": "unknown",
+                            "action": "exit_identity_rejected"}
+                action = "office_group_exited"
+            else:
+                if resource["state"] != "unknown":
+                    repository.resource_unknown(worker_instance, resource_id, "office_group_exit_unconfirmed")
+                return {"resource_id": resource_id, "state": "unknown",
+                        "action": "office_group_exit_unconfirmed"}
+
+            try:
+                # Keep a replacement/new owner's marker untouched, even if it
+                # appeared while the database operation was in progress.
+                if _load_private_json(owner_path) != snapshot:
+                    return {"resource_id": resource_id, "state": "exited",
+                            "action": "office_marker_changed"}
+                owner_path.unlink()
+            except FileNotFoundError:
+                pass  # The matching marker has already been retired.
+            except (OSError, ValueError):
+                # A later recovery may retry cleanup for an exited resource.
+                return {"resource_id": resource_id, "state": "exited",
+                        "action": "office_marker_cleanup_pending"}
+            return {"resource_id": resource_id, "state": "exited", "action": action}
+    except TimeoutError:
+        return {"resource_id": resource_id, "state": "exited" if already_exited else "unknown",
+                "action": "office_marker_lock_unavailable"}
+    except Exception as exc:
+        if not already_exited and resource["state"] != "unknown":
+            repository.resource_unknown(worker_instance, resource_id, "office_owner_untrusted")
+        return {"resource_id": resource_id, "state": "exited" if already_exited else "unknown",
+                "action": "office_owner_untrusted", "reason": type(exc).__name__}
+
+
 def _recover_one_resource(repository, worker: dict, resource: dict, *, root: Path,
                           cleanup_owned: bool, local_host: str, probe: Callable,
                           psutil_module=None) -> dict:
@@ -310,6 +419,10 @@ def _recover_one_resource(repository, worker: dict, resource: dict, *, root: Pat
     host_id = resource.get("host_id")
     executable = resource.get("executable")
 
+    if (resource.get("kind") == "word" and resource.get("owner_path")
+            and Path(resource["owner_path"]).name == "active.json"):
+        return _recover_office_resource(repository, worker, resource, root=root,
+                                        local_host=local_host)
     if state == "exited":
         return {"resource_id": resource_id, "state": "exited", "action": "already_exited"}
     if state == "starting" and pid is None:
@@ -524,7 +637,99 @@ def resolve_task(repository, task_id: str, proof: dict, *, root: str | Path = RO
     return repository.resolve_confirmed_task_by_proof(task_id, proof)
 
 
+def maintain_recovery(repository, *, cleanup_owned: bool = True,
+                      cooldown_seconds: float = 120.0, root: str | Path = ROOT,
+                      probe: Callable = probe_process_identity,
+                      psutil_module=None) -> list[dict[str, Any]]:
+    """Isolate interrupted attempts after proving all local execution has ended.
+
+    Remote request completion is deliberately not inferred from a timeout or
+    local process exit. The cooldown only spaces recovery and subsequent work;
+    audit records continue to say that external work is unknown. This path never
+    retries the interrupted task and does not weaken explicit administrator
+    resolution. A running, inaccessible or remote local resource still blocks
+    release rather than being labelled exited.
+    """
+    if (isinstance(cooldown_seconds, bool) or not isinstance(cooldown_seconds, (int, float))
+            or not math.isfinite(cooldown_seconds) or cooldown_seconds < 0):
+        raise ValueError("cooldown_seconds 必须是有限非负数。")
+    outcomes = recover_resources(
+        repository, cleanup_owned=cleanup_owned, root=root, probe=probe,
+        psutil_module=psutil_module,
+    )
+    local_host = local_host_id()
+    for worker in repository.workers():
+        worker_instance = worker.get("worker_instance")
+        if not worker_instance or worker.get("state") != "exited":
+            continue
+        worker_host = worker.get("host_id")
+        if not isinstance(worker_host, str) or worker_host.casefold() != local_host.casefold():
+            continue
+        tasks = repository.recovery_tasks_for_worker(worker_instance)
+        if not tasks:
+            continue
+        report = {"kind": "task_isolation", "worker_instance": worker_instance,
+                  "isolated_tasks": [], "blocked": [],
+                  "external_work_state": "unknown", "automatic_retry": False}
+        outcomes.append(report)
+        parent_state = _probe(
+            worker_host, int(worker["pid"]), worker["process_start_token"], None,
+            local_host=local_host, probe=probe, psutil_module=psutil_module,
+        )
+        if parent_state != ProcessProbeState.EXITED:
+            report["blocked"].append("worker_exit_unconfirmed")
+            continue
+        exited_at = worker.get("exited_at")
+        if exited_at is None or time.time() < float(exited_at) + cooldown_seconds:
+            report["blocked"].append("cooldown")
+            if exited_at is not None:
+                report["eligible_after"] = float(exited_at) + cooldown_seconds
+            continue
+        resources = repository.resources_for_worker(worker_instance)
+        for resource in resources:
+            if resource.get("state") != "exited":
+                report["blocked"].append("resource_exit_unconfirmed")
+                break
+            identity = (resource.get("host_id"), resource.get("pid"),
+                        resource.get("process_start_token"))
+            if identity == (None, None, None):
+                # Exited-before-attach is accepted only after the existing
+                # resource lifecycle has durably established no child exists.
+                continue
+            child_state = _probe(
+                resource.get("host_id"), resource.get("pid"),
+                resource.get("process_start_token"), resource.get("executable"),
+                local_host=local_host, probe=probe, psutil_module=psutil_module,
+            )
+            if child_state != ProcessProbeState.EXITED:
+                report["blocked"].append("resource_exit_unconfirmed")
+                break
+        if report["blocked"]:
+            continue
+        proof = {
+            "operator": "scheduled-maintenance",
+            "reason": "Exact local worker and all registered resources exited; isolate without retry.",
+            "resolution_kind": "local_exit_isolation", "external_work_state": "unknown",
+            "automatic_retry": False,
+            "worker": {key: worker[key] for key in (
+                "worker_instance", "host_id", "pid", "process_start_token")},
+            "resources": [{key: resource.get(key) for key in (
+                "resource_id", "host_id", "pid", "process_start_token")}
+                for resource in resources],
+        }
+        for task in tasks:
+            accepted = repository.isolate_confirmed_local_exit(
+                worker_instance, task["task_id"], task["attempt_token"], proof,
+                cooldown_seconds=cooldown_seconds,
+            )
+            if accepted:
+                report["isolated_tasks"].append(task["task_id"])
+            else:
+                report["blocked"].append("task_state_changed_or_resources_unconfirmed")
+    return outcomes
+
+
 __all__ = [
-    "read_owner_descriptor", "recover_resources", "resolve_task",
+    "read_owner_descriptor", "recover_resources", "maintain_recovery", "resolve_task",
     "validate_owner_descriptor",
 ]

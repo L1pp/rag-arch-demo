@@ -6,7 +6,8 @@ factory; vendor names, credentials and model choices remain project settings.
 from .config import Settings, resolve_chat_budgets
 from .runtime_audit import attach_chat_audit
 from .web_search import (WebSearchChat, web_search_extra_body, create_web_search_provider,
-                         select_chat_protocol, create_responses_chat)
+                         select_chat_protocol, create_responses_chat,
+                         is_deepseek_v41_flash_1017)
 TONGYI_FLASH = "tongyi-embedding-vision-flash-2026-03-06"
 QWEN_TEXT = "qwen3.7-text-embedding"
 QWEN_FLASH_TEXT = "qwen3.7-text-embedding-flash"
@@ -68,6 +69,8 @@ def create_chat_model(settings: Settings, *, max_tokens: int | None = None,
         cls = Qwen38Chat
     resolved_max_tokens, resolved_thinking_budget = resolve_chat_budgets(
         settings, max_tokens=max_tokens, thinking_budget=thinking_budget)
+    if is_deepseek_v41_flash_1017(settings) and resolved_thinking_budget is not None:
+        raise ValueError("deepseek-v4.1-flash-1017不支持thinking_budget；Chat Completions请移除该参数或使用Responses。")
     kwargs = dict(
         model=settings.chat_model,
         api_key=settings.chat_api_key,
@@ -98,7 +101,8 @@ def create_async_chat_model(settings: Settings, *, max_tokens: int | None = None
     _, resolved_thinking = resolve_chat_budgets(
         settings, max_tokens=max_tokens, thinking_budget=thinking_budget)
     if (protocol == "responses" and resolved_thinking is not None
-            and not settings.chat_model.lower().startswith("qwen3.8")):
+            and not settings.chat_model.lower().startswith("qwen3.8")
+            and not is_deepseek_v41_flash_1017(settings)):
         raise ValueError("此模型Responses不支持thinking_budget；请移除该专属参数，使用模型默认思考配置。")
     owns_client = http_async_client is None
     client = (http_async_client if not owns_client else

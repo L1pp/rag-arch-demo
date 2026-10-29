@@ -26,11 +26,19 @@ FastAPI 负责认证、账号内 API 请求、任务提交、上传下载边界�
 
 Worker 使用项目内的应用工作流与检索代码。聊天、网页搜索、嵌入和重排等网络请求采用异步编排。同步 CPU、文件和资料转换工作由有界本地执行资源或受监督子进程处理。离线 CLI 仍是独立的同步样例入口。
 
+恢复辅助函数只有在确认本机 worker 和登记资源退出、冷却期结束后，才可隔离中断任务；它不会自动重试，也不会假定外部请求已经停止。维护操作需要显式调用。
+
 ## 共享检索数据
 
 检索链路组合 BM25 与稠密向量候选，通过 RRF 融合后按配置重排并展开证据。公共语料记录、BM25 统计和稠密向量支持不可变只读内存映射包。多个进程可共享操作系统文件页，避免各自构建完整的 Python 内存副本；完整语料记录与定位信息按需解码。检索行为保持可读，改变的是共享数据的加载方式。
 
-公开代码包含 mmap 实现，但不包含语料和派生包。使用者按项目格式准备自有数据，再基于自己的语料和兼容的向量缓存构建索引包。源数据更新后，应构建匹配的语料与索引包，再重启 worker。公开命令和资料边界见[启动说明](setup.md)。
+公开代码包含 mmap 实现，但不包含语料和派生包。使用者按项目格式准备自有数据，再基于自己的语料和兼容的向量缓存构建索引包。加载器仍校验格式、维度、偏移、映射与边界，已移除独立的旧完整性校验。打开语料 mmap 包时不会检查原始源目录是否仍存在或与包匹配，结构有效的旧包仍可能加载。运维者需管理匹配版本；源数据更新后，应重建匹配的语料、BM25 和向量包，再重启 worker。公开命令和资料边界见[启动说明](setup.md)。
+
+## 页面证据与可选 OCR
+
+方案核查可查看来源整页或选定区域。首批选页与图片投递受到预算限制；图文台账记录获取、请求、返回和引用状态，台账本身不保存图片字节。图片投递给模型只说明交付情况，不能证明模型已正确识读。
+
+云 OCR 默认关闭。明确启用后，已领取任务的 worker 可为候选页补充 OCR 文字，保留页码和未核验状态。当前适配器使用指定的阿里云 VL-OCR 服务，配置与限制见[启动说明](setup.md)。Linux 使用受监督的 LibreOffice 进程转换文档页；Windows 用户应先将旧 DOC 转为 DOCX 再上传。
 
 ## 源码阅读位置
 
@@ -41,7 +49,8 @@ Worker 使用项目内的应用工作流与检索代码。聊天、网页搜索�
 | PostgreSQL 状态 | rag_arch/web/db.py、task_repository.py、persistent_tasks.py | 显式数据库迁移、按所有权查询、持久任务状态流转 |
 | 事件与 worker | rag_arch/web/events.py、task_worker.py、worker_process.py | 有序事件、游标续传、租约、执行和恢复 |
 | 附件与资料 | rag_arch/web/documents.py、document_routes.py、standards_resources.py | 账号附件归属与只读共享语料资源 |
-| 异步 Provider 边界 | rag_arch/async_support.py、providers.py、web_search.py | 异步网络调用与有界本地工作 |
+| 页面核查与 OCR | rag_arch/page_regions.py、visual_review_ledger.py、cloud_ocr.py、web/ocr_preparation.py | 页面区域、图片证据状态与可选的未核验 OCR |
+| 异步 Provider 边界 | rag_arch/async_support.py、providers.py、responses_chat.py、web_search.py | 异步调用、Responses 处理、服务商参数和有界本地工作 |
 | 检索与证据 | rag_arch/retrieval.py、binary_bm25.py、binary_vectors.py、binary_corpus.py、evidence_index.py | 混合候选、mmap 包、证据查询和按需解码 |
 | Agent 与报告 | rag_arch/standard_tools.py、graph_agent.py、plan_review_agent.py、plan_output.py | 证据工具链、方案引句核验、引用检查和报告输出 |
 | 独立 Web 前端 | frontend/ | React 开发服务器与生产构建 |
@@ -50,4 +59,4 @@ Worker 使用项目内的应用工作流与检索代码。聊天、网页搜索�
 
 可工作的部署需要 PostgreSQL、运维者提供的模型设置、项目格式的语料，以及查看来源页所需的原件。使用者可准备 data/corpus/clauses.jsonl、data/corpus/tables.jsonl，并按工作流需要添加目录、状态和来源映射。API 凭据和运行文件保存在本地。
 
-README 中唯一展示的截图于 2026-10-13 使用虚构离线样例拍摄，展示较早的 React 界面，不体现当前账号隔离、PostgreSQL 持久任务或 worker 生命周期。其他历史截图见文档导航；这些截图均非部署证据。
+文档导航链接的历史截图于 2026-10-13 使用虚构离线样例拍摄，展示较早的 React 界面，不能验证当前 worker 生命周期或真实部署。

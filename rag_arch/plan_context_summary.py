@@ -119,10 +119,12 @@ def _prompt_text(value):
 _IMAGE_BLOCK_TYPES = {"image_url", "input_image", "image"}
 _IMAGE_REFERENCE_FIELDS = (
     "evidence_id", "source_ref", "filename", "page", "page_count", "display_id", "citation",
+    "image_id", "parent_page_id", "view_kind", "region", "page_width", "page_height", "rotation",
+    "coordinate_system", "rendered_scale", "text_scope", "page_numbering",
 )
 _IMAGE_REMOVED_NOTE = (
     "图片原始编码已在上下文压缩时剥离；这里仅保留来源定位，不能把图片内容当作已识别文字。"
-    "需要细节时请重读原页。"
+    "需要细节时请重读原页；如需原局部图，使用保留的region重新读取。"
 )
 
 

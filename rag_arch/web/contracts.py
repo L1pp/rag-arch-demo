@@ -73,6 +73,7 @@ class TaskResult(BaseModel):
     report: dict | None = None
     report_markdown: str | None = None
     page_sources: list[dict] = Field(default_factory=list)
+    visual_review: dict | None = None
     citation_check: dict | None = None
 
 

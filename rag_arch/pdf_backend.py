@@ -24,6 +24,7 @@ from .resource_supervision import (
     probe_process,
 )
 from .visual_page_index import build_visual_page_index
+from .page_regions import normalize_region, render_page_image
 
 
 MAX_IMAGE_PIXELS = 4_000_000
@@ -135,29 +136,30 @@ def _scan_visual_pages(source) -> dict:
         raise ValueError("PDF 无法打开，请检查来源文件。") from exc
 
 
-def _read_page(source, page: int, scale: float) -> dict:
+def _ocr_candidates(source) -> list[dict]:
+    """Inspect page metadata and bounded thumbnails in the PDF process."""
+    from .ocr_page_policy import build_ocr_page_candidates
+    try:
+        with _open_pdf(source) as document:
+            _check_pdf(document)
+            return build_ocr_page_candidates(document)
+    except (OSError, RuntimeError) as exc:
+        raise ValueError("PDF 无法打开，请检查来源文件。") from exc
+
+
+def _read_page(source, page: int, scale: float, region=None) -> dict:
+    if type(page) is not int or page < 1:
+        raise ValueError("物理页码必须是从 1 开始的整数。")
+    region = normalize_region(region)
     try:
         with _open_pdf(source) as document:
             page_count = _check_pdf(document)
             if page > page_count:
                 raise ValueError("物理页码超出来源页面范围。")
-            original = document[page - 1]
-            width, height = original.rect.width, original.rect.height
-            render_scale = min(float(scale), (MAX_IMAGE_EDGE - 1) / max(width, height),
-                               (MAX_IMAGE_PIXELS / (width * height)) ** 0.5 * 0.99)
-            for _ in range(3):
-                pixmap = original.get_pixmap(matrix=pymupdf.Matrix(render_scale, render_scale),
-                                             colorspace=pymupdf.csRGB, alpha=False)
-                png = pixmap.tobytes("png")
-                if len(png) <= MAX_IMAGE_BYTES:
-                    break
-                render_scale *= 0.7
-            else:
-                raise ValueError("页面图像过大，请使用更小的缩放比例。")
             return {"page_count": page_count, "page": page,
-                    "text": original.get_text().strip(), "image_bytes": png,
-                    "mime_type": "image/png", "width": pixmap.width, "height": pixmap.height,
-                    "rendered_scale": render_scale}
+                    **render_page_image(document[page - 1], scale, region,
+                        max_pixels=MAX_IMAGE_PIXELS, max_edge=MAX_IMAGE_EDGE,
+                        max_bytes=MAX_IMAGE_BYTES)}
     except (OSError, RuntimeError) as exc:
         raise ValueError("PDF 无法打开，请检查来源文件。") from exc
 
@@ -178,8 +180,10 @@ def _worker_call(operation: str, payload: dict):
         result = _list_pages(payload["source"], payload["start"], payload["limit"], payload["query"])
     elif operation in {"scan_visual_pages", "visual_page_index"}:
         result = _scan_visual_pages(payload["source"])
+    elif operation == "ocr_candidates":
+        result = _ocr_candidates(payload["source"])
     elif operation == "read_page":
-        result = _read_page(payload["source"], payload["page"], payload["scale"])
+        result = _read_page(payload["source"], payload["page"], payload["scale"], payload.get("region"))
     else:
         raise ValueError("未知 PDF worker 操作。")
     return os.getpid(), result
@@ -194,6 +198,15 @@ def _write_response(path: str, envelope: tuple) -> None:
 
 
 _SAFE_WORKER_ERRORS = {
+    "区域必须是四个归一化坐标 [左, 上, 右, 下]。",
+    "区域坐标必须是有限实数，不能使用布尔值。",
+    "区域坐标必须是有限实数。",
+    "区域坐标须在 0 到 1 内，且左小于右、上小于下。",
+    "页面缩放必须在 0.25 到 4 之间。",
+    "物理页码必须是从 1 开始的整数。",
+    "页面尺寸无效，无法读取。",
+    "区域过小，请选择更大的页面区域。",
+    "页面图像过大或区域过小，无法在图像限制内读取。",
     "来源不是有效 PDF。",
     "加密 PDF 暂不支持分页。",
     "PDF 没有可读取页面。",
@@ -563,9 +576,20 @@ class ProcessPdfBackend:
         """Compatibility spelling for callers that treat the result as an index."""
         return self.scan_visual_pages(source)
 
-    def read_page(self, source, page: int, scale: float = 1.5) -> dict:
+    def ocr_candidates(self, source) -> list[dict]:
+        """Identify potentially unread pages in the owned PDF worker process."""
+        return self._call("ocr_candidates", {"source": self._source(source, "PDF")})
+
+    def read_page(self, source, page: int, scale: float = 1.5, region=None) -> dict:
+        if type(page) is not int or page < 1:
+            raise ValueError("物理页码必须是从 1 开始的整数。")
+        if (isinstance(scale, bool) or not isinstance(scale, (int, float))
+                or not 0.25 <= scale <= 4 or not math.isfinite(scale)):
+            raise ValueError("页面缩放必须在 0.25 到 4 之间。")
+        region = normalize_region(region)
         return self._call("read_page", {
-            "source": self._source(source, "PDF"), "page": page, "scale": scale})
+            "source": self._source(source, "PDF"), "page": page, "scale": scale,
+            "region": region})
 
     def _clear_process(self) -> None:
         with self._state_lock:

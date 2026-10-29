@@ -15,6 +15,8 @@ from ..evidence_index import EvidenceIndex
 from ..page_sources import _locations, standard_page_sources
 from ..standard_status import StandardStatusRegistry
 from ..standards import load_corpus
+from ..page_regions import normalize_region
+from .page_region_query import page_source_url, region_query_value
 
 ROOT = Path(__file__).resolve().parents[2]
 _LOG = logging.getLogger(__name__)
@@ -459,7 +461,7 @@ class StandardsResources:
         raise KeyError("未找到属于所选标准的这条证据；不会改用其他版本。")
 
     @staticmethod
-    def _mapped_pages(record, service):
+    def _mapped_pages(record, service, *, only_page=None):
         """Pages belong to a named file; never transfer numbers to another copy."""
         mapped = {}
         for location in _locations(record):
@@ -474,8 +476,10 @@ class StandardsResources:
                     start = location.get("page", location.get("page_start"))
                     end = location.get("page_end", start)
                 if type(start) is int and type(end) is int and 0 < start <= end:
-                    target = mapped.setdefault(ref, {})
-                    for page in range(start, end + 1):
+                    pages = range(start, end + 1) if only_page is None else (
+                        (only_page,) if start <= only_page <= end else ())
+                    for page in pages:
+                        target = mapped.setdefault(ref, {})
                         # Only display book numbering explicitly recorded for this location.
                         logical = location.get("logical_page", location.get("document_page_start"))
                         target.setdefault(page, logical if page == start else None)
@@ -494,17 +498,28 @@ class StandardsResources:
             # A model-read image is an actual per-run page, not a corpus clause.
             # Resolve its saved source path in the per-standard page registry.
             if record.get("kind") == "page_image":
-                mapped = self._mapped_pages(record, self.page_service(entry["std_no"]))
-                if mapped:
-                    ref = next(iter(mapped))
-                    url = "/viewer/pages?" + urlencode({"std": entry["catalog_id"],
-                                                        "source_ref": ref, "page": min(mapped[ref])})
+                service = self.page_service(entry["std_no"])
+                source = record.get("page_source")
+                source = source if isinstance(source, dict) else {}
+                page = source.get("page")
+                # source_ref is scoped to its originating page registry. Only
+                # the saved path can identify the same original in this viewer.
+                mapped = (self._mapped_pages(record, service, only_page=page)
+                          if type(page) is int and page > 0 else {})
+                refs = list(mapped)
+                if len(refs) == 1:
+                    url = page_source_url(
+                        "/viewer/pages?" + urlencode({"std": entry["catalog_id"]}),
+                        {**source, "source_ref": refs[0]})
         return {"evidence_id": evidence_id, "std_no": entry["std_no"], "title": entry["title"],
                 "clause_no": record.get("clause_no"), "text": record.get("text", ""),
                 "page_url": url,
                 "history_url": "/viewer/history/?" + urlencode({"std": entry["std_no"]})}
 
-    def page_view(self, std, *, evidence=None, source_ref=None, page=None):
+    def page_view(self, std, *, evidence=None, source_ref=None, page=None, region=None):
+        selected_region = normalize_region(region)
+        if selected_region is not None and page is None:
+            raise ValueError("局部页图需要指定页码。")
         entry = self.resolve(std)
         if not entry["original_available"]:
             raise ValueError("这项标准仅有目录登记，本地没有可显示的原件。")
@@ -541,16 +556,23 @@ class StandardsResources:
                 "sources": [{"source_ref": row["source_ref"], "filename": row["filename"],
                              "pages": sorted(mapping.get(row["source_ref"], {}))} for row in choices],
                 "pages": [{"page": p, "document_page": mapped.get(p),
+                           "region": selected_region,
                            "image_url": "/api/standards/page-image?" + urlencode(
-                               {"std": entry["catalog_id"], "source_ref": ref, "page": p})}
+                               {"std": entry["catalog_id"], "source_ref": ref, "page": p,
+                                **({"region": region_query_value(selected_region)} if selected_region is not None else {})})}
                           for p in requested],
                 "warning": " ".join(notes)}
 
-    def page_image(self, std, source_ref, page):
+    def page_image(self, std, source_ref, page, region=None):
         entry = self.resolve(std)
         if not entry["original_available"]:
             raise ValueError("本地没有这项标准的原件。")
-        return self.page_service(entry["std_no"]).read_page(source_ref, page)["image_bytes"]
+        service = self.page_service(entry["std_no"])
+        if not any(row.get("source_ref") == source_ref for row in service.sources()):
+            raise KeyError("所选来源不属于这项标准。")
+        selected_region = normalize_region(region)
+        return service.read_page(source_ref, page,
+            **({"region": selected_region} if selected_region is not None else {}))["image_bytes"]
 
     def close(self):
         with self._lock:

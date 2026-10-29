@@ -29,7 +29,7 @@ class LegacyImportError(RuntimeError):
 
 _ASSET_ID = re.compile(r"^[0-9a-f]{32}$")
 _LEGACY_ID = re.compile(r"^[0-9a-f]{32}$")
-_SUPPORTED_SUFFIXES = {".pdf", ".docx", ".txt", ".md"}
+_SUPPORTED_SUFFIXES = {".pdf", ".doc", ".docx", ".txt", ".md"}
 _MAX_JSON_BYTES = 64 * 1024 * 1024
 _MAX_STORAGE_KEY = 512
 _COPY_CHUNK_BYTES = 1024 * 1024

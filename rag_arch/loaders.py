@@ -2,8 +2,10 @@
 from __future__ import annotations
 
 from io import BytesIO
-from pathlib import PurePosixPath
+from pathlib import Path, PurePosixPath
 import re
+import shutil
+import tempfile
 from uuid import uuid4
 from zipfile import BadZipFile, ZipFile
 import xml.etree.ElementTree as ET
@@ -12,6 +14,7 @@ from .models import LoadedDocument, TextUnit
 
 MAX_UPLOAD_MB = 10
 MAX_UPLOAD_BYTES = MAX_UPLOAD_MB * 1024 * 1024
+_OLE_DOCUMENT_SIGNATURE = b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1"
 
 
 def validate_upload_sizes(sizes) -> None:
@@ -43,18 +46,24 @@ def _upload_name_kind(filename: str, data: bytes) -> tuple[str, str]:
     if not name:
         raise ValueError("文件名不能为空。")
     kind = PurePosixPath(name).suffix.lower().lstrip(".")
-    if kind not in {"pdf", "docx", "txt", "md"}:
-        raise ValueError("目前支持 PDF、DOCX、TXT 和 MD 文字文件。")
+    if kind not in {"pdf", "doc", "docx", "txt", "md"}:
+        raise ValueError("目前支持 PDF、DOC、DOCX、TXT 和 MD 文字文件。")
+    if kind == "doc" and not data.startswith(_OLE_DOCUMENT_SIGNATURE):
+        raise ValueError("DOC 文件内容不是有效的旧版 Word 文档，请检查文件格式。")
     return name, kind
 
 
-def load_document(filename: str, data: bytes, *, pdf_backend=None) -> LoadedDocument:
-    """Load PDF, DOCX, TXT or MD bytes and keep only the basename, not a path.
+def load_document(filename: str, data: bytes, *, pdf_backend=None,
+                  normalized_docx: bytes | None = None, office_converter=None,
+                  project_root: str | Path | None = None) -> LoadedDocument:
+    """Load PDF, DOC, DOCX, TXT or MD bytes and keep only the basename.
 
     An image-only PDF is a valid upload with no readable units and unread pages;
     malformed/unsupported files raise ValueError. No file links are dereferenced.
     """
     name, kind = _upload_name_kind(filename, data)
+    if normalized_docx is not None and kind != "doc":
+        raise ValueError("归一化 Word 内容只能用于旧版 DOC 文档。")
     if kind == "pdf" and pdf_backend is not None:
         loaded = pdf_backend.extract_document(name, data)
         if not isinstance(loaded, LoadedDocument):
@@ -65,11 +74,48 @@ def load_document(filename: str, data: bytes, *, pdf_backend=None) -> LoadedDocu
         _load_pdf(doc, data)
     elif kind == "docx":
         _load_docx(doc, data)
+    elif kind == "doc":
+        if normalized_docx is None:
+            normalized_docx = _convert_doc_to_docx(
+                data, office_converter=office_converter, project_root=project_root)
+        if not isinstance(normalized_docx, bytes) or not normalized_docx:
+            raise ValueError("DOC 转换后的 DOCX 为空或格式无效。")
+        _load_docx(doc, normalized_docx)
+        doc.warnings.append("DOC 已转为 DOCX 提取正文；转换结果可能与原件有差异，段落和表格行定位不是原件页码。")
     else:
         _load_text(doc, data)
     if not doc.units:
         doc.warnings.append("没有提取到可用于问答的文字；扫描件自动 OCR 尚未提供。")
     return doc
+
+
+def _convert_doc_to_docx(data: bytes, *, office_converter=None,
+                         project_root: str | Path | None = None) -> bytes:
+    """Normalize an unregistered DOC in a private temporary runtime directory."""
+    from .config import ROOT
+    from .office_conversion import OfficeConverter, _private_directory
+    from .resource_supervision import ResourceCleanupUncertain
+
+    root = Path(project_root if project_root is not None else ROOT).resolve()
+    parent = _private_directory(root)
+    temporary = Path(tempfile.mkdtemp(prefix="legacy-doc-", dir=parent)).resolve()
+    if temporary.parent != parent:
+        raise RuntimeError("DOC 临时目录不在允许的运行目录内。")
+    preserve = False
+    try:
+        source, target = temporary / "source.doc", temporary / "normalized.docx"
+        source.write_bytes(data)
+        (office_converter or OfficeConverter(root)).ensure_docx(source, target)
+        return target.read_bytes()
+    except ResourceCleanupUncertain:
+        # The converter may still own files in this directory; preserve them
+        # until the existing resource recovery flow confirms process exit.
+        preserve = True
+        raise
+    finally:
+        if (not preserve and not temporary.is_symlink()
+                and temporary.resolve().parent == parent):
+            shutil.rmtree(temporary, ignore_errors=True)
 
 
 def _load_text(doc: LoadedDocument, data: bytes) -> None:

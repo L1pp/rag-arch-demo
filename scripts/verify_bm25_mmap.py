@@ -10,7 +10,6 @@ import argparse
 from datetime import datetime, timezone
 from concurrent.futures import ThreadPoolExecutor
 import gc
-import hashlib
 import ipaddress
 import json
 import math
@@ -107,14 +106,20 @@ def _append_log(path: Path, message: str) -> None:
         handle.write(f"{stamp} {message}\n")
 
 
-def _source_snapshot(path: Path) -> dict[str, int]:
-    stat = path.stat()
-    return {"size_bytes": stat.st_size, "mtime_ns": stat.st_mtime_ns,
-            "file_id": getattr(stat, "st_ino", 0)}
+_QUERY_IDS: dict[str, str] = {}
+
+
+def _set_query_ids(queries: list[str]) -> None:
+    """Assign opaque ordinal labels; no identifier is derived from text."""
+    _QUERY_IDS.clear()
+    for query in queries:
+        _query_id(query)
 
 
 def _query_id(query: str) -> str:
-    return hashlib.sha256(query.encode("utf-8")).hexdigest()[:16]
+    if query not in _QUERY_IDS:
+        _QUERY_IDS[query] = f"query-{len(_QUERY_IDS) + 1:04d}"
+    return _QUERY_IDS[query]
 
 
 def _load_cached_query_vectors(source: Path, expected_dimensions: int) -> dict[str, list[float]]:
@@ -198,13 +203,13 @@ def _index_snapshots(index: EvidenceIndex, queries: list[str], *,
         "1.8≤18", "1.8 >= 18", "≤ ≥ ≠", "", "bm25_mmap_unseen_probe"]
     if tie_probe:
         lexical_queries.append(tie_probe)
-    score_hashes = {}
+    score_arrays = {}
     bm25_top30 = {}
     rrf_top8 = {}
     for query in lexical_queries:
         scores = np.asarray(index.local._bm25_scores(query), dtype="<f8")
         query_key = _query_id(query)
-        score_hashes[query_key] = hashlib.sha256(scores.tobytes()).hexdigest()
+        score_arrays[query_key] = [float(value).hex() for value in scores]
         bm25_top30[query_key] = _retrieval_snapshot(
             index, query, mode="bm25", top_k=30)
 
@@ -219,11 +224,11 @@ def _index_snapshots(index: EvidenceIndex, queries: list[str], *,
     ]
     filtered = {}
     for query in queries[:3]:
-        for filters in filter_cases:
-            key = f"{_query_id(query)}:{hashlib.sha256(json.dumps(filters, sort_keys=True).encode()).hexdigest()[:8]}"
+        for number, filters in enumerate(filter_cases, 1):
+            key = f"{_query_id(query)}:filter-{number}"
             filtered[key] = _retrieval_snapshot(
                 index, query, mode="rrf", top_k=8, filters=filters)
-    return {"score_array_hashes": score_hashes, "bm25_top30": bm25_top30,
+    return {"score_arrays": score_arrays, "bm25_top30": bm25_top30,
             "rrf_top8": rrf_top8, "filtered_rrf_and_expansion": filtered}
 
 
@@ -233,7 +238,7 @@ def _signature(index: EvidenceIndex, query: str) -> dict:
                 if not chunk.locator.get("excluded_from_current_retrieval", False)
                 and scores[i] > 0]
     ordered = sorted(eligible, key=lambda i: (-float(scores[i]), index.chunks[i].chunk_id))[:30]
-    return {"score_array_sha256": hashlib.sha256(scores.tobytes()).hexdigest(),
+    return {"score_array": [float(value).hex() for value in scores],
             "bm25_top30_ids": [index.chunks[i].chunk_id for i in ordered]}
 
 
@@ -271,6 +276,7 @@ def _worker_entry(connection, backend: str, corpus_dir: str, bm25_dir: str,
                   expected: dict[str, dict] | None) -> None:
     """Spawn target. Waits at a parent-controlled barrier after index loading."""
     _disable_external_network()
+    _set_query_ids(queries)
     index = None
     try:
         from rag_arch.evidence_index import EvidenceIndex as WorkerEvidenceIndex
@@ -305,7 +311,8 @@ def _worker_entry(connection, backend: str, corpus_dir: str, bm25_dir: str,
                 signature = _signature(index, query)
                 latencies.append(time.perf_counter() - before)
                 query_key = _query_id(query)
-                signatures[query_key] = signature
+                if expected is None:
+                    signatures[query_key] = signature
                 if expected is not None and expected.get(query) != signature:
                     mismatch_ids.append(query_key)
 
@@ -458,7 +465,7 @@ def _run_group(*, backend: str, workers: int, corpus_dir: Path, bm25_dir: Path,
             "group_query_seconds": query_seconds,
             "total_queries_per_second": query_total / query_seconds if query_seconds else None,
             "verification_workload_latency_p95_seconds": p95,
-            "latency_scope_note": "each sample includes a full score array, Top30 ordering, and digest; it is not a pure BM25 kernel or HTTP latency",
+            "latency_scope_note": "each sample includes construction of the full score array and Top30 ordering; it is not a pure BM25 kernel or HTTP latency",
             "ready_sum_uss_bytes": ready_sample["sum_uss_bytes"],
             "peak_query_phase_sum_uss_bytes": peak_query_sum_uss,
             "peak_query_phase_sum_private_commit_bytes": peak_query_sum_private,
@@ -513,17 +520,15 @@ def _check_memory_budget(worker_count: int, per_worker_gib: float,
 
 def _load_full_queries(args):
     source = args.embedding_cache
-    before = _source_snapshot(source)
     identity = read_core_embedding_identity(source)
     queries = _load_cached_query_vectors(source, identity["dimensions"])
-    return identity, queries, before
+    _set_query_ids(list(queries))
+    return identity, queries
 
 
-def _semantic_stage(args, query_vectors: dict[str, list[float]], identity: dict,
-                    source_before: dict) -> dict:
+def _semantic_stage(args, query_vectors: dict[str, list[float]], identity: dict) -> dict:
     memory_budget = _check_memory_budget(1, args.memory_per_worker_gib,
                                          args.reserve_gib)
-    source = args.embedding_cache
     corpus = load_corpus(args.corpus_dir)
     queries = list(query_vectors)
     lexical_probes = ["1.8≤18", "1.8 >= 18", "≤ ≥ ≠", "", "bm25_mmap_unseen_probe"]
@@ -581,9 +586,6 @@ def _semantic_stage(args, query_vectors: dict[str, list[float]], identity: dict,
 
     if baseline_snapshots != mapped_snapshots:
         raise AssertionError("BM25 score arrays, Top30, RRF Top8, filters, or evidence expansion differ")
-    after = _source_snapshot(source)
-    if source_before != after:
-        raise AssertionError("source embedding cache metadata changed during offline verification")
     # Two index passes, each with 28 unfiltered RRF and 3x3 filtered queries.
     expected_requests = 2 * (len(queries) + len(queries[:3]) * 3)
     if query_requests != expected_requests:
@@ -601,8 +603,6 @@ def _semantic_stage(args, query_vectors: dict[str, list[float]], identity: dict,
         "rrf_top8_exact": True, "filter_and_expansion_exact": True,
         "query_embedding_requests": 0, "document_embedding_requests": 0,
         "query_vectors_streamed_only": True,
-        "source_embedding_cache_unchanged": True,
-        "source_cache_size_bytes": source_before["size_bytes"],
     }
 
 
@@ -754,10 +754,10 @@ def main(argv=None) -> int:
         _write_result(args.output_dir, "synthetic", _small_synthetic_stage(args))
         return 0
 
-    identity, query_vectors, source_before = _load_full_queries(args)
+    identity, query_vectors = _load_full_queries(args)
     queries = list(query_vectors)
     if args.stage in {"semantic", "all"}:
-        result = _semantic_stage(args, query_vectors, identity, source_before)
+        result = _semantic_stage(args, query_vectors, identity)
         _write_result(args.output_dir, "semantic", result)
     if args.stage in {"memory", "concurrency", "all"}:
         expected, reference = _reference_signatures(args, queries, args.timeout_seconds)

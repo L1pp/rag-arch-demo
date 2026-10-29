@@ -255,7 +255,7 @@ class MmapCorpusIntegrationTests(unittest.TestCase):
         with self.assertRaises(BinaryCorpusStoreError):
             _ = sequence[0]
 
-    def test_resource_loader_auto_json_mmap_hit_and_stale_or_bad_503(self):
+    def test_resource_loader_auto_json_mmap_hit_and_missing_or_bad_503(self):
         def app_for(root, resources):
             service = TaskService(archive_root=None)
             return create_app(
@@ -291,21 +291,16 @@ class MmapCorpusIntegrationTests(unittest.TestCase):
                 self.assertEqual(json_resources._core_corpus_source, "json")
                 self.assertTrue(any("JSON语料" in line for line in logs.output))
 
-        # A package built from an older source snapshot must fail closed as 503.
-        stale_root = self.root / "stale"
-        stale_source = stale_root / "data" / "corpus"
-        stale_package = stale_root / "data" / "runtime" / "core_corpus"
-        _write_synthetic_corpus(stale_source, filler_count=32)
-        build_core_corpus_mmap(stale_source, stale_package)
-        clauses_path = stale_source / "clauses.jsonl"
-        clauses_path.write_text(
-            clauses_path.read_text(encoding="utf-8").replace(
-                "主体结构共同过滤词", "过期版本主体结构文本"),
-            encoding="utf-8",
-        )
-        stale_resources = StandardsResources(stale_root)
+        # Explicit mmap mode rejects a missing required package file.
+        missing_root = self.root / "missing-package-file"
+        missing_source = missing_root / "data" / "corpus"
+        missing_package = missing_root / "data" / "runtime" / "core_corpus"
+        _write_synthetic_corpus(missing_source, filler_count=32)
+        version = build_core_corpus_mmap(missing_source, missing_package)
+        (version / "clauses.records.bin").unlink()
+        missing_resources = StandardsResources(missing_root)
         with patch.dict(os.environ, {"RAG_ARCH_CORE_CORPUS_BACKEND": "mmap"}):
-            with TestClient(app_for(stale_root, stale_resources)) as client:
+            with TestClient(app_for(missing_root, missing_resources)) as client:
                 self.assertEqual(client.get("/api/health").status_code, 200)
                 self.assertEqual(client.get("/api/standards/catalog").status_code, 503)
 

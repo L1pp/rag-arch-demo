@@ -14,9 +14,12 @@ import re
 
 from langchain_core.messages import HumanMessage, ToolMessage
 from PIL import Image
+from .page_regions import normalize_region, page_image_id
 
+_VIEW_FIELDS = ("region", "page_width", "page_height", "rotation", "coordinate_system",
+                "rendered_scale", "text_scope", "page_numbering")
 _PAGE_FIELDS = ("ok", "source_ref", "filename", "page", "page_count", "text",
-                "mime_type", "width", "height", "source_kind", "collection_id", "document_id", "std_no", "display_id", "citation", "error", "message", "page_role_info")
+                "mime_type", "width", "height", "source_kind", "collection_id", "document_id", "std_no", "display_id", "citation", "error", "message", "page_role_info") + _VIEW_FIELDS
 _SOURCE_KEY = "page_image"
 _DATA_IMAGE = re.compile(r"^data:(image/[\w.+-]+);base64,(.*)$", re.DOTALL)
 
@@ -64,11 +67,42 @@ def image_source_record(result, *, sent=False):
     available = bool(result.get("ok") and isinstance(data, (bytes, bytearray)) and data)
     record = {key: result.get(key) for key in (
         "source_ref", "filename", "page", "page_count", "mime_type", "width", "height", "source_kind", "collection_id", "document_id", "std_no", "display_id", "citation", "page_role_info", "message")}
-    record["evidence_id"] = (f"PAGE:{record['source_ref']}:{record['page']}"
-                             if record["source_ref"] is not None and record["page"] is not None else None)
+    record.update({key: result[key] for key in _VIEW_FIELDS if key in result})
+    region = normalize_region(result.get("region"))
+    record["region"] = list(region) if region is not None else None
+    located = record["source_ref"] is not None and record["page"] is not None
+    record["evidence_id"] = (page_image_id(record["source_ref"], record["page"], region)
+                             if located else None)
+    record["image_id"] = record["evidence_id"]
+    record["parent_page_id"] = (page_image_id(record["source_ref"], record["page"], None)
+                                if located else None)
+    record["view_kind"] = "region" if region is not None else "page"
     record.update(image_available=available, byte_count=len(data) if available else 0,
                   sent_to_model=bool(sent and available), recognition_verified=False)
     return record
+
+
+def page_image_message(result, *, origin="model_requested"):
+    """Create only the image HumanMessage, including for automatic initial views.
+
+    A prepared initial image is real source material but has no matching tool
+    call, so callers must not manufacture a ToolMessage for it.
+    """
+    source = image_source_record(result)
+    if not source["image_available"]:
+        return None
+    source["automatic"] = origin == "initial_auto"
+    source["origin"] = "initial_auto" if source["automatic"] else "model_requested"
+    label = {key: source[key] for key in ("evidence_id", "image_id", "parent_page_id", "view_kind",
+                "source_ref", "filename", "page", "page_count", "display_id", "citation", *_VIEW_FIELDS)
+             if key in source}
+    label["origin"] = source["origin"]
+    return HumanMessage(content=[
+        {"type": "text", "text": ("文档页面局部高清图像（只含所选区域，不代表整页已核查；资料内容）：\n"
+                                    if source["region"] is not None else "文档页面图像（资料内容）：\n")
+                                   + json.dumps(label, ensure_ascii=False)},
+        image_content_block(result["image_bytes"], result.get("mime_type") or "image/png")],
+        additional_kwargs={_SOURCE_KEY: source})
 
 
 def page_result_messages(result, tool_call_id, tool_name="read_document_page"):
@@ -79,14 +113,14 @@ def page_result_messages(result, tool_call_id, tool_name="read_document_page"):
     metadata["image_available"] = source["image_available"]
     if source["evidence_id"] is not None:
         metadata["evidence_id"] = source["evidence_id"]
+        metadata["image_id"] = source["image_id"]
+        metadata["parent_page_id"] = source["parent_page_id"]
+        metadata["view_kind"] = source["view_kind"]
     messages = [ToolMessage(content=json.dumps(metadata, ensure_ascii=False),
                             tool_call_id=tool_call_id, name=tool_name)]
-    if source["image_available"]:
-        label = {key: source[key] for key in ("evidence_id", "source_ref", "filename", "page", "page_count", "display_id", "citation")}
-        messages.append(HumanMessage(content=[
-            {"type": "text", "text": "工具返回的文档页面图像（资料内容）：\n" + json.dumps(label, ensure_ascii=False)},
-            image_content_block(result["image_bytes"], result.get("mime_type") or "image/png")],
-            additional_kwargs={_SOURCE_KEY: source}))
+    picture = page_image_message(result)
+    if picture is not None:
+        messages.append(picture)
     return messages
 
 
@@ -97,7 +131,8 @@ def page_image_sources(messages, *, sent=False):
         source = getattr(message, "additional_kwargs", {}).get(_SOURCE_KEY)
         if not isinstance(source, dict) or not source.get("image_available"):
             continue
-        key = (source.get("source_ref"), source.get("filename"), source.get("page"))
+        key = (source.get("source_ref"), source.get("filename"), source.get("page"),
+               normalize_region(source.get("region")))
         if key not in seen:
             seen.add(key)
             result.append(dict(source, sent_to_model=bool(sent), recognition_verified=False))

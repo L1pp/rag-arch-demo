@@ -112,4 +112,35 @@ describe('independent standards page viewer', () => {
     expect(image.src).toBe('blob:page-viewer-test')
     expect(imageMock).toHaveBeenCalledWith('/api/documents/page-image?asset=private-a&page=2', expect.any(AbortSignal))
   })
+
+  it('opens a saved region and switches to the full page and back without changing its identity', async () => {
+    window.history.replaceState(null, '', '/viewer/pages?asset=private-a&workspace_id=work&source_ref=upload-a&page=2&region=0.1,0.2,0.6,0.45')
+    pagesMock.mockImplementation(async query => ({
+      ...pagesFor(), source_ref: 'upload-a', sources: [{ source_ref: 'upload-a', filename: '方案.docx', pages: [] }],
+      pages: [{ page: query.page ?? 2, region: query.region ? [0.1, 0.2, 0.6, 0.45] : null,
+        image_url: `/api/documents/page-image?asset=private-a&page=2${query.region ? `&region=${query.region}` : ''}` }],
+    }))
+    render(<PageViewer />)
+    expect(await screen.findByText('当前显示指定区域；可切回整页核对位置，局部图像不代表整页已核查。')).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: '放大区域' })).toHaveAttribute('aria-pressed', 'true')
+    fireEvent.click(screen.getByRole('button', { name: '整页' }))
+    await waitFor(() => expect(pagesMock).toHaveBeenLastCalledWith(expect.objectContaining({ asset: 'private-a', page: 2, region: undefined }), expect.any(AbortSignal)))
+    expect(new URLSearchParams(window.location.search).has('region')).toBe(false)
+    expect(await screen.findByLabelText('原放大区域位置')).toHaveStyle({ left: '10%', top: '20%', width: '50%' })
+    fireEvent.click(await screen.findByRole('button', { name: '放大区域' }))
+    await waitFor(() => expect(pagesMock).toHaveBeenLastCalledWith(expect.objectContaining({ region: '0.1,0.2,0.6,0.45' }), expect.any(AbortSignal)))
+    expect(new URLSearchParams(window.location.search).get('region')).toBe('0.1,0.2,0.6,0.45')
+  })
+
+  it('clears the previous region when navigating to another physical page', async () => {
+    window.history.replaceState(null, '', '/viewer/pages?std=gb-55008&source_ref=source-a&page=2&region=0.1,0.2,0.6,0.45')
+    pagesMock.mockResolvedValue(pagesFor())
+    render(<PageViewer />)
+    await screen.findByRole('button', { name: '放大区域' })
+    await waitFor(() => expect(screen.getByRole('button', { name: '下一页' })).toBeEnabled())
+    fireEvent.click(screen.getByRole('button', { name: '下一页' }))
+    await waitFor(() => expect(pagesMock).toHaveBeenLastCalledWith(expect.objectContaining({ page: 3, region: undefined }), expect.any(AbortSignal)))
+    expect(screen.queryByRole('button', { name: '放大区域' })).not.toBeInTheDocument()
+    expect(new URLSearchParams(window.location.search).has('region')).toBe(false)
+  })
 })

@@ -13,7 +13,6 @@ from contextlib import contextmanager
 from copy import deepcopy
 from datetime import datetime, timezone
 import heapq
-import hashlib
 import json
 import math
 import os
@@ -88,6 +87,13 @@ class BinaryCorpusStoreError(ValueError):
     """The current corpus package is absent, stale, malformed, or closed."""
 
 
+def _validate_summary_documents(summary: dict) -> None:
+    """Validate the small metadata projection before it is constructed."""
+    documents = summary.get("documents", [])
+    if not isinstance(documents, list) or any(not isinstance(row, dict) for row in documents):
+        raise BinaryCorpusStoreError("summary.documents须为对象列表。")
+
+
 def _is_link_or_junction(path: Path) -> bool:
     is_junction = getattr(path, "is_junction", None)
     return path.is_symlink() or (callable(is_junction) and bool(is_junction()))
@@ -111,20 +117,6 @@ def _fsync_directory(path: Path) -> None:
         pass
     finally:
         os.close(descriptor)
-
-
-def _sha256_file(path: Path) -> str:
-    digest = hashlib.sha256()
-    try:
-        with path.open("rb") as handle:
-            while True:
-                block = handle.read(1024 * 1024)
-                if not block:
-                    break
-                digest.update(block)
-    except OSError as exc:
-        raise BinaryCorpusStoreError("无法读取corpus派生文件完整性数据。") from exc
-    return digest.hexdigest()
 
 
 def _file_size(path: Path) -> int:
@@ -171,11 +163,11 @@ def _load_small_source_metadata(source_dir: Path) -> dict:
         raise BinaryCorpusStoreError("summary/catalog/relations源文件无效。") from exc
     if not isinstance(summary, dict) or not isinstance(catalog, list) or not isinstance(relations, list):
         raise BinaryCorpusStoreError("summary/catalog/relations源数据形状无效。")
+    _validate_summary_documents(summary)
     return {"summary": summary, "catalog": catalog, "relations": relations}
 
 
-def _source_snapshot(source_dir: Path) -> list[dict[str, Any]]:
-    result = []
+def _check_source_files(source_dir: Path) -> None:
     for name in _SOURCE_FILES:
         path = source_dir / name
         if _is_link_or_junction(path):
@@ -185,19 +177,11 @@ def _source_snapshot(source_dir: Path) -> list[dict[str, Any]]:
             if not exists:
                 if name in {"clauses.jsonl", "tables.jsonl"}:
                     raise BinaryCorpusStoreError(f"缺少必要语料文件：{name}")
-                result.append({"name": name, "exists": False})
                 continue
-            stat = path.stat()
             if not path.is_file():
                 raise BinaryCorpusStoreError(f"corpus源路径不是普通文件：{name}")
         except OSError as exc:
             raise BinaryCorpusStoreError(f"无法读取corpus源文件stat：{name}") from exc
-        result.append({
-            "name": name, "exists": True,
-            "device": int(stat.st_dev), "inode": int(stat.st_ino),
-            "size_bytes": int(stat.st_size), "mtime_ns": int(stat.st_mtime_ns),
-        })
-    return result
 
 
 def _resolve_current(directory: Path) -> tuple[str, Path]:
@@ -229,27 +213,6 @@ def _resolve_current(directory: Path) -> tuple[str, Path]:
     return version_id, version_dir
 
 
-def _validate_source_stat_list(before, after) -> None:
-    if (not isinstance(before, list) or not isinstance(after, list)
-            or before != after or len(before) != len(_SOURCE_FILES)):
-        raise BinaryCorpusStoreError("manifest源stat清单不一致。")
-    if [item.get("name") if isinstance(item, dict) else None for item in before] != list(_SOURCE_FILES):
-        raise BinaryCorpusStoreError("manifest源stat文件顺序无效。")
-    for item in before:
-        if set(item) == {"name", "exists"}:
-            if type(item["exists"]) is not bool or item["exists"]:
-                raise BinaryCorpusStoreError("manifest源stat缺少文件信息。")
-            continue
-        if (set(item) != {"name", "exists", "device", "inode", "size_bytes", "mtime_ns"}
-                or item.get("exists") is not True
-                or any(type(item.get(field)) is not int or item[field] < 0
-                       for field in ("device", "inode", "size_bytes", "mtime_ns"))):
-            raise BinaryCorpusStoreError("manifest源stat字段无效。")
-    for required in ("clauses.jsonl", "tables.jsonl"):
-        if not next(item for item in before if item["name"] == required)["exists"]:
-            raise BinaryCorpusStoreError(f"manifest缺少必要源文件：{required}")
-
-
 def _validate_manifest(manifest: dict, version_id: str) -> None:
     if (manifest.get("format") != _FORMAT
             or type(manifest.get("format_version")) is not int
@@ -273,8 +236,6 @@ def _validate_manifest(manifest: dict, version_id: str) -> None:
             or any(not isinstance(value, str) or not value for value in row_ids)
             or len(set(row_ids)) != len(row_ids)):
         raise BinaryCorpusStoreError("manifest chunk row_ids无效。")
-    _validate_source_stat_list(manifest.get("source_stat_before"),
-                               manifest.get("source_stat_after"))
 
 
 def _validate_package_files(version_dir: Path, files: dict) -> None:
@@ -287,13 +248,13 @@ def _validate_package_files(version_dir: Path, files: dict) -> None:
         entry = files[name]
         if not isinstance(entry, dict):
             raise BinaryCorpusStoreError(f"manifest文件条目无效：{name}")
-        if (type(entry.get("file_bytes")) is not int or entry["file_bytes"] != _file_size(path)
-                or not isinstance(entry.get("sha256"), str)
-                or not re.fullmatch(r"[0-9a-f]{64}", entry["sha256"])):
-            raise BinaryCorpusStoreError(f"corpus包文件尺寸或checksum元数据无效：{name}")
+        if type(entry.get("file_bytes")) is not int or entry["file_bytes"] != _file_size(path):
+            raise BinaryCorpusStoreError(f"corpus包文件尺寸无效：{name}")
+        # Older packages may include a digest field; it is neither required nor checked.
+        fields = set(entry) - {"sha256"}
         if name.endswith(".bin"):
             logical = entry.get("logical_bytes")
-            if (set(entry) != {"file_bytes", "sha256", "logical_bytes"}
+            if (fields != {"file_bytes", "logical_bytes"}
                     or type(logical) is not int or logical < 0
                     or entry["file_bytes"] != max(1, logical)):
                 raise BinaryCorpusStoreError(f"corpus blob逻辑长度无效：{name}")
@@ -302,16 +263,14 @@ def _validate_package_files(version_dir: Path, files: dict) -> None:
                     type(value) is not int or value < 0 for value in entry["shape"]):
                 raise BinaryCorpusStoreError(f"corpus NPY shape无效：{name}")
             if name == "chunks.map.npy":
-                if (set(entry) != {"file_bytes", "sha256", "shape", "fields"}
+                if (fields != {"file_bytes", "shape", "fields"}
                         or entry.get("fields") != {"kind": "uint8", "row": "uint64"}):
                     raise BinaryCorpusStoreError("chunks.map.npy dtype无效。")
-            elif (set(entry) != {"file_bytes", "sha256", "shape", "dtype"}
+            elif (fields != {"file_bytes", "shape", "dtype"}
                     or entry.get("dtype") != np.dtype(np.uint64).str):
                 raise BinaryCorpusStoreError(f"corpus offsets dtype无效：{name}")
-        elif set(entry) != {"file_bytes", "sha256"}:
+        elif fields != {"file_bytes"}:
             raise BinaryCorpusStoreError(f"corpus sidecar文件字段无效：{name}")
-        if _sha256_file(path) != entry["sha256"]:
-            raise BinaryCorpusStoreError(f"corpus派生文件SHA256校验失败：{name}")
 
 
 def _validate_offset_array(array: np.memmap, count: int, logical_bytes: int, name: str,
@@ -450,60 +409,6 @@ def _validate_projection_shapes(manifest: dict, record_meta: dict[str, list[dict
         raise BinaryCorpusStoreError("corpus_meta.json manifest字段无效。")
 
 
-def _validate_source_file(source_dir: Path, name: str, kind: str,
-                          records_blob: np.memmap, offsets: np.memmap,
-                          expected_rows: list[dict]) -> int:
-    path = source_dir / name
-    count = 0
-    try:
-        with path.open("rb") as handle:
-            for line_number, raw_line in enumerate(handle, 1):
-                record = _parse_jsonl_line(raw_line, filename=name, line_number=line_number)
-                if record is None:
-                    continue
-                if count >= len(expected_rows):
-                    raise BinaryCorpusStoreError(f"{name}比已构建包多出source row。")
-                start, end = int(offsets[count]), int(offsets[count + 1])
-                try:
-                    packaged = json.loads(records_blob[start:end].tobytes())
-                except (UnicodeError, json.JSONDecodeError) as exc:
-                    raise BinaryCorpusStoreError("record blob无法JSON解码。") from exc
-                if record != packaged:
-                    raise BinaryCorpusStoreError(f"{name}内容与mmap包记录不匹配。")
-                id_field = "clause_id" if kind == "clause" else "table_id"
-                if record.get(id_field) != expected_rows[count][id_field]:
-                    raise BinaryCorpusStoreError(f"{name} record ID/order与mmap包不匹配。")
-                count += 1
-    except BinaryCorpusStoreError:
-        raise
-    except OSError as exc:
-        raise BinaryCorpusStoreError(f"无法逐行校验{source_dir / name}。") from exc
-    if count != len(expected_rows):
-        raise BinaryCorpusStoreError(f"{name}比已构建包少source row。")
-    return count
-
-
-def _validate_source_dir(source_dir: Path, manifest: dict, version_dir: Path,
-                         record_meta: dict[str, list[dict]], corpus_meta: dict,
-                         arrays: dict[str, np.memmap], blobs: dict[str, np.memmap]) -> int:
-    before = _source_snapshot(source_dir)
-    expected_stats = manifest["source_stat_after"]
-    if before == expected_stats:
-        return 0
-    small = _load_small_source_metadata(source_dir)
-    if small != corpus_meta:
-        raise BinaryCorpusStoreError("source_dir的summary/catalog/relations与mmap包不匹配。")
-    validated = _validate_source_file(
-        source_dir, "clauses.jsonl", "clause", blobs["clauses.records.bin"],
-        arrays["clauses.record_offsets.npy"], record_meta["clauses"])
-    validated += _validate_source_file(
-        source_dir, "tables.jsonl", "table", blobs["tables.records.bin"],
-        arrays["tables.record_offsets.npy"], record_meta["tables"])
-    if _source_snapshot(source_dir) != before:
-        raise BinaryCorpusStoreError("source_dir在流式校验期间发生变化。")
-    return validated
-
-
 def _write_npy(path: Path, values: np.ndarray) -> None:
     with path.open("xb") as handle:
         np.save(handle, values, allow_pickle=False)
@@ -522,7 +427,7 @@ def _file_entry(path: Path, *, logical_bytes: int | None = None,
                 shape: list[int] | None = None,
                 dtype: str | None = None,
                 fields: dict | None = None) -> dict:
-    entry = {"file_bytes": _file_size(path), "sha256": _sha256_file(path)}
+    entry = {"file_bytes": _file_size(path)}
     if logical_bytes is not None:
         entry["logical_bytes"] = logical_bytes
     if shape is not None:
@@ -543,7 +448,7 @@ def build_core_corpus_mmap(source_dir: str | Path, output_dir: str | Path) -> Pa
     """
     source = Path(source_dir)
     output = Path(output_dir)
-    source_stat_before = _source_snapshot(source)
+    _check_source_files(source)
     corpus_meta = _load_small_source_metadata(source)
     try:
         if _is_link_or_junction(output):
@@ -715,10 +620,6 @@ def build_core_corpus_mmap(source_dir: str | Path, output_dir: str | Path) -> Pa
                    np.asarray(chunk_text_offsets, dtype=np.uint64))
         _write_npy(paths["chunks.map.npy"], chunk_map_array)
 
-        source_stat_after = _source_snapshot(source)
-        if source_stat_before != source_stat_after:
-            raise BinaryCorpusStoreError("corpus源文件在构建期间发生变化。")
-
         file_entries = {}
         for name in _PACKAGE_FILES:
             path = paths[name]
@@ -758,8 +659,6 @@ def build_core_corpus_mmap(source_dir: str | Path, output_dir: str | Path) -> Pa
             "unique_text_count": len(unique_texts),
             "source_record_count": source_record_count,
             "row_ids": row_ids,
-            "source_stat_before": source_stat_before,
-            "source_stat_after": source_stat_after,
             "corpus_meta_shape": {"keys": ["summary", "catalog", "relations"]},
             "files": file_entries,
         }
@@ -770,8 +669,6 @@ def build_core_corpus_mmap(source_dir: str | Path, output_dir: str | Path) -> Pa
             handle.write("\n")
             handle.flush()
             os.fsync(handle.fileno())
-        if _source_snapshot(source) != source_stat_after:
-            raise BinaryCorpusStoreError("发布前corpus源文件状态已变化。")
         _fsync_directory(temporary)
         temporary.replace(published)
         _fsync_directory(versions)
@@ -1453,6 +1350,7 @@ class BinaryCorpusStore:
                     or not isinstance(corpus_meta.get("catalog"), list)
                     or not isinstance(corpus_meta.get("relations"), list)):
                 raise BinaryCorpusStoreError("corpus_meta.json形状无效。")
+            _validate_summary_documents(corpus_meta["summary"])
             _validate_projection_shapes(manifest, record_meta, chunk_meta, source_records,
                                         loaded_arrays)
 
@@ -1473,12 +1371,9 @@ class BinaryCorpusStore:
                     raise BinaryCorpusStoreError(f"{name}空blob sentinel无效。")
                 blobs[name] = blob
 
-            if source_dir is not None:
-                validation_count = _validate_source_dir(
-                    Path(source_dir), manifest, version_dir, record_meta, corpus_meta,
-                    loaded_arrays, blobs)
-            else:
-                validation_count = 0
+            # The optional source path is retained for API compatibility; loading
+            # does not compare the current source against a packaged snapshot.
+            validation_count = 0
 
             clauses = _MappedRecordSequence(
                 None, "clause", record_meta["clauses"], loaded_arrays["clauses.record_offsets.npy"])

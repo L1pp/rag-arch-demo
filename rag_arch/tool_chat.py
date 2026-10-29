@@ -11,7 +11,8 @@ from copy import deepcopy
 from typing import ClassVar
 
 from langchain_core.messages import AIMessage
-from .web_search import WebSearchChat, web_search_extra_body, select_chat_protocol, create_responses_chat
+from .web_search import (WebSearchChat, web_search_extra_body, select_chat_protocol,
+                         create_responses_chat, is_deepseek_v41_flash_1017)
 
 from .config import resolve_chat_budgets
 from .runtime_audit import attach_chat_audit
@@ -122,6 +123,8 @@ def create_tool_chat_model(settings, *, max_tokens: int | None = None,
             from .terminal_output import TerminalOutputChat
             return TerminalOutputChat(model, response_schema)
         return model
+    if is_deepseek_v41_flash_1017(settings) and resolved_thinking_budget is not None:
+        raise ValueError("deepseek-v4.1-flash-1017不支持thinking_budget；Chat Completions请移除该参数或使用Responses。")
     kwargs = {"model": settings.chat_model, "api_key": settings.chat_api_key,
               "base_url": settings.chat_base_url.rstrip("/"),
               "timeout": settings.effective_chat_timeout_seconds,
