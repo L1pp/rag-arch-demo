@@ -25,7 +25,7 @@ from rag_arch.web.plan_runner import _require_plan_text, arun_plan, run_plan
 from tests.test_web_async_runners import AsyncOnlyModel
 
 
-def scan_pdf():
+def scan_pdf(page_count=1):
     image = Image.new("RGB", (900, 1200), "white")
     draw = ImageDraw.Draw(image)
     for y in range(50, 1150, 50):
@@ -33,8 +33,9 @@ def scan_pdf():
     stream = BytesIO()
     image.save(stream, format="PNG")
     with pymupdf.open() as pdf:
-        page = pdf.new_page()
-        page.insert_image(page.rect, stream=stream.getvalue())
+        for _ in range(page_count):
+            page = pdf.new_page()
+            page.insert_image(page.rect, stream=stream.getvalue())
         return pdf.tobytes(deflate=True)
 
 
@@ -144,6 +145,94 @@ class OCRPageFallbackTests(unittest.TestCase):
             self.assertEqual(statuses, {"completed", "not_attempted"})
             self.assertIn("未尝试", " ".join(result["warnings"]))
             store.close()
+
+    def test_partial_document_budget_deferral_is_not_cached_between_tasks(self):
+        pdf = scan_pdf(page_count=2)
+        self.assertLess(len(pdf), 200_000)
+        for workflow in ("loaded", "chat", "async_chat", "plan"):
+            with self.subTest(workflow=workflow), TemporaryDirectory() as temp:
+                root = Path(temp)
+                calls = []
+                store = DocumentStore(root, "workspace", ocr_client=ocr_client(root, calls))
+                self.addCleanup(store.close)
+                asset = store.add("fictional-two-page.pdf", pdf)
+                ids = [asset["asset_id"]]
+                def prepare():
+                    if workflow == "loaded":
+                        return store.load(ids[0])
+                    if workflow == "chat":
+                        return store.prepare_chat(ids)
+                    if workflow == "async_chat":
+                        return asyncio.run(store.aprepare_chat(ids))
+                    return store.get_plan(attachment_ids=ids)
+                def selected(value):
+                    if workflow == "loaded":
+                        return value
+                    if workflow in {"chat", "async_chat"}:
+                        return value.collection.documents[0]
+                    return value.document
+                with ocr_preparation_scope(Mock(), max_pages=1):
+                    initial = selected(prepare())
+                    self.assertEqual(len(calls), 1)
+                    self.assertEqual([row["status"] for row in initial.ocr_pages],
+                                     ["completed", "not_attempted"])
+                    self.assertEqual(initial.ocr_pages[1]["reason"], "task_page_budget")
+                    self.assertEqual(len(initial.units), 1)
+                    repeated = selected(prepare())
+                    self.assertEqual(len(calls), 1, "same task must not bypass its page budget")
+                    self.assertEqual(repeated.ocr_pages[1]["reason"], "task_page_budget")
+                with ocr_preparation_scope(Mock(), max_pages=1):
+                    completed_value = prepare()
+                completed = selected(completed_value)
+                self.assertEqual(len(calls), 2, "previously unattempted page is requested once")
+                self.assertEqual([row["status"] for row in completed.ocr_pages],
+                                 ["completed", "completed"])
+                self.assertTrue(completed.ocr_pages[0]["from_cache"])
+                self.assertFalse(completed.ocr_pages[1]["from_cache"])
+                self.assertEqual(len(completed.units), 2)
+                with ocr_preparation_scope(Mock(), max_pages=1):
+                    cached_value = prepare()
+                self.assertIs(cached_value, completed_value)
+                self.assertEqual(len(calls), 2)
+                store.close()
+
+    def test_other_partial_ocr_outcomes_keep_existing_cache_and_no_retries(self):
+        pdf = scan_pdf(page_count=2)
+        text = "合成 OCR 文字"
+        for second_status in ("failed", "unknown", "document_text_budget"):
+            with self.subTest(second_status=second_status), TemporaryDirectory() as temp:
+                root = Path(temp)
+                calls = []
+                def handler(request):
+                    calls.append(request)
+                    if len(calls) == 2 and second_status == "unknown":
+                        raise httpx.ReadTimeout("synthetic timeout", request=request)
+                    if len(calls) == 2 and second_status == "failed":
+                        return httpx.Response(503, json={"code": "SyntheticUnavailable"})
+                    return httpx.Response(200, json={"output": {"choices": [{"finish_reason": "stop",
+                        "message": {"content": [{"text": text}]}}]}})
+                settings = OCRSettings(True, "https://ws-test.cn-beijing.maas.aliyuncs.com/compatible-mode/v1",
+                                       "synthetic-ocr-key", 15)
+                client = VLOCRClient(root, settings, transport=httpx.MockTransport(handler))
+                store = DocumentStore(root, "workspace", ocr_client=client)
+                self.addCleanup(store.close)
+                asset = store.add("fictional-partial.pdf", pdf)
+                budget = len(text) + 1 if second_status == "document_text_budget" else 1_000_000
+                with patch("rag_arch.web.ocr_preparation.MAX_DOCUMENT_OCR_CHARACTERS", budget),                      ocr_preparation_scope(Mock(), max_pages=2):
+                    initial = store.load(asset["asset_id"])
+                self.assertEqual(len(initial.units), 1)
+                self.assertEqual(initial.ocr_pages[0]["status"], "completed")
+                if second_status == "document_text_budget":
+                    self.assertEqual(initial.ocr_pages[1]["reason"], "document_text_budget")
+                    self.assertEqual(initial.ocr_pages[1]["status"], "failed")
+                else:
+                    self.assertEqual(initial.ocr_pages[1]["status"], second_status)
+                self.assertEqual(len(calls), 2)
+                with ocr_preparation_scope(Mock(), max_pages=2):
+                    later = store.load(asset["asset_id"])
+                self.assertIs(later, initial)
+                self.assertEqual(len(calls), 2)
+                store.close()
 
     def test_unattempted_page_is_first_requested_in_a_later_chat_task(self):
         for asynchronous in (False, True):

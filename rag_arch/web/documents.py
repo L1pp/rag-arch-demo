@@ -53,9 +53,13 @@ def _document_cache_weight(document, original_bytes=0) -> int:
 
 
 def _cacheable_ocr_document(document) -> bool:
-    # A no-text OCR outcome may be task-budget dependent. Rebuild it on a
-    # later task; the OCR client's own durable markers still fence re-requests.
-    return bool(getattr(document, "units", ())) or not getattr(document, "ocr_pages", ())
+    # A task-limited page may become available on a later task, even if other
+    # pages already yielded text. Durable OCR markers still fence re-requests.
+    pages = getattr(document, "ocr_pages", ())
+    if isinstance(pages, (list, tuple)) and any(
+            isinstance(row, dict) and row.get("reason") == "task_page_budget" for row in pages):
+        return False
+    return bool(getattr(document, "units", ())) or not pages
 
 
 def _cacheable_ocr_chat(prepared) -> bool:
