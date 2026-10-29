@@ -107,6 +107,22 @@ export interface TaskFile {
   filename: string
   size_bytes: number
   page_url?: string | null
+  ocr_pages?: unknown[] | null
+}
+
+export interface PageImageSource {
+  image_id?: string | null
+  evidence_id?: string | null
+  source_ref?: string | null
+  filename?: string | null
+  page?: number | null
+  page_count?: number | null
+  page_url?: string | null
+  region?: number[] | null
+  automatic?: boolean
+  cited?: boolean
+  sent_to_model?: boolean
+  recognition_verified?: boolean
 }
 
 export type AppTaskResult = StandardTaskResult & {
@@ -119,6 +135,8 @@ export type AppTaskResult = StandardTaskResult & {
   report_format?: string | null
   file_mode?: 'direct' | 'retrieval' | 'pages_only' | string | null
   uses_embeddings?: boolean
+  page_sources?: PageImageSource[]
+  visual_review?: Record<string, unknown> | null
 }
 
 export interface StandardsPageSource {
@@ -131,6 +149,7 @@ export interface StandardsPageImage {
   page: number
   document_page?: number | string | null
   image_url: string
+  region?: number[] | null
 }
 
 export interface StandardsPagesResponse {

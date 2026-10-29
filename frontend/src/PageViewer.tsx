@@ -21,6 +21,7 @@ function readViewerQuery(): ViewerQuery {
     workspace_id: params.get('workspace_id')?.trim() || undefined,
     evidence: params.get('evidence')?.trim() || undefined,
     source_ref: params.get('source_ref')?.trim() || undefined,
+    region: params.get('region')?.trim() || undefined,
   }
   if (Number.isFinite(parsedPage)) query.page = Math.max(1, Math.floor(parsedPage))
   return query
@@ -34,6 +35,7 @@ function writeViewerQuery(query: ViewerQuery) {
   if (query.workspace_id) params.set('workspace_id', query.workspace_id)
   if (query.evidence) params.set('evidence', query.evidence)
   if (query.source_ref) params.set('source_ref', query.source_ref)
+  if (query.region) params.set('region', query.region)
   if (typeof query.page === 'number' && Number.isFinite(query.page)) params.set('page', String(query.page))
   window.history.replaceState(null, '', `${window.location.pathname}?${params}`)
 }
@@ -59,7 +61,15 @@ function sourceOptionsFor(data: StandardsPagesResponse): StandardsPageSource[] {
   return options
 }
 
-function PageImage({ image, title, zoom }: { image: StandardsPageImage; title: string; zoom: number | 'fit' }) {
+function regionCoordinates(value?: string): number[] | null {
+  if (!value) return null
+  const coordinates = value.split(',').map(Number)
+  if (coordinates.length !== 4 || coordinates.some(number => !Number.isFinite(number))) return null
+  const [left, top, right, bottom] = coordinates
+  return 0 <= left && left < right && right <= 1 && 0 <= top && top < bottom && bottom <= 1 ? coordinates : null
+}
+
+function PageImage({ image, title, zoom, highlightRegion }: { image: StandardsPageImage; title: string; zoom: number | 'fit'; highlightRegion?: number[] | null }) {
   const [failed, setFailed] = useState(false)
   const [imageUrl, setImageUrl] = useState<string | null>(null)
   const scale = zoom === 'fit' ? '100%' : `${zoom}%`
@@ -84,12 +94,16 @@ function PageImage({ image, title, zoom }: { image: StandardsPageImage; title: s
     }
   }, [image.image_url])
   return <figure className="viewer-page-card">
-    <div className="viewer-page-label">第 {image.page} 页{documentPage}</div>
+    <div className="viewer-page-label">第 {image.page} 页{documentPage}{image.region ? ' · 放大区域' : ''}</div>
     {failed
       ? <div className="viewer-image-error" role="img" aria-label={`${title} 第 ${image.page} 页暂不支持`}>当前页面暂不支持</div>
       : imageUrl
-        ? <div className="viewer-image-wrap"><img src={imageUrl}
-          alt={`${title} 第 ${image.page} 页`} style={{ width: scale }} onError={() => setFailed(true)} /></div>
+        ? <div className="viewer-image-wrap"><div style={{ width: scale, position: 'relative', margin: '0 auto' }}><img src={imageUrl}
+          alt={`${title} 第 ${image.page} 页`} style={{ width: '100%' }} onError={() => setFailed(true)} />
+          {highlightRegion && <div aria-label="原放大区域位置" style={{ position: 'absolute', pointerEvents: 'none',
+            border: '2px solid #d87922', boxSizing: 'border-box', left: `${highlightRegion[0] * 100}%`, top: `${highlightRegion[1] * 100}%`,
+            width: `${(highlightRegion[2] - highlightRegion[0]) * 100}%`, height: `${(highlightRegion[3] - highlightRegion[1]) * 100}%` }} />}
+        </div></div>
         : <div className="viewer-image-error" role="status">正在加载页图…</div>}
   </figure>
 }
@@ -102,6 +116,7 @@ export default function PageViewer() {
   const [error, setError] = useState(hasSource(query) ? null : '缺少 std、asset 或 plan_id 参数，无法打开规范原页。')
   const [zoom, setZoom] = useState<number | 'fit'>('fit')
   const [reload, setReload] = useState(0)
+  const [availableRegion, setAvailableRegion] = useState(query.region)
 
   useEffect(() => {
     if (!hasSource(query)) {
@@ -150,7 +165,10 @@ export default function PageViewer() {
     : [])
 
   const navigate = (next: Partial<ViewerQuery>) => {
-    const updated = { ...query, ...next }
+    const changedPage = (next.page != null && next.page !== page)
+      || (next.source_ref != null && next.source_ref !== selectedSource)
+    const updated = { ...query, ...next, ...(changedPage ? { region: undefined } : {}) }
+    if (changedPage) setAvailableRegion(undefined)
     setQuery(updated)
     writeViewerQuery(updated)
   }
@@ -188,15 +206,21 @@ export default function PageViewer() {
         <button type="button" className={zoom === 'fit' ? 'active' : ''} onClick={() => setZoom('fit')} aria-pressed={zoom === 'fit'}>适宽</button>
         <button type="button" onClick={() => setZoom(value => value === 'fit' ? 110 : Math.min(180, value + 10))} disabled={zoom !== 'fit' && zoom >= 180}>＋</button>
       </div>
+      {availableRegion && <div className="viewer-zoom" aria-label="页图范围">
+        <button type="button" onClick={() => navigate({ region: undefined })} aria-pressed={!query.region} disabled={loading}>整页</button>
+        <button type="button" onClick={() => navigate({ region: availableRegion })} aria-pressed={!!query.region} disabled={loading}>放大区域</button>
+      </div>}
     </section>
 
     {loading && <div className="viewer-status" role="status">正在加载原页…</div>}
     {!loading && error && <div className="viewer-status viewer-error" role="alert"><div><strong>当前页面暂不支持</strong><span>{error}</span></div><button type="button" onClick={() => setReload(value => value + 1)}>重试</button></div>}
     {!loading && !error && data?.warning && <div className="viewer-status viewer-warning" role="status">{data.warning}</div>}
+    {!loading && !error && data && query.region && <div className="viewer-status viewer-warning">当前显示指定区域；可切回整页核对位置，局部图像不代表整页已核查。</div>}
     {!loading && !error && data && <div className="viewer-page-summary" role="status">{query.evidence && mappedPages ? `本条涉及 ${mappedPages.length} 页` : `来源共 ${data.page_count} 页`} · 当前首屏显示 {Math.min(2, data.pages.length)} 页</div>}
     {!loading && !error && data && !data.pages.length && <div className="viewer-empty" role="status">当前来源暂无可显示的页图。</div>}
     {!loading && !error && data && !!data.pages.length && <section className="viewer-pages" aria-label="规范页图">
-      {data.pages.slice(0, 2).map(image => <PageImage key={`${image.page}-${image.image_url}`} image={image} title={data.title} zoom={zoom}/>)}
+      {data.pages.slice(0, 2).map(image => <PageImage key={`${image.page}-${image.image_url}`} image={image} title={data.title} zoom={zoom}
+        highlightRegion={!query.region ? regionCoordinates(availableRegion) : null}/>)}
     </section>}
   </main>
 }

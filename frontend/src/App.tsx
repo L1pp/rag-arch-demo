@@ -10,6 +10,7 @@ import {
   isActive,
   type AssistantId,
   type AppTaskResult,
+  type PageImageSource,
   type StandardCatalogEntry,
   type StandardCatalogMatch,
   type StandardCitation,
@@ -296,6 +297,76 @@ function CatalogMatchCards({ task }: { task: TaskSnapshot }) {
   </details></section>
 }
 
+function isOcrWarning(value: unknown): value is string {
+  return typeof value === 'string' && /ocr/i.test(value)
+}
+
+function safeOcrWarning(warning: string): string {
+  // Provider diagnostics can contain credentials, temporary links, or server paths.
+  // Keep those details out of both the visible notice and the expanded details.
+  return /https?:\/\/|\b(?:api[\s_-]?key|access[\s_-]?key|authorization|bearer|token|secret|password|endpoint|key)\b|密钥|(?:[A-Za-z]:[\\/]|\/(?:opt|etc|home|tmp|data\/runtime)\/)/i.test(warning)
+    ? 'OCR 状态暂不可显示，请查看原页。'
+    : warning
+}
+
+function OcrNotice({ result }: { result: AppTaskResult | null | undefined }) {
+  if (!result) return null
+  const warnings = Array.isArray(result.warnings) ? result.warnings.filter(isOcrWarning).map(safeOcrWarning) : []
+  const documentPages = Array.isArray(result.document?.ocr_pages) ? result.document.ocr_pages : []
+  const fileGroups = (Array.isArray(result.files) ? result.files : []).flatMap((file, index) => {
+    if (!file || typeof file !== 'object' || !Array.isArray(file.ocr_pages) || !file.ocr_pages.length) return []
+    const filename = typeof file.filename === 'string' ? file.filename.split(/[\\/]/).at(-1)?.trim() : ''
+    const label = filename && safeOcrWarning(filename) === filename ? `附件 ${index + 1}（${filename}）` : `附件 ${index + 1}`
+    return [{ label, pages: file.ocr_pages }]
+  })
+  const groups = [{ label: '', pages: documentPages }, ...fileGroups]
+  if (!warnings.length && !groups.some(group => group.pages.length)) return null
+
+  const pageDescriptions = groups.flatMap(({ label, pages }) => pages.flatMap((item: unknown) => {
+    if (!item || typeof item !== 'object') return []
+    const record = item as Record<string, unknown>
+    if (typeof record.page !== 'number' || !Number.isInteger(record.page) || record.page < 1) return []
+    const page = record.page_numbering === 'system_rendered_page'
+      ? `系统排版第 ${record.page} 页` : `第 ${record.page} 页`
+    const state = record.status === 'completed' ? '已识别，待核对'
+      : record.status === 'failed' ? '识别未成功'
+      : record.status === 'unknown' ? '识别状态未确认'
+      : record.status === 'not_attempted' ? '未执行识别'
+      : '识别情况待核对'
+    return [`${label ? `${label} · ` : ''}${page}：${state}`]
+  }))
+  const distinctWarnings = [...new Set(warnings)]
+  return <aside className="catalog-status catalog-warning" role="status" aria-label="OCR 识别提示">
+    <div><strong>OCR 识别提醒</strong><p>识别文字可能有错误或遗漏，关键数字、单位和表格请核对原页。</p>
+      {distinctWarnings.map((warning, index) => <p key={index}>{warning}</p>)}
+      {!!pageDescriptions.length && <p>{[...new Set(pageDescriptions)].join('；')}。</p>}
+    </div>
+  </aside>
+}
+
+function PageReviewDetails({ task }: { task: TaskSnapshot }) {
+  const result = task.result as AppTaskResult | undefined
+  const rawPages: unknown[] = result?.page_sources ?? []
+  const pages = rawPages.filter((source): source is PageImageSource => {
+    if (!source || typeof source !== 'object') return false
+    const row = source as Record<string, unknown>
+    return row.sent_to_model === true && typeof row.page === 'number' && Number.isInteger(row.page) && row.page > 0
+  })
+  if (!pages.length) return null
+  return <details className="response-details"><summary>已提供模型的页图/区域 · {pages.length} 项</summary>
+    <p>以下记录页图投递，不代表模型已正确识别；关键数字仍需结合原页核对。</p>
+    <ul>{pages.map((source, index) => {
+      const region = Array.isArray(source.region) && source.region.length === 4
+      const url = typeof source.page_url === 'string' && source.page_url.startsWith('/viewer/pages?') ? source.page_url : null
+      const numbering = /\.docx?$/i.test(source.filename ?? '') ? '系统排版第' : '第'
+      return <li key={source.image_id || source.evidence_id || index}>
+        <span>{source.filename || '来源文件'} · {numbering}{source.page}页{region ? ' · 局部区域' : ''} · {source.automatic ? '首次自动附入' : '按需读取'} · {source.cited ? '已引用' : '未引用'}</span>
+        {url && <> <a href={url} target="_blank" rel="noopener noreferrer">{region ? '查看区域↗' : '查看原页↗'}</a></>}
+      </li>
+    })}</ul>
+  </details>
+}
+
 function ResultDetails({ task }: { task: TaskSnapshot }) {
   const warnings = task.result?.warnings ?? []
   const links = (task.result?.web_sources ?? []).flatMap(source => {
@@ -305,7 +376,7 @@ function ResultDetails({ task }: { task: TaskSnapshot }) {
   })
   if (!warnings.length && !links.length) return null
   return <details className="response-details"><summary>来源与说明</summary>
-    {warnings.map((warning, index) => <p key={index}>{warning}</p>)}
+    {warnings.map((warning, index) => <p key={index}>{isOcrWarning(warning) ? safeOcrWarning(warning) : warning}</p>)}
     {!!links.length && <ul>{links.map((link, index) => <li key={index}><a href={link.url} target="_blank" rel="noopener noreferrer">{link.title}</a></li>)}</ul>}
   </details>
 }
@@ -517,10 +588,12 @@ function TaskMessages({ task, assistant, onInspect }: { task: TaskSnapshot; assi
           : task.status === 'failed' ? <div className="task-outcome failure"><strong>{simulated ? '本次演示未完成' : '本次回答未完成'}</strong><p>{task.error || task.detail || (simulated ? '服务器返回模拟失败。' : '模型请求未完成，请重试。')}</p></div>
           : task.status === 'cancelled' ? <div className="task-outcome"><strong>任务已停止</strong><p>{task.detail || (simulated ? '本次模拟运行已结束，其他助手不受影响。' : '本次请求已停止，其他助手不受影响。')}</p></div>
           : <div className="running-message"><span className="activity-bars"><i/><i/><i/></span><div><strong>{stageLabel(task)}</strong><p>{task.detail || '等待服务器提供下一步进度。'}</p></div></div>}
+        <OcrNotice result={result}/>
         <TaskSelectionSummary task={task} state={state}/>
         <TaskReadMode task={task}/>
         <PlanReportDetails content={planReport}/>
         <TaskFiles task={task}/>
+        <PageReviewDetails task={task}/>
         <ResultDetails task={task}/>
         {task.status === 'completed' && <><StandardCitationCards task={task}/><CatalogMatchCards task={task}/></>}
         <div className="message-meta"><Badge task={task}/><span><Icon name="clock" size={13}/><Elapsed task={task}/></span>
@@ -661,7 +734,7 @@ export default function App() {
                 <button type="submit" className="send-button" disabled={!canSend}>{assistant.submitting ? '正在提交' : active ? (model ? '回答中' : '任务运行中') : (model ? '发送' : '发送模拟任务')}<Icon name="send" size={16}/></button></div>
             </div>
             <div className="composer-disclaimer"><span>{model
-              ? id === 'standards' ? '回答附规范依据。' : id === 'plan' ? '整份核查覆盖文字；追问可按需读图。' : attachmentCount ? '附件将在发送时读取。' : '可以直接提问。'
+              ? id === 'standards' ? '回答附规范依据。' : id === 'plan' ? '整份核查包含文字与图表；图表尽力核对，疑点会注明。' : attachmentCount ? '附件将在发送时读取。' : '可以直接提问。'
               : '当前助手为模拟任务，不会调用模型或读取资料。'}</span><span>{assistant.draft.prompt.length}/{MAX_PROMPT_CHARS}</span></div>
           </form>
         </div>

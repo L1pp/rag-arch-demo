@@ -179,9 +179,10 @@ export interface StandardsPagesQuery {
   asset?: string
   plan_id?: string
   workspace_id?: string
+  region?: string
 }
 
-const standardsPagesPath = ({ std, evidence, source_ref, page, asset, plan_id, workspace_id }: StandardsPagesQuery) => {
+const standardsPagesPath = ({ std, evidence, source_ref, page, asset, plan_id, workspace_id, region }: StandardsPagesQuery) => {
   const params = new URLSearchParams()
   if (std) params.set('std', std)
   if (evidence) params.set('evidence', evidence)
@@ -190,6 +191,7 @@ const standardsPagesPath = ({ std, evidence, source_ref, page, asset, plan_id, w
   if (asset) params.set('asset', asset)
   if (plan_id) params.set('plan_id', plan_id)
   if (workspace_id) params.set('workspace_id', workspace_id)
+  if (region) params.set('region', region)
   return `${std ? '/api/standards/pages' : '/api/documents/pages'}?${params}`
 }
 export const standardsPagesUrl = (query: StandardsPagesQuery) => apiUrl(standardsPagesPath(query))
